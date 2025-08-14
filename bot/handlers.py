@@ -3,7 +3,11 @@ from telegram import Update
 from telegram.ext import ContextTypes, CommandHandler, MessageHandler, filters
 
 from services.market_data import get_price
-from config import DEFAULT_PAIRS
+try:
+    from config import DEFAULT_PAIRS
+except Exception:
+    DEFAULT_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pairs_txt = ", ".join(DEFAULT_PAIRS) if DEFAULT_PAIRS else "—"
@@ -24,7 +28,6 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if price is None:
         await update.message.reply_text(f"Не удалось получить цену для {symbol}")
         return
-    # форматируем аккуратно
     pretty = f"{price:.8g}" if price < 1 else f"{price:,.2f}".replace(",", " ")
     await update.message.reply_text(f"{symbol} — {pretty} ({ex})")
 
@@ -35,5 +38,4 @@ def register_handlers(app):
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("price", cmd_price))
-    # На всё остальное ответим мягко
     app.add_handler(MessageHandler(filters.COMMAND, on_unknown))
