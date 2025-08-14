@@ -1,41 +1,51 @@
 # strategy/base_strategy.py
-import math
 import logging
 from typing import Dict, Any, List, Tuple, Optional
 
 import pandas as pd
 from ta.trend import EMAIndicator, ADXIndicator, MACD
 from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 
 from services.market_data import get_candles, get_price
 
 log = logging.getLogger(__name__)
 
+# ---------- утилиты форматирования ----------
 def _fmt_price(p: float) -> str:
     return (f"{p:.8g}" if p < 1 else f"{p:,.2f}").replace(",", " ")
 
-def _levels(df: pd.DataFrame, lookback: int = 60, left: int = 2, right: int = 2) -> Tuple[List[float], List[float]]:
-    """Поиск локальных экстремумов в последних lookback барах."""
+# ---------- уровни (по экстремумам) ----------
+def _levels(df: pd.DataFrame, lookback: int = 80, left: int = 2, right: int = 2) -> Tuple[List[float], List[float]]:
+    """Возвращает (resistance[], support[]) — по последним локальным экстремумам."""
     highs = df["high"].to_list()
     lows  = df["low"].to_list()
     n = len(df)
-    idx_from = max(0, n - lookback)
-    res_up: List[float] = []
-    res_dn: List[float] = []
-    for i in range(idx_from + left, n - right):
-        h = highs[i]
-        l = lows[i]
-        if all(h >= highs[j] for j in range(i - left, i + right + 1) if j != i):
-            res_up.append(h)
-        if all(l <= lows[j] for j in range(i - left, i + right + 1) if j != i):
-            res_dn.append(l)
-    # возьмём два ближних к цене уровня сверху/снизу
-    close = df["close"].iloc[-1]
-    res_up = sorted(set(res_up), key=lambda x: (abs(x - close), -x))[:2]
-    res_dn = sorted(set(res_dn), key=lambda x: (abs(x - close), x))[:2]
-    return res_up, res_dn
+    start = max(0, n - lookback)
 
+    res: List[float] = []
+    sup: List[float] = []
+    for i in range(start + left, n - right):
+        h = highs[i]; l = lows[i]
+        # локальный максимум
+        if all(h >= highs[j] for j in range(i - left, i + right + 1) if j != i):
+            res.append(h)
+        # локальный минимум
+        if all(l <= lows[j] for j in range(i - left, i + right + 1) if j != i):
+            sup.append(l)
+
+    # оставим уникальные
+    res = sorted(set(res))
+    sup = sorted(set(sup))
+    return res, sup
+
+def _nearest_above(levels: List[float], price: float, limit: int = 2) -> List[float]:
+    return sorted([x for x in levels if x > price], key=lambda x: x)[:limit]
+
+def _nearest_below(levels: List[float], price: float, limit: int = 2) -> List[float]:
+    return sorted([x for x in levels if x < price], key=lambda x: -x)[:limit]
+
+# ---------- индикаторы ----------
 def _indicators(df: pd.DataFrame) -> Dict[str, float]:
     close = df["close"]
     high  = df["high"]
@@ -55,6 +65,8 @@ def _indicators(df: pd.DataFrame) -> Dict[str, float]:
     bb = BollingerBands(close, window=20, window_dev=2)
     bb_w = (bb.bollinger_hband() - bb.bollinger_lband()) / close * 100
 
+    atr = AverageTrueRange(high, low, close, window=14).average_true_range()
+
     return {
         "ema200": float(ema200.iloc[-1]),
         "ema50":  float(ema50.iloc[-1]),
@@ -64,6 +76,7 @@ def _indicators(df: pd.DataFrame) -> Dict[str, float]:
         "macd_sig": float(macd_signal.iloc[-1]),
         "macd_hist": float(macd_hist.iloc[-1]),
         "bb_width": float(bb_w.iloc[-1]),
+        "atr":    float(atr.iloc[-1]),
     }
 
 def _trend_4h(df_4h: pd.DataFrame) -> str:
@@ -75,8 +88,8 @@ def _trend_4h(df_4h: pd.DataFrame) -> str:
         return "down"
     return "flat"
 
+# ---------- скоринг и сторона ----------
 def _score_and_side(ind: Dict[str, float], trend4h: str) -> Tuple[str, int, List[str]]:
-    """Простая система баллов для направления."""
     reasons: List[str] = []
     long_pts = 0
     short_pts = 0
@@ -89,7 +102,7 @@ def _score_and_side(ind: Dict[str, float], trend4h: str) -> Tuple[str, int, List
     else:
         reasons.append("4H trend: flat")
 
-    # позиция к скользящим
+    # позиция скользящих
     if ind["ema50"] > ind["ema200"]:
         long_pts += 10
     else:
@@ -112,13 +125,11 @@ def _score_and_side(ind: Dict[str, float], trend4h: str) -> Tuple[str, int, List
         long_pts += 5; short_pts += 5
         reasons.append(f"1H ADX={ind['adx']:.1f}")
 
-    # Bollinger width — узкие/широкие
+    # инфо строки
     reasons.append(f"1H BB width={ind['bb_width']:.2f}%")
-
-    # RSI строка
     reasons.append(f"1H RSI={ind['rsi']:.1f}")
 
-    # Итог
+    # итог
     if long_pts > short_pts + 5:
         side = "long"
         score = min(95, 50 + (long_pts - short_pts) * 2)
@@ -131,11 +142,37 @@ def _score_and_side(ind: Dict[str, float], trend4h: str) -> Tuple[str, int, List
 
     return side, int(score), reasons
 
+# ---------- TP/SL генерация ----------
+def _tpsl(side: str, price: float, atr: float, res_levels: List[float], sup_levels: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Возвращает (TP1, TP2, SL) согласно стороне:
+      - LONG: TP=ближ/след сопротивления; SL=ближ поддержка ниже (иначе ATR-фолбэк)
+      - SHORT: TP=ближ/след поддержки; SL=ближ сопротивление выше (иначе ATR-фолбэк)
+    """
+    if side == "long":
+        above = _nearest_above(res_levels, price, 2)
+        below = _nearest_below(sup_levels, price, 1)
+        tp1 = above[0] if len(above) >= 1 else price + atr
+        tp2 = above[1] if len(above) >= 2 else price + 2 * atr
+        sl  = below[0] if len(below) >= 1 else max(0.0, price - atr)
+        return tp1, tp2, sl
+
+    if side == "short":
+        below = _nearest_below(sup_levels, price, 2)
+        above = _nearest_above(res_levels, price, 1)
+        tp1 = below[0] if len(below) >= 1 else price - atr
+        tp2 = below[1] if len(below) >= 2 else price - 2 * atr
+        sl  = above[0] if len(above) >= 1 else price + atr
+        return tp1, tp2, sl
+
+    return None, None, None
+
+# ---------- главный анализ ----------
 async def analyze_symbol(symbol: str, entry_tf: str = "1h") -> Dict[str, Any]:
     """
-    Возвращает словарь с анализом и отформатированным сообщением.
+    Возвращает словарь с анализом и Готовым текстом сообщения.
     """
-    # Данные
+    # 1) данные
     ohlc_1h, ex_h = await get_candles(symbol, entry_tf, limit=300)
     if ohlc_1h is None or len(ohlc_1h) < 60:
         raise RuntimeError("Недостаточно данных 1H")
@@ -148,32 +185,44 @@ async def analyze_symbol(symbol: str, entry_tf: str = "1h") -> Dict[str, Any]:
     exchange = ex_p or ex_h or ex_4h or "—"
     last = price if price is not None else float(ohlc_1h["close"].iloc[-1])
 
-    # Индикаторы
+    # 2) индикаторы
     ind_1h = _indicators(ohlc_1h)
     trend4h = _trend_4h(ohlc_4h)
     side, score, reasons = _score_and_side(ind_1h, trend4h)
 
-    # Уровни (рядом с ценой)
-    res, sup = _levels(ohlc_1h, lookback=80, left=2, right=2)
+    # 3) уровни
+    res_levels, sup_levels = _levels(ohlc_1h, lookback=80, left=2, right=2)
 
-    # Формат вывода
+    # 4) TP/SL
+    tp1, tp2, sl = _tpsl(side, last, ind_1h["atr"], res_levels, sup_levels)
+
+    # 5) формат
     side_icon = {"long":"🟢 LONG", "short":"🔴 SHORT", "none":"⚪ NONE"}[side]
     conf_icon = "🟢" if score >= 70 else ("🟡" if score >= 60 else "🔴")
+    macd_str = "MACD ↑" if ind_1h["macd_hist"] > 0 else ("MACD ↓" if ind_1h["macd_hist"] < 0 else "MACD —")
 
     msg_lines = []
     msg_lines.append(f"{symbol.upper()} — {_fmt_price(last)} ({exchange})")
     msg_lines.append(f"{side_icon}  •  TF: {entry_tf}  •  Confidence: {score}% {conf_icon}")
     msg_lines.append(f"• 4H trend: {trend4h}")
-    # Добавим короткую строку по ключевым индикаторам
-    macd_str = "MACD ↑" if ind_1h["macd_hist"] > 0 else ("MACD ↓" if ind_1h["macd_hist"] < 0 else "MACD —")
     msg_lines.append(f"• 1H ADX={ind_1h['adx']:.1f} | {macd_str} | RSI={ind_1h['rsi']:.1f}")
     msg_lines.append(f"• 1H BB width={ind_1h['bb_width']:.2f}%")
     msg_lines.append("")
     msg_lines.append("📊 Levels:")
-    R = " • ".join(_fmt_price(x) for x in res) if res else "—"
-    S = " • ".join(_fmt_price(x) for x in sup) if sup else "—"
+    R = " • ".join(_fmt_price(x) for x in _nearest_above(res_levels, last, 2)) or "—"
+    S = " • ".join(_fmt_price(x) for x in _nearest_below(sup_levels, last, 2)) or "—"
     msg_lines.append(f"Resistance: {R}")
     msg_lines.append(f"Support: {S}")
+
+    # блок TP/SL
+    if side != "none":
+        msg_lines.append("")
+        if tp1 is not None:
+            msg_lines.append(f"🎯 TP1: {_fmt_price(tp1)}")
+        if tp2 is not None:
+            msg_lines.append(f"🎯 TP2: {_fmt_price(tp2)}")
+        if sl is not None:
+            msg_lines.append(f"🛡 SL: {_fmt_price(sl)}")
 
     return {
         "symbol": symbol.upper(),
@@ -183,6 +232,10 @@ async def analyze_symbol(symbol: str, entry_tf: str = "1h") -> Dict[str, Any]:
         "side": side,
         "score": score,
         "reasons": reasons,
-        "levels": {"resistance": res, "support": sup},
+        "levels": {"resistance": res_levels, "support": sup_levels},
+        "atr": ind_1h["atr"],
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
         "text": "\n".join(msg_lines),
     }
