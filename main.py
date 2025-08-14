@@ -3,7 +3,9 @@ import time
 import logging
 import traceback
 
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, Update
+from telegram import Update
+from telegram.ext import ApplicationBuilder
+
 from bot.handlers import register_handlers
 from config import TELEGRAM_BOT_TOKEN
 
@@ -19,7 +21,7 @@ log.info(">>> ENTER main.py")
 def build_app():
     if not TELEGRAM_BOT_TOKEN:
         print(">>> NO TELEGRAM_BOT_TOKEN", flush=True)
-        # оставим время на прочтение логов, если переменная не задана
+        # Дадим время увидеть лог, если переменная не задана
         time.sleep(600)
         raise SystemExit(1)
 
@@ -32,8 +34,8 @@ if __name__ == "__main__":
         app = build_app()
         log.info("Starting polling…")
         print(">>> starting polling…", flush=True)
-        # ВАЖНО: не оборачиваем в asyncio.run, PTB сам управляет циклом
-        app.run_polling(drop_pending_updates=True)
+        # ВАЖНО: не оборачивать в asyncio.run — PTB сам управляет event loop
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except Exception:
         log.exception("FATAL in main.py")
         print(">>> FATAL in main.py:\n" + traceback.format_exc(), flush=True)
