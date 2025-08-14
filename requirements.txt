@@ -1,7 +1,6 @@
-python-telegram-bot==20.8
-aiohttp==3.12.15
-pandas==2.3.1
-numpy==2.3.2
-httpx==0.26.0
-APScheduler==3.10.4
+python-telegram-bot==21.6
+aiohttp>=3.9
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
 ta==0.11.0
