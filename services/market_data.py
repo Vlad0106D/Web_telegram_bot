@@ -169,3 +169,53 @@ if __name__ == "__main__":
         except Exception as e:
             print("ERR", e)
     asyncio.run(_test())
+    
+    
+    # --- SAFE LAST PRICE HELPER --------------------------------------------------
+from typing import Optional, Any
+
+async def get_price_safe(symbol: str, exchange: Optional[str] = None) -> Optional[float]:
+    """
+    Возвращает последнюю цену символа как float или None.
+    Ничего не выбрасывает. Использует те же данные, что и get_candles().
+    exchange — опционально, чтобы совпадать с сигнатурой get_candles().
+    """
+    try:
+        candles = await get_candles(symbol, "1h", limit=1, exchange=exchange)
+
+        # Нормализация под разные форматы, которые могли вернуть:
+        # 1) (DataFrame, extra)
+        # 2) список словарей [{'close': ...}] / [{'c': ...}] / ...
+        price: Optional[float] = None
+
+        # Вариант 1: кортеж с DataFrame в нулевом элементе
+        if isinstance(candles, tuple) and len(candles) >= 1:
+            df = candles[0]
+            if hasattr(df, "empty"):
+                if not df.empty and "close" in df.columns:
+                    price = float(df["close"].iloc[-1])
+            else:
+                # на случай, если вернули не pandas.DataFrame, а что-то массивоподобное
+                try:
+                    last = candles[0][-1]
+                    price = float(
+                        last.get("close")
+                        or last.get("c")
+                        or last.get("Close")
+                        or last.get("last")
+                    )
+                except Exception:
+                    price = None
+
+        # Вариант 2: список свечей (словарей)
+        elif isinstance(candles, list) and candles:
+            last = candles[-1]
+            if isinstance(last, dict):
+                price = last.get("close") or last.get("c") or last.get("Close") or last.get("last")
+                if price is not None:
+                    price = float(price)
+
+        return price
+    except Exception:
+        # Любые ошибки гасим — функция «safe»
+        return None
