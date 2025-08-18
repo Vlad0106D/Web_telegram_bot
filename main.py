@@ -1,15 +1,10 @@
 # main.py
-import asyncio
 import logging
 import os
+import time
 
 from telegram.error import Conflict
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 # === ENV ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -21,21 +16,23 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-# --- простые команды для проверки ---
+# -------- базовые команды для проверки --------
 async def cmd_start(update, context):
-    await update.message.reply_text("✅ Бот запущен. Используй /ping для проверки, /check для анализа.")
+    await update.message.reply_text(
+        "✅ Бот запущен. Команды: /ping, /check, /find"
+    )
 
 async def cmd_ping(update, context):
     await update.message.reply_text("pong ✅")
 
-# заглушка, чтобы «не падать» на любых текстах
 async def fallback_text(update, context):
+    # спокойная заглушка на любой текст
     msg = getattr(getattr(update, "message", None), "text", "")
     if msg:
         await update.message.reply_text("Команда не распознана. Попробуй /check или /ping.")
 
 
-# --- импорт твоих хендлеров команд ---
+# -------- необязательные внешние хендлеры --------
 try:
     from bot.handlers import register_handlers  # если есть
 except Exception as e:
@@ -43,55 +40,63 @@ except Exception as e:
     log.warning("register_handlers not imported: %s", e)
 
 
-async def build_app():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Env TELEGRAM_BOT_TOKEN is empty")
-
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # обязательно сносим вебхук (убирает конкурирующий режим)
+# post_init сносит вебхук перед стартом polling
+async def _post_init(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (drop_pending_updates=True).")
     except Exception as e:
         log.warning("delete_webhook warn: %s", e)
 
-    # базовые команды
+
+def build_app():
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Env TELEGRAM_BOT_TOKEN is empty")
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
+
+    # базовые
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
-    # твои основные хендлеры
+    # твои команды/кнопки
     if register_handlers:
         register_handlers(app)
-
-    # чтобы не падать на текстах
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
 
     return app
 
 
-async def main():
+if __name__ == "__main__":
     log.info(">>> ENTER main.py")
-    app = await build_app()
+    app = build_app()
 
-    # run_polling с обработкой 409: не валимся, просто логируем и продолжаем
+    # Один цикл перезапуска на случай сетевых/409
     while True:
         try:
             log.info("Bot starting (polling)…")
-            await app.run_polling(
-                allowed_updates=None,  # пусть Telegram сам решит набор
-                drop_pending_updates=True,
-                close_loop=False,
+            # run_polling — синхронный; PTB сам управляет event loop
+            app.run_polling(
+                allowed_updates=None,          # пусть Telegram отдаёт всё нужное
+                drop_pending_updates=True,     # чистим хвосты апдейтов
+                stop_signals=None,             # по умолчанию SIGINT/SIGTERM
             )
+            # если вышли «нормально» — прерываем цикл
+            break
+
         except Conflict as e:
-            log.warning("Ignoring Telegram 409 Conflict (parallel polling somewhere else): %s", e)
-            await asyncio.sleep(3)
+            # второй процесс с тем же токеном где-то жив
+            log.warning("409 Conflict: запущен второй потребитель Bot API. %s", e)
+            time.sleep(3)
+            # продолжаем пытаться (или останавливай цикл, если хочешь)
+            continue
+
         except Exception as e:
             log.exception("FATAL in polling: %s", e)
-            await asyncio.sleep(3)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+            time.sleep(3)
+            continue
