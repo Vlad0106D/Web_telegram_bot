@@ -1,70 +1,59 @@
-# main.py — PTB v21.x, без JobQueue, с автосообщением при старте
+# -*- coding: utf-8 -*-
 import os
 import logging
-
+from telegram.error import Conflict
 from telegram import Update
-from telegram.ext import ApplicationBuilder
+from telegram.ext import ApplicationBuilder, CommandHandler
 
-# === ЛОГИ ===
+# ====== НАСТРОЙКИ ======
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Env TELEGRAM_BOT_TOKEN is not set")
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("main")
 
-# === КОНФИГ/ТОКЕН/ЧАТ ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # строка или None
+# ====== ОБРАБОТЧИКИ КОМАНД (минимум для проверки) ======
+async def cmd_start(update: Update, context):
+    await update.message.reply_text("✅ Бот запущен и готов к работе.")
 
-# На случай, если токен лежит в config.TOKEN — не обязательно
-try:
-    from config import TOKEN as _CFG_TOKEN  # type: ignore
-    if not TELEGRAM_BOT_TOKEN and _CFG_TOKEN:
-        TELEGRAM_BOT_TOKEN = _CFG_TOKEN
-except Exception:
-    pass
+# ====== ОБРАБОТЧИК ОШИБОК (глотаем 409 Conflict) ======
+_conflict_logged = False
+async def on_error(update: object, context):
+    global _conflict_logged
+    err = context.error
+    if isinstance(err, Conflict):
+        # Игнорируем повторный getUpdates с другого процесса
+        if not _conflict_logged:
+            log.warning("Ignoring Telegram 409 Conflict: another getUpdates is active.")
+            _conflict_logged = True
+        return
+    # остальные ошибки — по полной
+    log.exception("Unhandled error", exc_info=err)
 
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Укажи переменную окружения или config.TOKEN.")
-
-# === ХЭНДЛЕРЫ (поддержка bot/ или Bot/) ===
-try:
-    from bot.handlers import register_handlers as _register_handlers  # type: ignore
-except Exception:
-    try:
-        from Bot.handlers import register_handlers as _register_handlers  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Не найден модуль handlers: ни bot.handlers, ни Bot.handlers") from e
-
-
-async def _notify_startup(app):
-    """Одноразовое сообщение в чат после старта (если ALERT_CHAT_ID задан)."""
-    if ALERT_CHAT_ID:
-        try:
-            await app.bot.send_message(
-                chat_id=ALERT_CHAT_ID,
-                text="✅ Бот запущен и готов к работе."
-            )
-            log.info("Startup message sent to chat %s", ALERT_CHAT_ID)
-        except Exception as e:
-            log.warning("Failed to send startup message: %s", e)
-
-
+# ====== СБОРКА ПРИЛОЖЕНИЯ ======
 def build_app():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    # регистрируем команды/хэндлеры
-    _register_handlers(app)
-    # отправим сообщение при инициализации
-    app.post_init = _notify_startup
+
+    # команды
+    app.add_handler(CommandHandler("start", cmd_start))
+
+    # обработчик ошибок
+    app.add_error_handler(on_error)
+
     return app
 
-
+# ====== ЗАПУСК ПОЛЛИНГА ======
 if __name__ == "__main__":
     log.info(">>> ENTER main.py")
-    application = build_app()
+    app = build_app()
     log.info("Bot starting (polling)…")
-    application.run_polling(
+    # deleteWebhook PTB делает сам внутри run_polling; drop_pending — чистим хвосты
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        close_loop=False,  # устойчивее на Render
+        # close_loop=False  # можно оставить по умолчанию
     )
