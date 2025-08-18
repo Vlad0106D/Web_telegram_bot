@@ -1,50 +1,58 @@
-# main.py — минимальный рабочий скелет, чтобы проверить обработку команд
+# main.py — минимальный каркас бота с защитой от 409 и базовыми командами
 import os
 import logging
 from datetime import datetime, timezone
 
 from telegram import Update, BotCommand
+from telegram.error import Conflict
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, Application,
+    CommandHandler, MessageHandler, ContextTypes, filters,
 )
 
+# ---------------------- ЛОГИ ----------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("main")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
+# ---------------------- ENV ----------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # можно не задавать
+
+if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Env TELEGRAM_BOT_TOKEN is empty")
 
-# ---------- простые коллбэки команд ----------
-
+# ---------------------- КОМАНДЫ ----------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот запущен и готов к работе.\nКоманды: /ping /check /checkpair /find")
+    await update.message.reply_text(
+        "✅ Бот запущен и готов к работе.\n"
+        "Команды: /ping /check /checkpair /find"
+    )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong " + datetime.now(timezone.utc).strftime("%H:%M:%S UTC"))
+    await update.message.reply_text(
+        "pong " + datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    )
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # заглушка — сюда вернём аналитику
     await update.message.reply_text("Команда /check получена. (заглушка)")
 
 async def cmd_checkpair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args) if context.args else "(без аргументов)"
-    await update.message.reply_text(f"Команда /checkpair {text} получена. (заглушка)")
+    pair = " ".join(context.args) if context.args else "(без аргументов)"
+    await update.message.reply_text(f"Команда /checkpair {pair} получена. (заглушка)")
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Команда /find получена. (заглушка)")
 
-# ---------- лог всех апдейтов, чтобы видеть, что вообще прилетает ----------
+# ---------------------- ЛОГ ВСЕГО ----------------------
 async def log_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if update.message:
-            log.info("UPDATE message: chat_id=%s text=%r", update.message.chat_id, update.message.text)
+            log.info("UPDATE message: chat=%s text=%r",
+                     update.message.chat_id, update.message.text)
         elif update.callback_query:
             log.info("UPDATE callback_query: data=%r", update.callback_query.data)
         else:
@@ -52,20 +60,39 @@ async def log_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Error in log_all: %s", e)
 
-# ---------- сборка приложения ----------
-def build_app():
-    app = ApplicationBuilder().token(TOKEN).build()
+# ---------------------- ХУКИ/ОШИБКИ ----------------------
+async def post_init(app: Application):
+    """Сносим вебхук и очищаем очередь, чтобы не было подвисших апдейтов."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (drop pending updates).")
+    except Exception as e:
+        log.warning("delete_webhook warn: %s", e)
 
-    # меню команд в клиенте
-    app.bot.set_my_commands([
-        BotCommand("start", "Запуск"),
-        BotCommand("ping", "Проверка ответа"),
-        BotCommand("check", "Проверить все пары (заглушка)"),
-        BotCommand("checkpair", "Проверить пару (заглушка)"),
-        BotCommand("find", "Поиск пары (заглушка)"),
-    ])
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Гасим 409-конфликт, остальное логируем."""
+    if isinstance(context.error, Conflict):
+        log.warning("Ignoring Telegram 409 Conflict: another getUpdates is active.")
+        return
+    log.exception("Unhandled error: %s (update=%s)", context.error, update)
 
-    # лог апдейтов (ставим с самым ранним приоритетом)
+# ---------------------- СБОРКА APP ----------------------
+def build_app() -> Application:
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    # меню команд
+    try:
+        app.bot.set_my_commands([
+            BotCommand("start", "Запуск"),
+            BotCommand("ping", "Проверка ответа"),
+            BotCommand("check", "Проверить все пары (заглушка)"),
+            BotCommand("checkpair", "Проверить пару (заглушка)"),
+            BotCommand("find", "Поиск пары (заглушка)"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands warn: %s", e)
+
+    # лог всех апдейтов — самым ранним хендлером
     app.add_handler(MessageHandler(filters.ALL, log_all), group=-1)
 
     # команды
@@ -75,10 +102,14 @@ def build_app():
     app.add_handler(CommandHandler("checkpair", cmd_checkpair))
     app.add_handler(CommandHandler("find", cmd_find))
 
+    # обработчик ошибок
+    app.add_error_handler(on_error)
     return app
 
+# ---------------------- ENTRYPOINT ----------------------
 if __name__ == "__main__":
-    log.info(">>> ENTER minimal main.py")
+    log.info(">>> ENTER main.py")
     app = build_app()
     log.info("Bot starting (polling)…")
+    # drop_pending_updates=True — очищаем очередь, чтобы не зависеть от старых поллеров
     app.run_polling(allowed_updates=None, drop_pending_updates=True)
