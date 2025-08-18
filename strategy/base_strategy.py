@@ -1,268 +1,377 @@
-# strategy/base_strategy.py
-import logging
-from typing import Dict, Any, List, Tuple, Optional
+# -*- coding: utf-8 -*-
+import math
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
-from ta.trend import EMAIndicator, ADXIndicator, MACD
+import numpy as np
+from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
 from services.market_data import get_candles, get_price
+from config import (
+    RSI_PERIOD, ADX_PERIOD, BB_PERIOD,
+    EMA_FAST, EMA_SLOW,
+    ADX_STRONG, RSI_OVERBOUGHT, RSI_OVERSOLD,
+    MIN_R_MULT, TP2_R_MULT, ATR_MULT_SL, MAX_RISK_PCT
+)
 
-log = logging.getLogger(__name__)
+# --------------------------
+# Helpers
+# --------------------------
 
-# ===================== ПАРАМЕТРЫ КОРРЕКЦИИ TP/SL =====================
-TP2_MIN_PCT = 0.015  # 1.5% минимум растяжка для TP2 (LONG вверх, SHORT вниз)
-SL_PAD_PCT  = 0.005  # 0.5% запас за уровнем для SL
-
-# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
-def _fmt_price(p: float) -> str:
-    # компактное форматирование (как в твоих сообщениях)
-    return (f"{p:.8g}" if p < 1 else f"{p:,.2f}").replace(",", " ")
-
-def _levels(df: pd.DataFrame, lookback: int = 80, left: int = 2, right: int = 2) -> Tuple[List[float], List[float]]:
+def _safe_unpack_candles(ret) -> Tuple[pd.DataFrame, Optional[str]]:
     """
-    Возвращает (resistance[], support[]) по локальным экстремумам на окне lookback.
+    get_candles(...) в проекте встречался в двух вариантах:
+      1) возвращает (df, exchange)
+      2) возвращает df
+    Поддержим оба.
     """
-    highs = df["high"].to_list()
-    lows  = df["low"].to_list()
-    n = len(df)
-    start = max(0, n - lookback)
-
-    res: List[float] = []
-    sup: List[float] = []
-
-    for i in range(start + left, n - right):
-        h = highs[i]; l = lows[i]
-        if all(h >= highs[j] for j in range(i - left, i + right + 1) if j != i):
-            res.append(h)
-        if all(l <= lows[j] for j in range(i - left, i + right + 1) if j != i):
-            sup.append(l)
-
-    return sorted(set(res)), sorted(set(sup))
-
-def _nearest_above(levels: List[float], price: float, limit: int = 2) -> List[float]:
-    return sorted([x for x in levels if x > price])[:limit]
-
-def _nearest_below(levels: List[float], price: float, limit: int = 2) -> List[float]:
-    return sorted([x for x in levels if x < price], reverse=True)[:limit]
-
-# ===================== ИНДИКАТОРЫ =====================
-def _indicators(df: pd.DataFrame) -> Dict[str, float]:
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
-
-    ema200 = EMAIndicator(close, 200).ema_indicator()
-    ema50  = EMAIndicator(close, 50).ema_indicator()
-
-    rsi14 = RSIIndicator(close, 14).rsi()
-    adx14 = ADXIndicator(high, low, close, 14).adx()
-
-    macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    macd_line   = macd.macd()
-    macd_signal = macd.macd_signal()
-    macd_hist   = macd.macd_diff()
-
-    bb = BollingerBands(close, window=20, window_dev=2)
-    bb_w = (bb.bollinger_hband() - bb.bollinger_lband()) / close * 100
-
-    atr = AverageTrueRange(high, low, close, window=14).average_true_range()
-
-    return {
-        "ema200": float(ema200.iloc[-1]),
-        "ema50":  float(ema50.iloc[-1]),
-        "rsi":    float(rsi14.iloc[-1]),
-        "adx":    float(adx14.iloc[-1]),
-        "macd":   float(macd_line.iloc[-1]),
-        "macd_sig": float(macd_signal.iloc[-1]),
-        "macd_hist": float(macd_hist.iloc[-1]),
-        "bb_width": float(bb_w.iloc[-1]),
-        "atr":    float(atr.iloc[-1]),
-    }
-
-def _trend_4h(df_4h: pd.DataFrame) -> str:
-    ema200_4h = EMAIndicator(df_4h["close"], 200).ema_indicator().iloc[-1]
-    c = df_4h["close"].iloc[-1]
-    if c > ema200_4h:
-        return "up"
-    elif c < ema200_4h:
-        return "down"
-    return "flat"
-
-# ===================== СКОРИНГ И СТОРОНА =====================
-def _score_and_side(ind: Dict[str, float], trend4h: str) -> Tuple[str, int, List[str]]:
-    reasons: List[str] = []
-    long_pts = 0
-    short_pts = 0
-
-    # Тренд старшего ТФ
-    if trend4h == "up":
-        long_pts += 15; reasons.append("4H trend: up")
-    elif trend4h == "down":
-        short_pts += 15; reasons.append("4H trend: down")
+    if isinstance(ret, tuple) and len(ret) == 2 and isinstance(ret[0], pd.DataFrame):
+        return ret[0], ret[1]
+    elif isinstance(ret, pd.DataFrame):
+        return ret, None
     else:
-        reasons.append("4H trend: flat")
+        raise ValueError("get_candles() returned unexpected value")
 
-    # EMA50 vs EMA200
-    if ind["ema50"] > ind["ema200"]:
-        long_pts += 10
-    else:
-        short_pts += 10
+def _bb_width(ohlc: pd.DataFrame) -> float:
+    bb = BollingerBands(close=ohlc["close"], window=BB_PERIOD, window_dev=2)
+    up = bb.bollinger_hband()
+    low = bb.bollinger_lband()
+    mid = bb.bollinger_mavg()
+    # относительная ширина в %
+    width = (up - low) / mid.replace(0, np.nan) * 100.0
+    return float(width.iloc[-1])
 
-    # RSI
-    if ind["rsi"] >= 55:
-        long_pts += 10
-    if ind["rsi"] <= 45:
-        short_pts += 10
+def _ema(ohlc: pd.DataFrame, period: int, col: str = "close") -> float:
+    return float(EMAIndicator(close=ohlc[col], window=period).ema_indicator().iloc[-1])
 
-    # MACD-гистограмма
-    if ind["macd_hist"] > 0:
-        long_pts += 10
-    if ind["macd_hist"] < 0:
-        short_pts += 10
+def _rsi(ohlc: pd.DataFrame) -> float:
+    return float(RSIIndicator(close=ohlc["close"], window=RSI_PERIOD).rsi().iloc[-1])
 
-    # ADX — сила тренда (как положительный фактор для обеих сторон)
-    if ind["adx"] >= 25:
-        long_pts += 5; short_pts += 5
-        reasons.append(f"1H ADX={ind['adx']:.1f}")
+def _macd(ohlc: pd.DataFrame) -> Tuple[float, float]:
+    m = MACD(close=ohlc["close"])
+    macd_val = float(m.macd().iloc[-1])
+    macd_sig = float(m.macd_signal().iloc[-1])
+    return macd_val, macd_sig
 
-    # Инфо строки
-    reasons.append(f"1H BB width={ind['bb_width']:.2f}%")
-    reasons.append(f"1H RSI={ind['rsi']:.1f}")
+def _adx(ohlc: pd.DataFrame) -> float:
+    adx = ADXIndicator(
+        high=ohlc["high"], low=ohlc["low"], close=ohlc["close"], window=ADX_PERIOD
+    ).adx()
+    return float(adx.iloc[-1])
 
-    # Итог: сторона и confidence
-    if long_pts > short_pts + 5:
-        side = "long"
-        score = min(95, 50 + (long_pts - short_pts) * 2)
-    elif short_pts > long_pts + 5:
-        side = "short"
-        score = min(95, 50 + (short_pts - long_pts) * 2)
-    else:
-        side = "none"
-        score = 50
+def _atr(ohlc: pd.DataFrame) -> float:
+    atr = AverageTrueRange(
+        high=ohlc["high"], low=ohlc["low"], close=ohlc["close"], window=14
+    ).average_true_range()
+    return float(atr.iloc[-1])
 
-    return side, int(score), reasons
-
-# ===================== TP/SL (ДИНАМИЧЕСКОЕ) =====================
-def _tpsl_dynamic(
-    side: str,
-    price: float,
-    atr: float,
-    res_levels: List[float],
-    sup_levels: List[float],
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def _swing_levels(
+    ohlc: pd.DataFrame, lookback: int = 80, left: int = 2, right: int = 2
+) -> Tuple[List[float], List[float]]:
     """
-    Возвращает (TP1, TP2, SL) с динамической коррекцией:
-      LONG:
-        TP1 = ближайшее сопротивление (или price+ATR)
-        TP2 = max(второе сопротивление (или price+2*ATR), price * (1+TP2_MIN_PCT))
-        SL  = (ближайшая поддержка * (1 - SL_PAD_PCT)) или (price - ATR)
-      SHORT: зеркально
+    Простейший поиск локальных экстремумов за lookback баров.
+    Возвращаем (resistances_desc, supports_desc).
     """
+    df = ohlc.tail(lookback).copy()
+    res, sup = [], []
+    highs = df["high"].to_numpy()
+    lows = df["low"].to_numpy()
+
+    for i in range(left, len(df) - right):
+        h = highs[i]
+        l = lows[i]
+        if h == max(highs[i - left : i + right + 1]):
+            res.append(float(h))
+        if l == min(lows[i - left : i + right + 1]):
+            sup.append(float(l))
+    # отсортируем по удалённости от последней цены (ближайшие сверху/снизу первыми)
+    last_close = float(df["close"].iloc[-1])
+    res = sorted(res, key=lambda x: (x - last_close), reverse=False)  # выше цены
+    res = [x for x in res if x >= last_close]
+    sup = sorted(sup, key=lambda x: (last_close - x), reverse=False)  # ниже цены
+    sup = [x for x in sup if x <= last_close]
+
+    # оставим по 2 ближайших
+    return res[:2], sup[:2]
+
+def _fmt_num(x: Optional[float]) -> Optional[float]:
+    if x is None or np.isnan(x):
+        return None
+    # округление «красиво» до разумного числа знаков
+    if x >= 1000:
+        return round(x, 2)
+    if x >= 1:
+        return round(x, 2)
+    return round(x, 4)
+
+def _choose_sl_from_levels_and_atr(
+    side: str, entry: float, atr_val: float, res_levels: List[float], sup_levels: List[float]
+) -> Optional[float]:
+    """
+    Выбор SL:
+      LONG  -> берём ближайшую поддержку ниже entry, также учитываем entry - ATR_MULT_SL*ATR;
+              SL = min(выбранная поддержка, entry - k*ATR)
+      SHORT -> ближайшее сопротивление выше entry, также entry + k*ATR;
+              SL = max(выбранное сопротивление, entry + k*ATR)
+    """
+    k = ATR_MULT_SL
     if side == "long":
-        above = _nearest_above(res_levels, price, 2)
-        below = _nearest_below(sup_levels, price, 1)
-
-        tp1 = above[0] if len(above) >= 1 else price + atr
-        candidate_tp2 = above[1] if len(above) >= 2 else price + 2 * atr
-        min_tp2 = price * (1 + TP2_MIN_PCT)
-        tp2 = max(candidate_tp2, min_tp2)
-
-        if len(below) >= 1:
-            level_sl = below[0] * (1 - SL_PAD_PCT)
-            sl = max(0.0, level_sl)
+        below = [s for s in sup_levels if s < entry]
+        lvl = max(below) if below else None
+        atr_stop = entry - k * atr_val
+        if lvl is None:
+            sl = atr_stop
         else:
-            sl = max(0.0, price - atr)
-
-        return tp1, tp2, sl
+            sl = min(lvl, atr_stop)
+        return float(sl) if sl is not None else None
 
     if side == "short":
-        below = _nearest_below(sup_levels, price, 2)
-        above = _nearest_above(res_levels, price, 1)
-
-        tp1 = below[0] if len(below) >= 1 else price - atr
-        candidate_tp2 = below[1] if len(below) >= 2 else price - 2 * atr
-        min_tp2 = price * (1 - TP2_MIN_PCT)  # для SHORT ниже на 1.5%
-        tp2 = min(candidate_tp2, min_tp2)
-
-        if len(above) >= 1:
-            sl = above[0] * (1 + SL_PAD_PCT)
+        above = [r for r in res_levels if r > entry]
+        lvl = min(above) if above else None
+        atr_stop = entry + k * atr_val
+        if lvl is None:
+            sl = atr_stop
         else:
-            sl = price + atr
+            sl = max(lvl, atr_stop)
+        return float(sl) if sl is not None else None
 
-        return tp1, tp2, sl
+    return None
 
-    return None, None, None
+def _apply_rr_guard(
+    side: str,
+    entry: float,
+    sl: float,
+    res_levels: List[float],
+    sup_levels: List[float],
+    min_r: float = MIN_R_MULT,
+    tp2_mult: float = TP2_R_MULT,
+    max_risk_pct: float = MAX_RISK_PCT,
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Возвращает (tp1, tp2, reason_if_skip).
+    Если выполнено R:R >= min_r — отдаём tp1/tp2.
+    Если нет — пытаемся скорректировать TP1 на ближайший «жёсткий» уровень,
+    и если R всё равно < min_r — вернём (None, None, 'reason').
+    """
+    if sl is None or entry is None:
+        return None, None, "no SL/entry"
 
-# ===================== ГЛАВНЫЙ АНАЛИЗ =====================
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None, None, "zero risk"
+
+    # ограничим риск по % от цены
+    if risk / entry > max_risk_pct:
+        return None, None, f"risk too big ({round(100*risk/entry, 2)}%)"
+
+    # изначальные TP по кратности R
+    if side == "long":
+        raw_tp1 = entry + min_r * risk
+        tp2 = entry + tp2_mult * risk
+        # проверим, не «упираемся» ли в сопротивление раньше 3R
+        blocking = [r for r in res_levels if entry < r < raw_tp1]
+        if blocking:
+            best = min(blocking)  # ближайшее сопротивление
+            # пересчитаем фактическое R
+            r_eff = (best - entry) / risk
+            if r_eff < min_r:
+                return None, None, f"R<Rmin due to resistance {best}"
+            tp1 = best
+        else:
+            tp1 = raw_tp1
+        return float(tp1), float(tp2), None
+
+    if side == "short":
+        raw_tp1 = entry - min_r * risk
+        tp2 = entry - tp2_mult * risk
+        blocking = [s for s in sup_levels if raw_tp1 < s < entry]
+        if blocking:
+            best = max(blocking)  # ближайшая поддержка
+            r_eff = (entry - best) / risk
+            if r_eff < min_r:
+                return None, None, f"R<Rmin due to support {best}"
+            tp1 = best
+        else:
+            tp1 = raw_tp1
+        return float(tp1), float(tp2), None
+
+    return None, None, "no side"
+
+def _confidence(adx: float, aligned: bool) -> int:
+    """
+    Простая шкала уверенности:
+      - базово 70
+      - если ADX >= ADX_STRONG -> +10
+      - если сигналы (RSI/MACD) согласованы со старшим трендом -> +10
+      - ограничим [40..95]
+    """
+    score = 70
+    if adx >= ADX_STRONG:
+        score += 10
+    if aligned:
+        score += 10
+    return int(max(40, min(95, score)))
+
+# --------------------------
+# Main
+# --------------------------
+
 async def analyze_symbol(symbol: str, entry_tf: str = "1h") -> Dict[str, Any]:
     """
-    Возвращает словарь с анализом и готовым текстом сообщения (с TP/SL).
+    Возвращает словарь для форматтера сообщения:
+      {
+        'symbol','entry_tf','signal','score','price','atr','sl','tp1','tp2',
+        'reasons':[], 'h_adx', 'levels':{'resistance':[],'support':[]}, 'tags':[]
+      }
     """
-    # 1) данные
-    ohlc_1h, ex_h = await get_candles(symbol, entry_tf, limit=300)
-    if ohlc_1h is None or len(ohlc_1h) < 60:
-        raise RuntimeError("Недостаточно данных 1H")
+    # --- грузим данные
+    candles_4h = await get_candles(symbol, "4h", limit=300)
+    ohlc_4h, _ = _safe_unpack_candles(candles_4h)
 
-    ohlc_4h, ex_4h = await get_candles(symbol, "4h", limit=300)
-    if ohlc_4h is None or len(ohlc_4h) < 60:
-        raise RuntimeError("Недостаточно данных 4H")
+    candles_1h = await get_candles(symbol, "1h", limit=300)
+    ohlc_1h, ex = _safe_unpack_candles(candles_1h)
 
-    price, ex_p = await get_price(symbol)
-    exchange = ex_p or ex_h or ex_4h or "—"
-    last = price if price is not None else float(ohlc_1h["close"].iloc[-1])
+    # --- текущая цена
+    price = await get_price(symbol)
+    if isinstance(price, tuple):
+        # иногда возвращали (price, exchange)
+        price_val = float(price[0])
+        if ex is None and isinstance(price[1], str):
+            ex = price[1]
+    else:
+        price_val = float(price)
 
-    # 2) индикаторы и тренд
-    ind_1h = _indicators(ohlc_1h)
-    trend4h = _trend_4h(ohlc_4h)
-    side, score, reasons = _score_and_side(ind_1h, trend4h)
+    # --- индикаторы
+    ema200_4h = _ema(ohlc_4h, 200)
+    rsi_4h = _rsi(ohlc_4h)
+    trend_4h_up = ohlc_4h["close"].iloc[-1] > ema200_4h and rsi_4h >= 50
 
-    # 3) уровни
-    res_levels, sup_levels = _levels(ohlc_1h, lookback=80, left=2, right=2)
+    adx_1h = _adx(ohlc_1h)
+    rsi_1h = _rsi(ohlc_1h)
+    macd_val, macd_sig = _macd(ohlc_1h)
+    bb_width = _bb_width(ohlc_1h)
+    atr = _atr(ohlc_1h)
 
-    # 4) TP/SL (динамическое)
-    tp1, tp2, sl = _tpsl_dynamic(side, last, ind_1h["atr"], res_levels, sup_levels)
+    macd_up = macd_val >= macd_sig
+    macd_down = macd_val < macd_sig
 
-    # 5) текст сообщения
-    side_icon = {"long": "🟢 LONG", "short": "🔴 SHORT", "none": "⚪ NONE"}[side]
-    conf_icon = "🟢" if score >= 70 else ("🟡" if score >= 60 else "🔴")
-    macd_str = "MACD ↑" if ind_1h["macd_hist"] > 0 else ("MACD ↓" if ind_1h["macd_hist"] < 0 else "MACD —")
+    # --- уровни
+    res_levels, sup_levels = _swing_levels(ohlc_1h, lookback=120, left=2, right=2)
 
-    msg_lines: List[str] = []
-    msg_lines.append(f"{symbol.upper()} — {_fmt_price(last)} ({exchange})")
-    msg_lines.append(f"{side_icon}  •  TF: {entry_tf}  •  Confidence: {score}% {conf_icon}")
-    msg_lines.append(f"• 4H trend: {trend4h}")
-    msg_lines.append(f"• 1H ADX={ind_1h['adx']:.1f} | {macd_str} | RSI={ind_1h['rsi']:.1f}")
-    msg_lines.append(f"• 1H BB width={ind_1h['bb_width']:.2f}%")
-    msg_lines.append("")
-    msg_lines.append("📊 Levels:")
-    R = " • ".join(_fmt_price(x) for x in _nearest_above(res_levels, last, 2)) or "—"
-    S = " • ".join(_fmt_price(x) for x in _nearest_below(sup_levels, last, 2)) or "—"
-    msg_lines.append(f"Resistance: {R}")
-    msg_lines.append(f"Support: {S}")
+    # --- базовое направление сигнала (родная логика, упрощённо)
+    side = "none"
+    reasons: List[str] = []
+    aligned = False
 
-    if side != "none":
-        msg_lines.append("")
-        if tp1 is not None:
-            msg_lines.append(f"🎯 TP1: {_fmt_price(tp1)}")
-        if tp2 is not None:
-            msg_lines.append(f"🎯 TP2: {_fmt_price(tp2)}")
-        if sl is not None:
-            msg_lines.append(f"🛡 SL: {_fmt_price(sl)}")
+    if trend_4h_up and macd_up and rsi_1h >= 50:
+        side = "long"
+        reasons.append("4H trend: up")
+        aligned = True
+    elif (not trend_4h_up) and macd_down and rsi_1h <= 50:
+        side = "short"
+        reasons.append("4H trend: down")
+        aligned = True
+    else:
+        # пробуем контртренд на экстремумах RSI, но слабой уверенностью
+        if rsi_1h <= RSI_OVERSOLD and macd_up:
+            side = "long"
+            reasons.append("counter-trend oversold bounce")
+            aligned = False
+        elif rsi_1h >= RSI_OVERBOUGHT and macd_down:
+            side = "short"
+            reasons.append("counter-trend overbought pullback")
+            aligned = False
 
+    # если всё ещё none — вернём пустой результат с причинами
+    if side == "none":
+        reasons.extend([
+            f"4H trend: {'up' if trend_4h_up else 'down'}",
+            f"1H ADX={round(adx_1h,1)} | MACD {'↑' if macd_up else '↓'} | RSI={round(rsi_1h,1)}",
+            f"1H BB width={round(bb_width,2)}%"
+        ])
+        return {
+            "symbol": symbol,
+            "entry_tf": entry_tf,
+            "signal": "none",
+            "score": 50,
+            "price": price_val,
+            "atr": atr,
+            "sl": None,
+            "tp1": None,
+            "tp2": None,
+            "reasons": reasons + ["нет согласования условий"],
+            "h_adx": adx_1h,
+            "levels": {"resistance": res_levels, "support": sup_levels},
+            "tags": []
+        }
+
+    # --- выбираем SL (уровень + ATR)
+    sl = _choose_sl_from_levels_and_atr(side, price_val, atr, res_levels, sup_levels)
+
+    # --- рассчитываем TP1/TP2 с R:R фильтром
+    tp1, tp2, rr_reason = _apply_rr_guard(
+        side=side, entry=price_val, sl=sl,
+        res_levels=res_levels, sup_levels=sup_levels,
+        min_r=MIN_R_MULT, tp2_mult=TP2_R_MULT, max_risk_pct=MAX_RISK_PCT
+    )
+
+    # если R:R не проходит — SKIP
+    if tp1 is None or tp2 is None:
+        reasons.extend([
+            f"4H trend: {'up' if trend_4h_up else 'down'}",
+            f"1H ADX={round(adx_1h,1)} | MACD {'↑' if macd_up else '↓'} | RSI={round(rsi_1h,1)}",
+            f"1H BB width={round(bb_width,2)}%",
+        ])
+        if rr_reason:
+            reasons.append(f"skip: {rr_reason}")
+        return {
+            "symbol": symbol,
+            "entry_tf": entry_tf,
+            "signal": "none",
+            "score": 50,
+            "price": price_val,
+            "atr": atr,
+            "sl": _fmt_num(sl),
+            "tp1": None,
+            "tp2": None,
+            "reasons": reasons + [f"R:R < {MIN_R_MULT} — пропуск"],
+            "h_adx": adx_1h,
+            "levels": {"resistance": res_levels, "support": sup_levels},
+            "tags": ["SKIP_RR"]
+        }
+
+    # --- уверенность
+    score = _confidence(adx_1h, aligned)
+
+    # --- финальные причины (для красивого отчёта)
+    reasons_final = [
+        f"4H trend: {'up' if trend_4h_up else 'down'}",
+        f"1H ADX={round(adx_1h,1)} | MACD {'↑' if macd_up else '↓'} | RSI={round(rsi_1h,1)}",
+        f"1H BB width={round(bb_width,2)}%",
+    ]
+    if not aligned:
+        reasons_final.append("⚠ counter-trend")
+
+    # округлим уровни для вывода
     return {
-        "symbol": symbol.upper(),
-        "price": last,
-        "exchange": exchange,
+        "symbol": symbol,
         "entry_tf": entry_tf,
-        "side": side,
+        "signal": side,
         "score": score,
-        "reasons": reasons,
-        "levels": {"resistance": res_levels, "support": sup_levels},
-        "atr": ind_1h["atr"],
-        "tp1": tp1,
-        "tp2": tp2,
-        "sl": sl,
-        "text": "\n".join(msg_lines),
+        "price": _fmt_num(price_val),
+        "atr": _fmt_num(atr),
+        "sl": _fmt_num(sl),
+        "tp1": _fmt_num(tp1),
+        "tp2": _fmt_num(tp2),
+        "reasons": reasons_final,
+        "h_adx": adx_1h,
+        "levels": {
+            "resistance": [ _fmt_num(x) for x in res_levels ],
+            "support":    [ _fmt_num(x) for x in sup_levels ],
+        },
+        "tags": []
     }
