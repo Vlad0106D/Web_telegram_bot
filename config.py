@@ -1,15 +1,42 @@
-# config.py — минимальный конфиг
+# -*- coding: utf-8 -*-
 import os
 
-# Токен из окружения. Никаких хардкодов.
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # обязательно
+# === TELEGRAM ===
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # токен из переменных окружения
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # строка или None
 
-# Необязательные — можно оставить пустыми/не задавать
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # строка (например "-100123...") или None
-DEFAULT_PAIRS = os.getenv("WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT").replace(" ", "").split(",")
+# === WATCHLIST ===
+PAIRS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+]
 
-# Биржи по умолчанию (используем OKX, падаем на KuCoin если что)
-DEFAULT_EXCHANGE = os.getenv("DEFAULT_EXCHANGE", "okx").lower()  # okx/kucoin
+# === INTERVALS ===
+BREAKOUT_CHECK_SEC = 10
+AUTOSCAN_INTERVAL_MIN = 30
 
-# Форматирование
+# === INDICATORS / STRATEGY ===
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+BB_PERIOD  = 20
+EMA_FAST   = 9
+EMA_SLOW   = 21
+
+ADX_STRONG = 25
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD   = 30
+
+# === R:R правила (НОВОЕ) ===
+# минимальная кратность риска до TP1 (например, 3.0 = 1:3)
+MIN_R_MULT   = 3.0
+# TP2 как кратность риска
+TP2_R_MULT   = 4.5
+# множитель ATR для "страховочного" стопа (кроме уровня)
+ATR_MULT_SL  = 1.2
+# максимальный риск в % от цены (если стоп слишком далёкий — пропускаем)
+MAX_RISK_PCT = 0.012  # 1.2%
+
+# === FORMATTING ===
+EXCHANGE = "okx"
 SYMBOL_SUFFIX = "USDT"
