@@ -1,231 +1,194 @@
 # services/market_data.py
-# Асинхронная загрузка рыночных данных с OKX и KuCoin.
-# Возвращаем единый формат свечей: pandas.DataFrame c колонками:
-# ["open","high","low","close","volume"] и индексом-UTC datetime.
-# Функции:
-#   - await get_candles(symbol, tf, limit=300) -> (df, exchange)
-#   - await get_price(symbol) -> (price, exchange)
-#   - await get_price_safe(symbol) -> float | None
-
-from __future__ import annotations
-
 import asyncio
-from typing import Optional, Tuple, Dict
+import time
+from typing import Tuple, Optional, List
 
+import aiohttp
 import pandas as pd
-import numpy as np
-import httpx
 
-# -----------------------
-# Константы и маппинги
-# -----------------------
+try:
+    from config import EXCHANGE as DEFAULT_EXCHANGE
+except Exception:
+    DEFAULT_EXCHANGE = "okx"
 
-OKX_BASE = "https://www.okx.com"
-KCS_BASE = "https://api.kucoin.com"
 
-# Маппинг таймфреймов в обозначения бирж
-_OKX_BAR = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "10m": "10m",
-    "15m": "15m",
-    "30m": "30m",
-    "1h": "1H",
-    "2h": "2H",
-    "4h": "4H",
-    "6h": "6H",
-    "12h": "12H",
-    "1d": "1D",
-}
-_KCS_TYPE = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h": "1hour",
-    "4h": "4hour",
-    "1d": "1day",
+# ---- Таймфреймы-синонимы (вход -> канонический) ----
+_CANON = {
+    "1h": "1h", "1hour": "1h",
+    "4h": "4h", "4hour": "4h",
+    "30m": "30m", "30min": "30m",
+    "15m": "15m", "15min": "15m",
 }
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MrTradeBot/1.0)"}
+# ---- Маппинги таймфреймов под API бирж ----
+TF_OKX = {"1h": "1H", "4h": "4H", "30m": "30m", "15m": "15m"}
+TF_BINANCE = {"1h": "1h", "4h": "4h", "30m": "30m", "15m": "15m"}
+TF_KUCOIN = {"1h": "1hour", "4h": "4hour", "30m": "30min", "15m": "15min"}
 
-# -----------------------
-# Утилиты
-# -----------------------
 
-def _to_okx_inst(symbol: str) -> str:
-    # "BTCUSDT" -> "BTC-USDT"
-    s = symbol.upper().strip()
-    if "-" in s:
-        return s
-    if s.endswith("USDT"):
-        return s[:-4] + "-USDT"
+def _canon_tf(tf: str) -> str:
+    tf = (tf or "").strip().lower()
+    if tf not in _CANON:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return _CANON[tf]
+
+
+def _okx_symbol(symbol: str) -> str:
+    # OKX использует дефис: BTC-USDT
+    s = symbol.upper().replace("_", "-")
+    if "-" not in s:
+        s = s.replace("USDT", "-USDT")
     return s
 
-def _to_kcs_symbol(symbol: str) -> str:
-    # "BTCUSDT" -> "BTC-USDT"
-    return _to_okx_inst(symbol)
 
-def _build_df_ohlc(raw: list, order: str, scheme: str) -> pd.DataFrame:
-    """
-    Унифицируем разные форматы массивов бирж в общий DataFrame.
-    order: "desc" или "asc" — порядок входящих строк (последнее -> первое).
-    scheme:
-      - "okx": [ts, o, h, l, c, vol, volccy, ...]
-      - "kcs": [ts, o, c, h, l, vol, turnover]
-    """
-    if not raw:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
+def _kucoin_symbol(symbol: str) -> str:
+    # KuCoin тоже с дефисом
+    s = symbol.upper().replace("_", "-")
+    if "-" not in s:
+        s = s.replace("USDT", "-USDT")
+    return s
 
-    rows = raw[:]
-    if order == "desc":
-        rows = list(reversed(rows))  # делаем возрастание времени
 
-    opens, highs, lows, closes, vols, tss = [], [], [], [], [], []
-    for r in rows:
-        if scheme == "okx":
-            # OKX: ts(ms), o,h,l,c, vol(base), volccy, volCcyQuote, confirm
-            ts_ms = int(r[0])
-            o, h, l, c = map(float, (r[1], r[2], r[3], r[4]))
-            vol = float(r[5]) if len(r) > 5 else np.nan
-        else:
-            # KuCoin: ts(sec), open, close, high, low, volume, turnover
-            ts_ms = int(r[0]) * 1000
-            o = float(r[1]); c = float(r[2]); h = float(r[3]); l = float(r[4])
-            vol = float(r[5]) if len(r) > 5 else np.nan
+def _binance_symbol(symbol: str) -> str:
+    # Binance — без дефиса
+    return symbol.upper().replace("-", "")
 
-        tss.append(pd.to_datetime(ts_ms, unit="ms", utc=True))
-        opens.append(o); highs.append(h); lows.append(l); closes.append(c); vols.append(vol)
 
-    df = pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": vols},
-        index=pd.DatetimeIndex(tss, name="time")
-    )
+async def _fetch_json(session: aiohttp.ClientSession, url: str, params: dict | None = None) -> dict | list:
+    for attempt in range(3):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(0.4)
+    return {}  # на всякий
+
+
+async def _candles_okx(session: aiohttp.ClientSession, symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    inst = _okx_symbol(symbol)
+    bar = TF_OKX[tf]
+    # https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar=1H&limit=100
+    url = "https://www.okx.com/api/v5/market/candles"
+    data = await _fetch_json(session, url, params={"instId": inst, "bar": bar, "limit": str(limit)})
+    # Ответ: {"code":"0","data":[ [ts, o,h,l,c,vol,volCcy,volCcyQuote,confirm] , ... ]}
+    arr = (data or {}).get("data") or []
+    if not arr:
+        return pd.DataFrame()
+    rows = []
+    for item in arr:
+        # item: [ts, o, h, l, c, vol, ...]
+        ts = int(item[0])
+        o = float(item[1]); h = float(item[2]); l = float(item[3]); c = float(item[4])
+        vol = float(item[5])
+        rows.append((ts, o, h, l, c, vol))
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
     return df
 
-# -----------------------
-# Загрузка свечей
-# -----------------------
 
-async def _okx_candles(symbol: str, tf: str, limit: int = 300) -> Optional[pd.DataFrame]:
-    bar = _OKX_BAR.get(tf.lower())
-    if not bar:
-        return None
-    inst = _to_okx_inst(symbol)
-    url = f"{OKX_BASE}/api/v5/market/candles"
-    params = {"instId": inst, "bar": bar, "limit": str(min(limit, 1000))}
-    async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    if not isinstance(data, dict) or data.get("code") != "0":
-        return None
-    arr = data.get("data", [])
-    df = _build_df_ohlc(arr, order="desc", scheme="okx")
-    return df.tail(limit)
+async def _candles_binance(session: aiohttp.ClientSession, symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    sym = _binance_symbol(symbol)
+    interval = TF_BINANCE[tf]
+    # https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=100
+    url = "https://api.binance.com/api/v3/klines"
+    data = await _fetch_json(session, url, params={"symbol": sym, "interval": interval, "limit": str(limit)})
+    # Элементы: [ openTime, open, high, low, close, volume, closeTime, ... ]
+    if not data:
+        return pd.DataFrame()
+    rows = []
+    for k in data:
+        ts = int(k[0])
+        o = float(k[1]); h = float(k[2]); l = float(k[3]); c = float(k[4])
+        vol = float(k[5])
+        rows.append((ts, o, h, l, c, vol))
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
-async def _kcs_candles(symbol: str, tf: str, limit: int = 300) -> Optional[pd.DataFrame]:
-    ctype = _KCS_TYPE.get(tf.lower())
-    if not ctype:
-        return None
-    sym = _to_kcs_symbol(symbol)
-    url = f"{KCS_BASE}/api/v1/market/candles"
-    params = {"type": ctype, "symbol": sym}
-    async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    if not isinstance(data, dict) or data.get("code") != "200000":
-        return None
-    arr = data.get("data", [])
-    df = _build_df_ohlc(arr, order="desc", scheme="kcs")
-    return df.tail(limit)
 
-async def get_candles(symbol: str, tf: str, limit: int = 300) -> Tuple[pd.DataFrame, str]:
-    """
-    Пробуем OKX, затем KuCoin. Возвращаем (df, "OKX"/"KuCoin").
-    Бросаем ValueError, если данных нет.
-    """
-    # 1) OKX
-    try:
-        df = await _okx_candles(symbol, tf, limit)
-        if df is not None and not df.empty:
-            return df, "OKX"
-    except Exception:
-        pass
-
-    # 2) KuCoin
-    try:
-        df = await _kcs_candles(symbol, tf, limit)
-        if df is not None and not df.empty:
-            return df, "KuCoin"
-    except Exception:
-        pass
-
-    raise ValueError(f"No candles for {symbol} {tf}")
-
-# -----------------------
-# Текущая цена
-# -----------------------
-
-async def _okx_price(symbol: str) -> Optional[Tuple[float, str]]:
-    inst = _to_okx_inst(symbol)
-    url = f"{OKX_BASE}/api/v5/market/ticker"
-    params = {"instId": inst}
-    async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    if not isinstance(data, dict) or data.get("code") != "0":
-        return None
-    arr = data.get("data", [])
+async def _candles_kucoin(session: aiohttp.ClientSession, symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    sym = _kucoin_symbol(symbol)
+    ktype = TF_KUCOIN[tf]
+    # https://api.kucoin.com/api/v1/market/candles?type=1hour&symbol=BTC-USDT
+    url = "https://api.kucoin.com/api/v1/market/candles"
+    data = await _fetch_json(session, url, params={"type": ktype, "symbol": sym})
+    # Ответ: {"code":"200000","data":[ [time, open, close, high, low, volume, turnover], ... ]}
+    arr = (data or {}).get("data") or []
     if not arr:
-        return None
-    last = float(arr[0]["last"])
-    return last, "OKX"
+        return pd.DataFrame()
+    # KuCoin возвращает в обратном порядке (от новой к старой), приведём к хронологии
+    rows = []
+    for item in reversed(arr[-limit:]):
+        # item: [time, open, close, high, low, volume, turnover]
+        # time — строка timestamp в секундах
+        ts = int(float(item[0])) * 1000
+        o = float(item[1]); c = float(item[2]); h = float(item[3]); l = float(item[4])
+        vol = float(item[5])
+        rows.append((ts, o, h, l, c, vol))
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
-async def _kcs_price(symbol: str) -> Optional[Tuple[float, str]]:
-    sym = symbol.upper()
-    if "-" not in sym:
-        if sym.endswith("USDT"):
-            sym = sym[:-4] + "-USDT"
-    url = f"{KCS_BASE}/api/v1/market/orderbook/level1"
-    params = {"symbol": sym}
-    async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
-    if not isinstance(data, dict) or data.get("code") != "200000":
-        return None
-    d = data.get("data") or {}
-    price = d.get("price")
-    if price is None:
-        return None
-    return float(price), "KuCoin"
 
-async def get_price(symbol: str) -> Tuple[float, str]:
+async def get_candles(
+    symbol: str,
+    timeframe: str,
+    limit: int = 300,
+    exchange: Optional[str] = None
+) -> Tuple[pd.DataFrame, str]:
     """
-    Пробуем OKX, затем KuCoin. Возвращаем (price, exchange) или ValueError.
+    Универсальный загрузчик свечей.
+    Возвращает (df, exchange_used). Если данных нет — ValueError.
     """
-    try:
-        p = await _okx_price(symbol)
-        if p:
-            return p
-    except Exception:
-        pass
-    try:
-        p = await _kcs_price(symbol)
-        if p:
-            return p
-    except Exception:
-        pass
-    raise ValueError(f"No price for {symbol}")
+    tf = _canon_tf(timeframe)
 
-async def get_price_safe(symbol: str) -> Optional[float]:
-    try:
-        price, _ = await get_price(symbol)
-        return price
-    except Exception:
-        return None
+    # Порядок попыток: указанная биржа → остальные
+    priority: List[str] = []
+    if exchange:
+        priority.append(exchange.lower())
+    if DEFAULT_EXCHANGE and (not priority or DEFAULT_EXCHANGE.lower() not in priority):
+        priority.append(DEFAULT_EXCHANGE.lower())
+    for ex in ("okx", "binance", "kucoin"):
+        if ex not in priority:
+            priority.append(ex)
+
+    async with aiohttp.ClientSession(headers={"User-Agent": "mr.trade-bot/1.0"}) as session:
+        for ex in priority:
+            try:
+                if ex == "okx":
+                    df = await _candles_okx(session, symbol, tf, limit)
+                elif ex == "binance":
+                    df = await _candles_binance(session, symbol, tf, limit)
+                elif ex == "kucoin":
+                    df = await _candles_kucoin(session, symbol, tf, limit)
+                else:
+                    continue
+
+                if not df.empty:
+                    return df, ex
+            except Exception:
+                # тихо пробуем следующую биржу
+                await asyncio.sleep(0.2)
+                continue
+
+    raise ValueError(f"No candles for {symbol} {timeframe}")
+
+
+# Утилита для синхронного теста (локально):
+if __name__ == "__main__":
+    async def _test():
+        for ex in (None, "okx", "binance", "kucoin"):
+            try:
+                df, used = await get_candles("BTCUSDT", "1h", 100, exchange=ex)
+                print("OK:", used, len(df), "rows", "last close:", df["close"].iloc[-1])
+                break
+            except Exception as e:
+                print("fail", ex, e)
+
+    asyncio.run(_test())
