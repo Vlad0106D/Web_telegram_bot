@@ -126,3 +126,60 @@ async def get_price(symbol: str) -> Tuple[float, str]:
         log.warning("KuCoin price fail %s: %s", symbol, e)
 
     raise ValueError(f"No price for {symbol}")
+    # --- ДОБАВЬ НИЖЕ В services/market_data.py ---
+
+import re
+import httpx
+
+# Утилита нормализации "BTC-USDT" -> "BTCUSDT"
+def _norm(sym: str) -> str:
+    s = sym.replace("-", "").replace("_", "").upper()
+    # допускаем только буквы/цифры
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+async def search_symbols(query: str, limit: int = 50) -> list[str]:
+    """
+    Ищем пары по подстроке (безрегистр.) среди спотов OKX и KuCoin.
+    Возвращаем уплощённые тикеры вида BTCUSDT, без дублей, только USDT.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+
+    out: list[str] = []
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        # OKX instruments (SPOT)
+        try:
+            r_okx = await client.get("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"})
+            data = r_okx.json()
+            for inst in data.get("data", []):
+                inst_id = inst.get("instId", "")  # BTC-USDT
+                n = _norm(inst_id)
+                if n.endswith("USDT") and q in n.lower():
+                    out.append(n)
+        except Exception:
+            pass
+
+        # KuCoin symbols
+        try:
+            r_ku = await client.get("https://api.kucoin.com/api/v1/symbols")
+            data = r_ku.json()
+            for inst in data.get("data", []):
+                sym = inst.get("symbol", "")  # BTC-USDT
+                n = _norm(sym)
+                if n.endswith("USDT") and q in n.lower():
+                    out.append(n)
+        except Exception:
+            pass
+
+    # дедуп и ограничение
+    dedup = []
+    seen = set()
+    for s in out:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+        if len(dedup) >= limit:
+            break
+    return dedup
