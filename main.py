@@ -54,3 +54,29 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # main.py (фрагмент)
+import logging
+from telegram.ext import ApplicationBuilder, CommandHandler
+from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC
+from bot.watcher import breakout_job
+from bot.commands_watch import watch_on, watch_off, watch_status
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def main():
+    logger.info(">>> ENTER main.py")
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("watch_on", watch_on))
+    app.add_handler(CommandHandler("watch_off", watch_off))
+    app.add_handler(CommandHandler("watch_status", watch_status))
+
+    if WATCHER_ENABLED:
+        app.job_queue.run_repeating(breakout_job, interval=WATCHER_INTERVAL_SEC, first=0, name="breakout_watcher")
+        logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s")
+
+    app.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
