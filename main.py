@@ -1,16 +1,15 @@
-# main.py
+import os
 import logging
 from telegram.ext import ApplicationBuilder, CommandHandler
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC
 
-# — наши модули вочера
+# watcher
 from bot.watcher import breakout_job
 from bot.commands_watch import watch_on, watch_off, watch_status
 
-# — если у тебя уже есть общий регистратор хендлеров (/start, /help, /list, /find, /check)
-#   он будет вызван безопасно (без лишних аргументов)
+# базовые хендлеры (опционально, если есть)
 try:
-    from bot.handlers import register_handlers  # опционально
+    from bot.handlers import register_handlers
 except Exception:
     register_handlers = None
 
@@ -21,35 +20,42 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _env_tfs() -> list[str]:
+    # WATCHER_TFS=1h,15m,5m  (по умолчанию только 1h)
+    raw = os.getenv("WATCHER_TFS", "1h")
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
 def main():
     logger.info(">>> ENTER main.py")
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # === Твои существующие команды ===
-    # Если есть общий регистратор — подключим его
+    # базовые команды проекта (если есть)
     if callable(register_handlers):
         try:
-            register_handlers(app)  # без лишних kwargs (во избежание ошибок сигнатуры)
+            register_handlers(app)
             logger.info("Base handlers registered via bot.handlers.register_handlers()")
         except Exception as e:
             logger.exception(f"register_handlers failed: {e}")
 
-    # === Команды управления вочером ===
+    # команды управления вочером
     app.add_handler(CommandHandler("watch_on", watch_on))
     app.add_handler(CommandHandler("watch_off", watch_off))
     app.add_handler(CommandHandler("watch_status", watch_status))
 
-    # === Автозапуск вочера при старте воркера ===
+    # автозапуск вочера на ТФ из окружения
     if WATCHER_ENABLED:
-        app.job_queue.run_repeating(
-            breakout_job,
-            interval=WATCHER_INTERVAL_SEC,
-            first=0,
-            name="breakout_watcher",
-        )
-        logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s")
+        tfs = _env_tfs()
+        for tf in tfs:
+            app.job_queue.run_repeating(
+                breakout_job,
+                interval=WATCHER_INTERVAL_SEC,
+                first=0,
+                name=f"breakout_watcher_{tf}",
+                data={"tf": tf},
+            )
+        logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s for TFs: {', '.join(tfs)}")
 
-    # Запускаем бота (важно: close_loop=False, чтобы не ловить 'Cannot close a running event loop')
+    # важное: не закрывать loop (иначе RuntimeError в средах с внешним лупом)
     app.run_polling(close_loop=False)
 
 
