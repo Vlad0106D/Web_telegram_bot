@@ -1,12 +1,11 @@
 # main.py
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.error import TelegramError
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS, ALERT_CHAT_ID
-
-# наши модули
 from bot.watcher import breakout_job
 try:
-    from bot.handlers import register_handlers  # опционально: /start, /help, /list, /find, /check
+    from bot.handlers import register_handlers
 except Exception:
     register_handlers = None
 
@@ -16,42 +15,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+async def _post_init(app):
+    # Снимем вебхук, чтобы getUpdates был единственным источником
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook deleted (drop_pending_updates=True)")
+    except TelegramError as e:
+        logger.warning("delete_webhook failed: %s", e)
+
+async def _error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error", exc_info=context.error)
 
 def main():
     logger.info(">>> ENTER main.py")
-
     if not TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN пуст. Задай переменную окружения TELEGRAM_BOT_TOKEN."
-        )
+        raise RuntimeError("TELEGRAM_BOT_TOKEN пуст. Задай TELEGRAM_BOT_TOKEN.")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(_post_init)   # <-- ключевое
+        .build()
+    )
 
-    # Базовые команды, если модуль есть
+    # Базовые команды
     if callable(register_handlers):
         try:
             register_handlers(app)
             logger.info("Base handlers registered via bot.handlers.register_handlers()")
         except Exception as e:
-            logger.exception(f"register_handlers failed: {e}")
+            logger.exception("register_handlers failed: %s", e)
 
-    # Автозапуск вочера
+    # Глобальный обработчик ошибок, чтобы не падало без лога
+    app.add_error_handler(_error_handler)
+
+    # Вочер
     if WATCHER_ENABLED:
-        # В v21 можно сразу закрепить chat_id у джобы.
         app.job_queue.run_repeating(
             breakout_job,
             interval=WATCHER_INTERVAL_SEC,
             first=0,
             name="breakout_watcher",
-            chat_id=ALERT_CHAT_ID,             # ← КЛЮЧЕВОЕ: чтобы не было 'Chat_id is empty'
-            data={"tfs": WATCHER_TFS},         # таймфреймы пробрасываем в job.data
+            chat_id=ALERT_CHAT_ID,
+            data={"tfs": WATCHER_TFS},
         )
-        tfs_str = ", ".join(WATCHER_TFS) if WATCHER_TFS else "—"
-        logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s for TFs: {tfs_str}")
+        logger.info(
+            "Watcher scheduled every %ss for TFs: %s",
+            WATCHER_INTERVAL_SEC, ", ".join(WATCHER_TFS)
+        )
 
-    # Запуск бота
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
