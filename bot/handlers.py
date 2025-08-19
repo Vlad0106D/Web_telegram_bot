@@ -1,6 +1,6 @@
 # bot/handlers.py
 import logging
-from typing import List
+from typing import List, Optional
 
 from telegram import (
     Update,
@@ -19,7 +19,6 @@ from services.state import get_favorites, add_favorite, remove_favorite, init_fa
 from services.market_data import search_symbols  # async
 
 log = logging.getLogger(__name__)
-
 
 # ---------- helpers ----------
 
@@ -126,7 +125,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = await analyze_symbol(symbol, tf="1h")
             await update.message.reply_text(format_signal(res))
         except Exception as e:
-            log.exception("analyze/send failed for %s", symbol)
+            log.exception("analyze/send failed for %s 1h", symbol)
             await update.message.reply_text(f"⚠️ Ошибка при анализе {symbol}: {e}")
 
 
@@ -146,13 +145,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data.startswith("favadd:"):
             symbol = data.split(":", 1)[1]
             add_favorite(symbol)
-            # Обновим клавиатуру если это было под сообщением поиска
             await q.answer("Добавлено в избранное ✅", show_alert=False)
 
         elif data.startswith("favdel:"):
             symbol = data.split(":", 1)[1]
             remove_favorite(symbol)
-            # Перерисуем список избранного, если удаляем прямо в /list
             try:
                 favs = get_favorites()
                 await q.message.edit_reply_markup(reply_markup=_kb_favorites(favs))
@@ -169,10 +166,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"⚠️ Ошибка: {e}")
 
 
-def register_handlers(app: Application):
+def register_handlers(
+    app: Application,
+    watchlist: Optional[List[str]] = None,        # принимаем для совместимости со старым main.py
+    alert_chat_id: Optional[str] = None,          # принимаем для совместимости
+):
     """
     Подключаем все команды и колбэки.
+    Параметры watchlist/alert_chat_id принимаются и игнорируются, чтобы не ломать существующий main.py.
     """
+    # инициализируем избранное сразу при старте приложения
+    try:
+        init_favorites()
+    except Exception:
+        log.warning("init_favorites() failed on startup", exc_info=True)
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
