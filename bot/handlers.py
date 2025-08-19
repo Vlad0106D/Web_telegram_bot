@@ -1,110 +1,27 @@
 # bot/handlers.py
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from telegram import (
     Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ForceReply,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ForceReply,
 )
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
 )
+
+from services.state import get_favorites, add_favorite, remove_favorite
+from services.market_data import search_symbols
+from services.analyze import analyze_symbol
+from services.signal_text import build_signal_message  # файл, который ты прислал с форматированием
 
 log = logging.getLogger(__name__)
 
-# ====== ХРАНЕНИЕ ИЗБРАННОГО ====================================================
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-FAV_FILE = DATA_DIR / "favorites.json"
-
-
-def _load_all_favs() -> Dict[str, List[str]]:
-    if not FAV_FILE.exists():
-        return {}
-    try:
-        return json.loads(FAV_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        log.exception("Failed to read favorites.json, resetting")
-        return {}
-
-
-def _save_all_favs(data: Dict[str, List[str]]) -> None:
-    FAV_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def get_favs(chat_id: int) -> List[str]:
-    allf = _load_all_favs()
-    return allf.get(str(chat_id), [])
-
-
-def set_favs(chat_id: int, symbols: List[str]) -> None:
-    allf = _load_all_favs()
-    allf[str(chat_id)] = symbols
-    _save_all_favs(allf)
-
-
-def add_fav(chat_id: int, symbol: str) -> bool:
-    syms = get_favs(chat_id)
-    if symbol not in syms:
-        syms.append(symbol)
-        set_favs(chat_id, syms)
-        return True
-    return False
-
-
-def rem_fav(chat_id: int, symbol: str) -> bool:
-    syms = get_favs(chat_id)
-    if symbol in syms:
-        syms = [s for s in syms if s != symbol]
-        set_favs(chat_id, syms)
-        return True
-    return False
-
-
-# ====== ИСТОЧНИКИ ДАННЫХ / СИГНАЛЫ ============================================
-def list_all_pairs() -> List[str]:
-    """
-    TODO: подключи свой источник (биржа/БД/файл).
-    Верни ВСЕ доступные тикеры (верхним регистром).
-    """
-    # Пример-рыба: убери и подставь свой список
-    return [
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-        "ADAUSDT", "DOGEUSDT", "TONUSDT", "TRXUSDT", "LINKUSDT",
-    ]
-
-
-def build_signal(symbol: str) -> str:
-    """
-    TODO: подключи свою реальную генерацию сигнала.
-    Должна вернуть готовый HTML/текст сообщения без <> в обычном тексте.
-    """
-    # Пример-рыба (временная!)
-    return (
-        f"<b>{symbol}</b>\n"
-        f"• TF: 15m\n"
-        f"• Тренд: нейтральный\n"
-        f"• Уровни: 1) 1.00  2) 1.05  3) 0.95\n"
-        f"• Идея: ждать пробой и ретест.\n"
-    )
-
-
-# ====== UI: КЛАВИАТУРЫ ========================================================
+# ------------ Кнопка "Меню" ------------
 def _menu_keyboard() -> ReplyKeyboardMarkup:
     rows: List[List[KeyboardButton]] = [
         [KeyboardButton("/list"), KeyboardButton("/find")],
@@ -115,139 +32,122 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-def _list_keyboard(symbols: List[str]) -> InlineKeyboardMarkup:
+# ------------ Вспомогательные клавиатуры ------------
+def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
     for s in symbols:
-        rows.append(
-            [
-                InlineKeyboardButton(s, callback_data=f"sig|{s}"),
-                InlineKeyboardButton("➖", callback_data=f"rem|{s}"),
-            ]
-        )
-    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("Пусто", callback_data="noop")]])
+        rows.append([
+            InlineKeyboardButton(text=s, callback_data=f"sig:{s}"),
+            InlineKeyboardButton(text="➖", callback_data=f"del:{s}"),
+        ])
+    if not rows:
+        rows = [[InlineKeyboardButton(text="(список пуст)", callback_data="noop")]]
+    return InlineKeyboardMarkup(rows)
 
 
-def _search_keyboard(found: List[str]) -> InlineKeyboardMarkup:
+def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
-    for s in found:
-        rows.append(
-            [
-                InlineKeyboardButton(s, callback_data=f"sig|{s}"),
-                InlineKeyboardButton("➕", callback_data=f"add|{s}"),
-            ]
-        )
-    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("Ничего не найдено", callback_data="noop")]])
+    for s in symbols[:30]:
+        rows.append([
+            InlineKeyboardButton(text=s, callback_data=f"sig:{s}"),
+            InlineKeyboardButton(text="➕", callback_data=f"add:{s}"),
+        ])
+    if not rows:
+        rows = [[InlineKeyboardButton(text="ничего не найдено", callback_data="noop")]]
+    return InlineKeyboardMarkup(rows)
 
 
-# ====== /start /help /menu =====================================================
+# ------------ Команды ------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Привет!\n"
         "• /list — избранные пары\n"
-        "• /find текст — поиск пары\n"
-        "• /check — сигналы по избранному\n"
+        "• /find ‹строка› — поиск пары\n"   # без угловых скобок '< >', чтобы не ломать HTML parse_mode
+        "• /check — анализ избранного\n"
         "• /watch_on — включить вотчер\n"
         "• /watch_off — выключить вотчер\n"
         "• /watch_status — статус вотчера\n"
-        "• /menu — показать клавиатуру команд"
+        "• /menu — показать клавиатуру команд\n"
     )
-    if update.message:
-        await update.message.reply_text(text, reply_markup=_menu_keyboard())
+    await update.message.reply_text(text, reply_markup=_menu_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu"
-        )
+    await update.message.reply_text(
+        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu"
+    )
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("Меню команд:", reply_markup=_menu_keyboard())
+    await update.message.reply_text("Меню команд:", reply_markup=_menu_keyboard())
 
 
-# ====== /list =================================================================
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    favs = get_favs(chat_id)
-    if not favs:
-        msg = "Избранный список пуст. Используй /find, чтобы добавить пары."
-    else:
-        msg = "Избранные пары:"
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=_list_keyboard(favs))
+    favs = get_favorites()
+    await update.message.reply_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
 
 
-# ====== /find (диалог) ========================================================
-FIND_AWAIT = 10  # состояние ConversationHandler
-
-
-async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    /find [текст]
-    Если текст есть — сразу ищем.
-    Если нет — просим ввести строку (диалог).
-    """
-    q = " ".join(context.args) if context.args else ""
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Вариант 1: /find btc — сразу ищем
+    q = " ".join(context.args).strip() if context.args else ""
     if q:
-        return await _do_search_and_reply(update, context, q)
-    # диалог
-    if update.message:
+        syms = await search_symbols(q)
         await update.message.reply_text(
-            "Введи часть названия пары (например: btc, usdt, ton) — я найду подходящее:",
-            reply_markup=ForceReply(selective=True),
+            f"Результаты по «{q}»:",
+            reply_markup=_search_results_kb(syms),
         )
-    return FIND_AWAIT
-
-
-async def on_find_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = (update.message.text or "").strip()
-    await _do_search_and_reply(update, context, q)
-    return ConversationHandler.END
-
-
-async def _do_search_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> int:
-    query_up = query.upper()
-    all_pairs = list_all_pairs()
-    found = [s for s in all_pairs if query_up in s.upper()]
-    if update.message:
-        await update.message.reply_text(
-            f"Результаты по «{query}»:",
-            reply_markup=_search_keyboard(found),
-        )
-    return ConversationHandler.END
-
-
-async def cancel_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message:
-        await update.message.reply_text("Поиск отменён.")
-    return ConversationHandler.END
-
-
-# ====== /check ================================================================
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    favs = get_favs(chat_id)
-    if not favs:
-        if update.message:
-            await update.message.reply_text("Избранный список пуст. Добавь пары через /find.")
         return
 
-    if update.message:
-        await update.message.reply_text(f"Отправляю сигналы по {len(favs)} парам…")
+    # Вариант 2: попросить ввести строку поиска
+    msg = await update.message.reply_text(
+        "Напиши часть названия пары (например: btc или sol):",
+        reply_markup=ForceReply(selective=True),
+    )
+    # запомним id сообщения, чтобы поймать следующий ответ
+    context.user_data["await_find_reply_to"] = msg.message_id
 
-    # по одной паре — отдельное сообщение
-    for sym in favs:
-        text = build_signal(sym)
+
+async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ловим текстовый ответ на ForceReply из /find
+    awaited_id = context.user_data.get("await_find_reply_to")
+    if not awaited_id:
+        return
+    if not update.message or not update.message.reply_to_message:
+        return
+    if update.message.reply_to_message.message_id != awaited_id:
+        return
+
+    q = update.message.text.strip()
+    context.user_data.pop("await_find_reply_to", None)
+    if not q:
+        await update.message.reply_text("Пустой запрос.")
+        return
+
+    syms = await search_symbols(q)
+    await update.message.reply_text(
+        f"Результаты по «{q}»:",
+        reply_markup=_search_results_kb(syms),
+    )
+
+
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    favs = get_favorites()
+    if not favs:
+        await update.message.reply_text("Список избранного пуст.")
+        return
+
+    await update.message.reply_text(f"Проверяю {len(favs)} пар…")
+    for s in favs:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            log.exception("Failed to send signal for %s", sym)
-        await asyncio.sleep(0.4)  # чуть‑чуть, чтобы не спамить API
+            res = await analyze_symbol(s)
+            text = build_signal_message(res)
+            await update.message.reply_text(text)
+        except Exception as e:
+            log.exception("check %s failed", s)
+            await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
 
-# ====== Callback кнопки =======================================================
+# ------------ Callback-кнопки ------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -255,92 +155,55 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
 
     data = q.data or ""
-    if data.startswith("sig|"):
-        symbol = data.split("|", 1)[1]
-        text = build_signal(symbol)
-        await q.message.reply_text(text)
+    if data == "noop":
         return
 
-    chat_id = update.effective_chat.id
-
-    if data.startswith("add|"):
-        symbol = data.split("|", 1)[1]
-        added = add_fav(chat_id, symbol)
-        await q.edit_message_reply_markup(reply_markup=_search_keyboard(
-            _refresh_found_keyboard(q.message, added_symbol=symbol, added=True)
-        ))
-        await q.message.reply_text("Добавлено в избранное ✅" if added else "Уже в избранном")
-        return
-
-    if data.startswith("rem|"):
-        symbol = data.split("|", 1)[1]
-        removed = rem_fav(chat_id, symbol)
-        # перерисуем текущий список
-        favs = get_favs(chat_id)
-        try:
-            await q.edit_message_reply_markup(reply_markup=_list_keyboard(favs))
-        except Exception:
-            # если редактирование не удалось (например, старая кнопка) — просто ответим
-            pass
-        await q.message.reply_text("Удалено из избранного ⛔" if removed else "Этой пары нет в избранном")
-        return
-
-    # ничего не делаем для "noop"
-
-
-def _refresh_found_keyboard(message, added_symbol: str, added: bool) -> List[str]:
-    """
-    Хелпер для обновления клавы «результаты поиска».
-    Если добавили тикер — оставляем список как есть (можно усложнить, но не обязательно).
-    Здесь просто возвращаем текущий список кнопок, если удастся прочитать текст — снова ищем.
-    """
     try:
-        caption = message.text or ""
-        if "Результаты по" in caption:
-            # извлечём запрос, чтобы пересчитать(found)
-            start = caption.find("«")
-            end = caption.find("»", start + 1)
-            if start != -1 and end != -1:
-                q = caption[start + 1 : end]
-                all_pairs = list_all_pairs()
-                query_up = q.upper()
-                return [s for s in all_pairs if query_up in s.upper()]
+        action, sym = data.split(":", 1)
+        sym = sym.strip().upper()
     except Exception:
+        return
+
+    if action == "sig":
+        # прислать сигнал по паре
+        try:
+            res = await analyze_symbol(sym)
+            text = build_signal_message(res)
+            await q.message.reply_text(text)
+        except Exception as e:
+            log.exception("signal %s failed", sym)
+            await q.message.reply_text(f"{sym}: ошибка анализа — {e}")
+
+    elif action == "del":
+        favs = remove_favorite(sym)
+        await q.message.edit_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
+
+    elif action == "add":
+        add_favorite(sym)
+        await q.message.reply_text(f"{sym} добавлена в избранное ✅")
+
+    else:
         pass
-    # fallback: вернуть просто исходный список всех пар (не страшно)
-    return list_all_pairs()
 
 
-# ====== РЕГИСТРАЦИЯ ХЕНДЛЕРОВ =================================================
+# ------------ Регистрация ------------
 def register_handlers(app: Application) -> None:
-    log.info(
-        "Handlers зарегистрированы: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu"
-    )
-    # Базовые
+    log.info("Handlers зарегистрированы: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu")
+
+    # базовые
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
 
-    # Список/поиск/проверка
+    # основные команды
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("check", cmd_check))
 
-    # /find как диалог
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("find", cmd_find)],
-        states={
-            FIND_AWAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_find_query)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_find)],
-        allow_reentry=True,
-    )
-    app.add_handler(conv)
+    # ловим текстовый ответ на ForceReply после /find
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
 
-    # Кнопки
+    # callback-кнопки (сигнал / добавить / удалить)
     app.add_handler(CallbackQueryHandler(on_callback))
 
-
-# ====== ЕСЛИ У ТЕБЯ УЖЕ ЕСТЬ ГОТОВЫЕ ФУНКЦИИ В ПРОЕКТЕ =======================
-# Раскомментируй и импортируй свои реализации, а две «рыбы» выше удали.
-# from bot.market import list_all_pairs
-# from bot.signals import build_signal
+    # твои уже существующие watch_* хендлеры оставляй где они у тебя были
