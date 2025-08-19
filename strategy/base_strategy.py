@@ -2,7 +2,7 @@
 import math
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
@@ -11,13 +11,20 @@ from services.indicators import ema_series, rsi, macd, adx, bb_width
 
 log = logging.getLogger(__name__)
 
-# настройки по умолчанию
+# === Настройки по умолчанию ===
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 BB_PERIOD = 20
 
+# RR и ATR-параметры
+MIN_RR_TP1 = 3.0   # TP1 >= 3R
+MIN_RR_TP2 = 5.0   # TP2 >= 5R
+ATR_PERIOD = 14
+ATR_MULT_SL = 1.5  # на случай fallback стопа
+
+# ---------------- utils ----------------
 def _fmt_price(val: float) -> str:
     if val >= 1000:
         return f"{val:,.2f}".replace(",", " ")
@@ -28,17 +35,38 @@ def _fmt_price(val: float) -> str:
 def _now_utc_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+def _atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
+    """
+    Локальный ATR (True Range, RMA/EMA) — без зависимости от внешних либ.
+    Ожидаются колонки: high, low, close
+    """
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    c = df["close"].astype(float)
+    prev_close = c.shift(1)
+
+    tr1 = h - l
+    tr2 = (h - prev_close).abs()
+    tr3 = (l - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # EMA для ATR
+    alpha = 2 / (period + 1)
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    last_atr = float(atr.iloc[-1])
+    return max(1e-12, last_atr)
+
 def _levels(df: pd.DataFrame) -> Dict[str, float]:
     """
-    Простые уровни: последние экстремумы за ~100 свечей.
+    Простые уровни: последние экстремумы примерно за 100 свечей.
+    Возвращаем 2 сопротивления и 2 поддержки.
     """
     tail = df.tail(100)
     r = float(tail["high"].max())
     s = float(tail["low"].min())
-    # добавим второй уровень — медианные экстремумы
     r2 = float(tail["high"].nlargest(5).iloc[-1])
     s2 = float(tail["low"].nsmallest(5).iloc[-1])
-    # отсортируем по удалённости (для красоты не критично)
+
     return {
         "res1": max(r, r2),
         "res2": min(r, r2),
@@ -58,55 +86,108 @@ def _direction(close: float, ema_f: float, ema_s: float, rsi_v: float, macd_hist
         return "SHORT"
     return "NONE"
 
-def _tp_sl(symbol: str, direction: str, price: float, levels: Dict[str, float]) -> Dict[str, float]:
-    """
-    TP/SL из уровней. Если два TP совпадают или «не по сторону», применяем fallback 1:3 от ближайшего логичного SL.
-    """
-    if direction == "LONG":
-        tp_candidates = sorted([levels["res1"], levels["res2"]])
-        sl_candidates = sorted([levels["sup1"], levels["sup2"]])
-        # фильтруем TP выше цены
-        tp_filtered = [x for x in tp_candidates if x > price * 1.001]
-        sl_filtered = [x for x in sl_candidates if x < price * 0.999]
-
-        # базово
-        tp1 = tp_filtered[0] if tp_filtered else price * 1.02
-        tp2 = tp_filtered[1] if len(tp_filtered) > 1 else tp1 * 1.02
-        sl = sl_filtered[-1] if sl_filtered else price * 0.99
-
-        # fallback: если TP1≈TP2
-        if math.isclose(tp1, tp2, rel_tol=1e-3):
-            risk = price - sl
-            tp1 = price + 2 * risk
-            tp2 = price + 3 * risk
-
-    elif direction == "SHORT":
-        tp_candidates = sorted([levels["sup1"], levels["sup2"]])
-        sl_candidates = sorted([levels["res1"], levels["res2"]])
-        tp_filtered = [x for x in tp_candidates if x < price * 0.999]
-        sl_filtered = [x for x in sl_candidates if x > price * 1.001]
-
-        tp1 = tp_filtered[-1] if tp_filtered else price * 0.98
-        tp2 = tp_filtered[0] if len(tp_filtered) > 1 else tp1 * 0.98
-        sl = sl_filtered[0] if sl_filtered else price * 1.01
-
-        if math.isclose(tp1, tp2, rel_tol=1e-3):
-            risk = sl - price
-            tp1 = price - 2 * risk
-            tp2 = price - 3 * risk
-    else:
-        # NONE
-        return {"tp1": price, "tp2": price, "sl": price}
-
-    return {"tp1": tp1, "tp2": tp2, "sl": sl}
-
 def _confidence(direction: str, adx_v: float, rsi_v: float) -> int:
     if direction == "NONE":
         return 50
-    base = 65 if direction == "LONG" else 65
+    base = 65
     base += 10 if adx_v >= 25 else 0
     base += 10 if (rsi_v >= 55 and direction == "LONG") or (rsi_v <= 45 and direction == "SHORT") else 0
     return max(40, min(95, base))
+
+# ---------- RR‑логика TP/SL ----------
+def _pick_struct_levels_for_side(price: float, levels: Dict[str, float], side: str) -> Tuple[list, list]:
+    """
+    Возврат (tp_candidates, sl_candidates) отсортированных в сторону сделки.
+    """
+    if side == "LONG":
+        # цели — только выше цены; стопы — ниже цены
+        tp_raw = sorted([levels["res1"], levels["res2"]])
+        sl_raw = sorted([levels["sup1"], levels["sup2"]])
+        tp = [x for x in tp_raw if x > price * 1.0005]
+        sl = [x for x in sl_raw if x < price * 0.9995]
+    else:  # SHORT
+        tp_raw = sorted([levels["sup1"], levels["sup2"]])
+        sl_raw = sorted([levels["res1"], levels["res2"]])
+        tp = [x for x in tp_raw if x < price * 0.9995]
+        sl = [x for x in sl_raw if x > price * 1.0005]
+    return tp, sl
+
+def _tp_sl_rr_enforced(symbol: str, direction: str, price: float, df: pd.DataFrame, levels: Dict[str, float]) -> Dict[str, float]:
+    """
+    Минимум 1:3 (TP1>=3R) и TP2>=5R.
+    1) Пытаемся взять "логичный" SL от уровня в нужную сторону,
+       иначе fallback на ATR*ATR_MULT_SL.
+    2) Цели «якорим» к структуре, НО не ниже порога RR (если уровень ближе — сдвигаем до 3R/5R).
+    """
+    if direction not in ("LONG", "SHORT"):
+        return {"tp1": price, "tp2": price, "sl": price}
+
+    atr = _atr(df, ATR_PERIOD)
+
+    tp_cands, sl_cands = _pick_struct_levels_for_side(price, levels, direction)
+
+    # 1) SL: берём ближайший «логичный» уровень, иначе ATR‑fallback
+    if direction == "LONG":
+        # ближайший ниже цены — последний элемент из sl_cands
+        sl_level = sl_cands[-1] if sl_cands else None
+        if sl_level is None or sl_level >= price:
+            sl = price - ATR_MULT_SL * atr
+        else:
+            sl = sl_level
+        risk = max(1e-12, price - sl)
+        # 2) TP: минимум 3R/5R, но если ближайший уровень дальше — можно взять уровень
+        # ближайший tp выше цены — первый из tp_cands
+        tp1_struct = tp_cands[0] if tp_cands else None
+        tp2_struct = tp_cands[1] if len(tp_cands) > 1 else None
+
+        tp1_min = price + MIN_RR_TP1 * risk
+        tp2_min = price + MIN_RR_TP2 * risk
+
+        tp1 = tp1_min
+        if tp1_struct is not None and tp1_struct >= tp1_min:
+            tp1 = tp1_struct
+
+        # для TP2 — берём максимум из (минимум по RR, следующий структурный, либо дальше)
+        tp2 = tp2_min
+        if tp2_struct is not None and tp2_struct >= tp2_min:
+            tp2 = tp2_struct
+        elif tp2_struct is None and tp1_struct is not None and tp1_struct > tp1_min:
+            # если есть только один "далёкий" уровень и он уже дальше TP1_min,
+            # попробуем сделать TP2 ещё дальше на 5R
+            tp2 = max(tp2_min, tp1 + 2 * risk)
+
+    else:  # SHORT
+        sl_level = sl_cands[0] if sl_cands else None  # ближайший выше цены — первый
+        if sl_level is None or sl_level <= price:
+            sl = price + ATR_MULT_SL * atr
+        else:
+            sl = sl_level
+        risk = max(1e-12, sl - price)
+
+        tp1_struct = tp_cands[-1] if tp_cands else None  # ближайший ниже цены
+        tp2_struct = tp_cands[0] if len(tp_cands) > 1 else None
+
+        tp1_min = price - MIN_RR_TP1 * risk
+        tp2_min = price - MIN_RR_TP2 * risk
+
+        tp1 = tp1_min
+        if tp1_struct is not None and tp1_struct <= tp1_min:
+            tp1 = tp1_struct
+
+        tp2 = tp2_min
+        if tp2_struct is not None and tp2_struct <= tp2_min:
+            tp2 = tp2_struct
+        elif tp2_struct is None and tp1_struct is not None and tp1_struct < tp1_min:
+            tp2 = min(tp2_min, tp1 - 2 * risk)
+
+    # Небольшая защита: если TP2 «почти равно» TP1 — разнести
+    if math.isclose(tp1, tp2, rel_tol=1e-4):
+        if direction == "LONG":
+            tp2 = tp1 + 2 * risk
+        else:
+            tp2 = tp1 - 2 * risk
+
+    return {"tp1": float(tp1), "tp2": float(tp2), "sl": float(sl)}
 
 # --- PUBLIC --------------------------------------------------------------
 async def analyze_symbol(symbol: str, tf: str = "1h") -> Optional[Dict]:
@@ -127,14 +208,16 @@ async def analyze_symbol(symbol: str, tf: str = "1h") -> Optional[Dict]:
     macd_line, signal_line, hist = macd(close)
     macd_hist = float(hist.iloc[-1])
     adx_v = float(adx(df, ADX_PERIOD).iloc[-1])
+    # bb_width из services.indicators обычно возвращает проценты (0..100)
     bb_w = float(bb_width(close, BB_PERIOD).iloc[-1])
 
-    trend_4h = "up"  # упрощённо (если нужно — можно вытянуть 4h свечи и посчитать отдельно)
+    # (при желании можно реально посчитать 4H-тренд; пока упростим)
+    trend_4h = "up" if ema_f >= ema_s else "down"
+
     direction = _direction(last_price, ema_f, ema_s, rsi_v, macd_hist, adx_v)
     conf = _confidence(direction, adx_v, rsi_v)
-
     lv = _levels(df)
-    tpsl = _tp_sl(symbol, direction, last_price, lv)
+    tpsl = _tp_sl_rr_enforced(symbol, direction, last_price, df, lv)
 
     return {
         "symbol": symbol,
@@ -159,7 +242,7 @@ async def analyze_symbol(symbol: str, tf: str = "1h") -> Optional[Dict]:
 
 def format_signal(res: Dict) -> str:
     """
-    Сообщение в твоём формате “💎 СИГНАЛ” отдельным постом на пару.
+    Сообщение в формате “💎 СИГНАЛ” отдельным постом на пару.
     """
     sym = res["symbol"]
     px = _fmt_price(res["price"])
