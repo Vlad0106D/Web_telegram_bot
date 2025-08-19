@@ -1,5 +1,5 @@
-python-telegram-bot==21.6
-aiohttp>=3.9
+python-telegram-bot[job-queue]>=20.6
+aiohttp>=3.9.0
 pandas>=2.2
 numpy>=1.26
 requests>=2.31
