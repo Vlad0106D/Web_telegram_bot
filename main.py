@@ -1,67 +1,56 @@
-# main.py
-import os
-import asyncio
+# main.py — синхронный запуск PTB v20+, без asyncio.run/await
+
+from __future__ import annotations
+
 import logging
-from typing import List
+import os
 
-from telegram.ext import Application, ApplicationBuilder
-from bot.handlers import register_handlers  # должен существовать
+from telegram.ext import ApplicationBuilder
 
-# ----------------- logging -----------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+from bot.handlers import register_handlers  # наша функция с сигнатурой (app, watchlist=None, alert_chat_id=None)
+
+# ---------- ЛОГИ ----------
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("main")
+logger = logging.getLogger("main")
 
-# ----------------- env -----------------
+# ---------- КОНФИГ ИЗ ENV ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN (env)")
 
-# необязательные
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
-WATCHLIST_RAW = os.getenv("WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT")
-WATCHLIST: List[str] = [s.strip().upper() for s in WATCHLIST_RAW.split(",") if s.strip()]
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # опционально
+# WATCHLIST можно задавать как "BTCUSDT,ETHUSDT,SOLUSDT"
+WATCHLIST_ENV = os.getenv("WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT")
+WATCHLIST = [s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.strip()]
 
-# ----------------- build app -----------------
-def build_app() -> Application:
+def build_app():
+    # Создаём Application синхронно — без await/asyncio
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    register_handlers(app, watchlist=WATCHLIST, alert_chat_id=ALERT_CHAT_ID)
-    log.info("Handlers зарегистрированы.")
     return app
 
-# ----------------- run polling (single) -----------------
-async def run_polling_once(app: Application) -> None:
-    """
-    Стартуем polling ОДИН РАЗ, без лишних манипуляций с loop.
-    """
-    try:
-        # На всякий случай очищаем вебхук и апдейты, чтобы не ловить 409
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook удалён (drop_pending_updates=True).")
+def main():
+    logger.info(">>> ENTER main.py")
 
-        # Запускаем polling. Этот вызов блокирующий — вернётся только при остановке приложения.
-        await app.run_polling(
-            allowed_updates=None,   # все типы апдейтов
-            stop_signals=None,      # Render/процесс-менеджер управляет сигналами
-            timeout=30,             # long poll timeout
-        )
-        # Если сюда дошли — polling завершён штатно (например, приложению прислали stop).
-        log.info("Polling завершён.")
-    except Exception as e:
-        log.exception("Неожиданная ошибка в polling: %s", e)
-        # Неблокирующий sleep, чтобы лог не заспамился в случае внешних перезапусков
-        await asyncio.sleep(3)
-
-# ----------------- main -----------------
-async def main() -> None:
-    log.info(">>> ENTER main.py")
     app = build_app()
-    # ВАЖНО: не запускаем никаких «бесконечных» циклов — один запуск polling на процесс.
-    await run_polling_once(app)
+
+    # Регистрируем наши командные хендлеры
+    register_handlers(app, watchlist=WATCHLIST, alert_chat_id=ALERT_CHAT_ID)
+    logger.info("Handlers зарегистрированы.")
+
+    # В PTB run_polling сам удалит вебхук. Просто запускаем.
+    # Включаем drop_pending_updates, чтобы не ловить старые апдейты,
+    # и явно просим все типы апдейтов.
+    logger.info("Запускаю polling…")
+    app.run_polling(
+        poll_interval=1.0,           # частота опроса getUpdates
+        timeout=30,                  # long-poll таймаут
+        drop_pending_updates=True,   # отбрасываем старые апдейты
+        allowed_updates=None,        # все типы апдейтов
+        stop_signals=None,           # Render сам управляет процессом, не перехватываем SIGINT/SIGTERM
+    )
 
 if __name__ == "__main__":
-    # Запускаем единожды. PTB сам создаёт/закрывает loop внутри run_polling.
-    asyncio.run(main())
+    main()
