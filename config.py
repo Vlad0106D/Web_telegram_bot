@@ -1,26 +1,30 @@
 # config.py
 import os
 
-# Токен бота
-TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN", "")
+def _get_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
-# Вочер: включён ли автозапуск
-WATCHER_ENABLED = (os.getenv("WATCHER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on"))
+def _get_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
-# Интервал проверки в секундах
-WATCHER_INTERVAL_SEC = int(os.getenv("WATCHER_INTERVAL_SEC", "45"))
+# Основной токен: берём TELEGRAM_BOT_TOKEN, а также поддерживаем альтернативные имена
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TOKEN = TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN", "").strip() or os.getenv("TOKEN", "").strip()
+if not TOKEN:
+    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN (или BOT_TOKEN/TOKEN) в переменных окружения")
 
-# Какие таймфреймы смотреть (строка "5m,15m,1h" -> ["5m","15m","1h"])
-def _parse_tfs(s: str) -> list[str]:
-    return [part.strip() for part in s.replace(" ", "").split(",") if part.strip()]
+# Настройки вотчера
+WATCHER_ENABLED = _get_bool("WATCHER_ENABLED", True)
+WATCHER_INTERVAL_SEC = _get_int("WATCHER_INTERVAL_SEC", 45)
 
-WATCHER_TFS = _parse_tfs(os.getenv("WATCHER_TFS", "5m,15m,1h"))
+# Список таймфреймов (пример: 5m,15m,1h)
+WATCHER_TFS = [t.strip() for t in os.getenv("WATCHER_TFS", "1h").split(",") if t.strip()]
 
-# Стартовый список избранного (используется services/state.py)
-WATCHLIST = os.getenv("WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT")
-
-# Где хранить favorites.json
-FAVORITES_PATH = os.getenv("FAVORITES_PATH", "data/favorites.json")
-
-# (опционально) Куда слать алерты, если используешь в watcher
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "")  # можно оставить пустым
+# Куда слать алерты (опционально)
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "").strip() or None
