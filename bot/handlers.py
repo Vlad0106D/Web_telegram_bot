@@ -14,10 +14,13 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
+from config import WATCHER_TFS, WATCHER_INTERVAL_SEC
+from bot.watcher import schedule_watcher_jobs
+
 from services.state import get_favorites, add_favorite, remove_favorite
 from services.market_data import search_symbols
 from services.analyze import analyze_symbol
-from services.signal_text import build_signal_message  # файл, который ты прислал с форматированием
+from services.signal_text import build_signal_message
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +34,6 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-
 # ------------ Вспомогательные клавиатуры ------------
 def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
@@ -44,7 +46,6 @@ def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
         rows = [[InlineKeyboardButton(text="(список пуст)", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
 
-
 def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
     for s in symbols[:30]:
@@ -56,13 +57,12 @@ def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
         rows = [[InlineKeyboardButton(text="ничего не найдено", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
 
-
 # ------------ Команды ------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Привет!\n"
         "• /list — избранные пары\n"
-        "• /find ‹строка› — поиск пары\n"   # без угловых скобок '< >', чтобы не ломать HTML parse_mode
+        "• /find ‹строка› — поиск пары\n"
         "• /check — анализ избранного\n"
         "• /watch_on — включить вотчер\n"
         "• /watch_off — выключить вотчер\n"
@@ -71,21 +71,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
 
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu"
     )
 
-
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Меню команд:", reply_markup=_menu_keyboard())
-
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = get_favorites()
     await update.message.reply_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
-
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Вариант 1: /find btc — сразу ищем
@@ -103,12 +99,9 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Напиши часть названия пары (например: btc или sol):",
         reply_markup=ForceReply(selective=True),
     )
-    # запомним id сообщения, чтобы поймать следующий ответ
     context.user_data["await_find_reply_to"] = msg.message_id
 
-
 async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ловим текстовый ответ на ForceReply из /find
     awaited_id = context.user_data.get("await_find_reply_to")
     if not awaited_id:
         return
@@ -129,7 +122,6 @@ async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=_search_results_kb(syms),
     )
 
-
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = get_favorites()
     if not favs:
@@ -146,6 +138,45 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("check %s failed", s)
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
+# ------------ Вотчер ------------
+async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    created = schedule_watcher_jobs(
+        app=context.application,
+        tfs=WATCHER_TFS,
+        interval_sec=int(WATCHER_INTERVAL_SEC),
+    )
+    tfs_txt = ", ".join([t for t in WATCHER_TFS]) or "—"
+    await update.message.reply_text(
+        f"Вотчер включён ✅\nTF: {tfs_txt}\ninterval={WATCHER_INTERVAL_SEC}s\njobs: {', '.join(created) or '—'}"
+    )
+
+async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    jq = context.application.job_queue
+    removed = 0
+    for job in list(jq.jobs()):
+        if job and job.name and job.name.startswith("watch_"):
+            try:
+                job.schedule_removal()
+                removed += 1
+            except Exception:
+                pass
+    await update.message.reply_text(f"Вотчер выключен ⛔ (удалено jobs: {removed})")
+
+async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    jq = context.application.job_queue
+    jobs = [j for j in jq.jobs() if j and j.name and j.name.startswith("watch_")]
+
+    if not jobs:
+        await update.message.reply_text("Watcher: выключен ⛔")
+        return
+
+    lines = ["Watcher: включён ✅"]
+    for j in sorted(jobs, key=lambda x: x.name):
+        tf = j.name.replace("watch_", "", 1)
+        nxt = getattr(j, "next_t", None)
+        nxt_s = nxt.strftime("%Y-%m-%d %H:%M:%S UTC") if nxt else "—"
+        lines.append(f"• TF {tf}: next={nxt_s}")
+    await update.message.reply_text("\n".join(lines))
 
 # ------------ Callback-кнопки ------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -165,7 +196,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if action == "sig":
-        # прислать сигнал по паре
         try:
             res = await analyze_symbol(sym)
             text = build_signal_message(res)
@@ -182,28 +212,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         add_favorite(sym)
         await q.message.reply_text(f"{sym} добавлена в избранное ✅")
 
-    else:
-        pass
-
-
 # ------------ Регистрация ------------
 def register_handlers(app: Application) -> None:
     log.info("Handlers зарегистрированы: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu")
 
-    # базовые
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("menu", cmd_menu))
 
-    # основные команды
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("check", cmd_check))
 
-    # ловим текстовый ответ на ForceReply после /find
+    app.add_handler(CommandHandler("watch_on", cmd_watch_on))
+    app.add_handler(CommandHandler("watch_off", cmd_watch_off))
+    app.add_handler(CommandHandler("watch_status", cmd_watch_status))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
-
-    # callback-кнопки (сигнал / добавить / удалить)
     app.add_handler(CallbackQueryHandler(on_callback))
-
-    # твои уже существующие watch_* хендлеры оставляй где они у тебя были
