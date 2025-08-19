@@ -1,26 +1,70 @@
-# bot/commands_watch.py
+import os
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
-from bot.watcher import breakout_job
+
+from .watcher import breakout_job
 from config import WATCHER_INTERVAL_SEC
 
-JOB_NAME = "breakout_watcher"
+log = logging.getLogger(__name__)
+
+def _env_tfs() -> list[str]:
+    raw = os.getenv("WATCHER_TFS", "1h")
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+def _jobs_for_tf(app, tf: str):
+    return app.job_queue.get_jobs_by_name(f"breakout_watcher_{tf}")
+
+def _all_jobs(app):
+    return [j for j in app.job_queue.jobs() if (j.name or "").startswith("breakout_watcher_")]
 
 async def watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for j in context.job_queue.jobs():
-        if j.name == JOB_NAME:
-            await update.message.reply_text("✅ Вочер уже запущен.")
-            return
-    context.job_queue.run_repeating(breakout_job, interval=WATCHER_INTERVAL_SEC, first=0, name=JOB_NAME)
-    await update.message.reply_text(f"✅ Вочер запущен. Интервал: {WATCHER_INTERVAL_SEC}s")
+    """
+    /watch_on                  -> включить ТФ из окружения (по умолчанию 1h)
+    /watch_on 5m 15m 1h       -> включить список ТФ
+    """
+    args = [a.strip() for a in (context.args or []) if a.strip()]
+    tfs = args if args else _env_tfs()
+    enabled = []
+    for tf in tfs:
+        if _jobs_for_tf(context.application, tf):
+            continue
+        context.job_queue.run_repeating(
+            breakout_job,
+            interval=WATCHER_INTERVAL_SEC,
+            first=0,
+            name=f"breakout_watcher_{tf}",
+            data={"tf": tf},
+            chat_id=update.effective_chat.id,  # куда слать, если job дернётся из команды
+        )
+        enabled.append(tf)
+    if enabled:
+        await update.message.reply_text(f"Watcher ON ⏱ {WATCHER_INTERVAL_SEC}s | TF: {', '.join(enabled)}")
+    else:
+        await update.message.reply_text("Watcher уже был включён для указанных ТФ.")
 
 async def watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    removed = 0
-    for j in context.job_queue.jobs():
-        if j.name == JOB_NAME:
-            j.schedule_removal(); removed += 1
-    await update.message.reply_text("⏹️ Вочер остановлен." if removed else "ℹ️ Вочер и так не запущен.")
+    """
+    /watch_off             -> выключить все ТФ
+    /watch_off 5m 15m      -> выключить конкретные ТФ
+    """
+    args = [a.strip() for a in (context.args or []) if a.strip()]
+    jobs = _all_jobs(context.application) if not args else sum([_jobs_for_tf(context.application, tf) for tf in args], [])
+    if not jobs:
+        await update.message.reply_text("Watcher и так выключен.")
+        return
+    for j in jobs:
+        j.schedule_removal()
+    await update.message.reply_text("Watcher выключен 🛑")
 
 async def watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    running = any(j.name == JOB_NAME for j in context.job_queue.jobs())
-    await update.message.reply_text("🟢 Вочер: ON" if running else "⚪️ Вочер: OFF")
+    jobs = _all_jobs(context.application)
+    if not jobs:
+        await update.message.reply_text("Watcher: выключен.")
+        return
+    lines = ["Watcher: включён ✅"]
+    for j in sorted(jobs, key=lambda x: x.name or ""):
+        tf = (j.name or "").replace("breakout_watcher_", "")
+        nxt = j.next_t.strftime("%Y-%m-%d %H:%M:%S %Z") if j.next_t else "—"
+        lines.append(f"• TF {tf}: interval={WATCHER_INTERVAL_SEC}s, next={nxt}")
+    await update.message.reply_text("\n".join(lines))
