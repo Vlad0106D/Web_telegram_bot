@@ -1,82 +1,57 @@
-# main.py — синхронный запуск PTB v20+, без asyncio.run/await
-
-from __future__ import annotations
-
+# main.py
 import logging
-import os
+from telegram.ext import ApplicationBuilder, CommandHandler
+from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC
 
-from telegram.ext import ApplicationBuilder
+# — наши модули вочера
+from bot.watcher import breakout_job
+from bot.commands_watch import watch_on, watch_off, watch_status
 
-from bot.handlers import register_handlers  # наша функция с сигнатурой (app, watchlist=None, alert_chat_id=None)
+# — если у тебя уже есть общий регистратор хендлеров (/start, /help, /list, /find, /check)
+#   он будет вызван безопасно (без лишних аргументов)
+try:
+    from bot.handlers import register_handlers  # опционально
+except Exception:
+    register_handlers = None
 
-# ---------- ЛОГИ ----------
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("main")
 
-# ---------- КОНФИГ ИЗ ENV ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN (env)")
-
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # опционально
-# WATCHLIST можно задавать как "BTCUSDT,ETHUSDT,SOLUSDT"
-WATCHLIST_ENV = os.getenv("WATCHLIST", "BTCUSDT,ETHUSDT,SOLUSDT")
-WATCHLIST = [s.strip().upper() for s in WATCHLIST_ENV.split(",") if s.strip()]
-
-def build_app():
-    # Создаём Application синхронно — без await/asyncio
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    return app
-
-def main():
-    logger.info(">>> ENTER main.py")
-
-    app = build_app()
-
-    # Регистрируем наши командные хендлеры
-    register_handlers(app, watchlist=WATCHLIST, alert_chat_id=ALERT_CHAT_ID)
-    logger.info("Handlers зарегистрированы.")
-
-    # В PTB run_polling сам удалит вебхук. Просто запускаем.
-    # Включаем drop_pending_updates, чтобы не ловить старые апдейты,
-    # и явно просим все типы апдейтов.
-    logger.info("Запускаю polling…")
-    app.run_polling(
-        poll_interval=1.0,           # частота опроса getUpdates
-        timeout=30,                  # long-poll таймаут
-        drop_pending_updates=True,   # отбрасываем старые апдейты
-        allowed_updates=None,        # все типы апдейтов
-        stop_signals=None,           # Render сам управляет процессом, не перехватываем SIGINT/SIGTERM
-    )
-
-if __name__ == "__main__":
-    main()
-    # main.py (фрагмент)
-import logging
-from telegram.ext import ApplicationBuilder, CommandHandler
-from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC
-from bot.watcher import breakout_job
-from bot.commands_watch import watch_on, watch_off, watch_status
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def main():
     logger.info(">>> ENTER main.py")
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # === Твои существующие команды ===
+    # Если есть общий регистратор — подключим его
+    if callable(register_handlers):
+        try:
+            register_handlers(app)  # без лишних kwargs (во избежание ошибок сигнатуры)
+            logger.info("Base handlers registered via bot.handlers.register_handlers()")
+        except Exception as e:
+            logger.exception(f"register_handlers failed: {e}")
+
+    # === Команды управления вочером ===
     app.add_handler(CommandHandler("watch_on", watch_on))
     app.add_handler(CommandHandler("watch_off", watch_off))
     app.add_handler(CommandHandler("watch_status", watch_status))
 
+    # === Автозапуск вочера при старте воркера ===
     if WATCHER_ENABLED:
-        app.job_queue.run_repeating(breakout_job, interval=WATCHER_INTERVAL_SEC, first=0, name="breakout_watcher")
+        app.job_queue.run_repeating(
+            breakout_job,
+            interval=WATCHER_INTERVAL_SEC,
+            first=0,
+            name="breakout_watcher",
+        )
         logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s")
 
+    # Запускаем бота (важно: close_loop=False, чтобы не ловить 'Cannot close a running event loop')
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
