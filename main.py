@@ -1,13 +1,15 @@
-import asyncio
-import logging
-from typing import List
+# main.py
+from __future__ import annotations
 
-from telegram import BotCommand, BotCommandScopeDefault
-from telegram.ext import Application, ApplicationBuilder
+import logging
+from typing import Iterable
+
+from telegram.ext import ApplicationBuilder, Application
+from telegram.constants import ParseMode
 
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
-from bot.watcher import schedule_watcher_jobs  # <-- берём планировщик из watcher
+from bot.watcher import schedule_watcher_jobs
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,43 +17,49 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-BOT_COMMANDS: List[BotCommand] = [
-    BotCommand("start", "приветствие и список возможностей"),
-    BotCommand("help", "краткая справка"),
-    BotCommand("list", "избранные пары"),
-    BotCommand("find", "поиск пары по названию"),
-    BotCommand("check", "анализ избранного"),
-    BotCommand("watch_on", "включить вотчер"),
-    BotCommand("watch_off", "выключить вотчер"),
-    BotCommand("watch_status", "статус вотчера"),
-    BotCommand("menu", "показать клавиатуру команд"),
-]
 
-async def post_init(app: Application) -> None:
-    me = await app.bot.get_me()
-    logging.getLogger("main").info("Bot @%s is starting…", me.username)
+async def _post_init(app: Application) -> None:
+    # На всякий случай выключаем вебхук перед polling,
+    # чтобы не было конфликтов 409.
     await app.bot.delete_webhook(drop_pending_updates=True)
-    logging.getLogger("main").info("Webhook deleted (drop_pending_updates=True)")
-    await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    log.info("Webhook deleted (drop_pending_updates=True)")
 
-def build_app() -> Application:
-    return ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
 def main() -> None:
     log.info(">>> ENTER main.py")
-    app = build_app()
 
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(_post_init)
+        .parse_mode(ParseMode.HTML)
+        .build()
+    )
+
+    # Базовые хендлеры (ничего тут не меняем)
     register_handlers(app)
+    log.info("Base handlers registered via bot.handlers.register_handlers()")
 
+    # Планирование вотчера
     if WATCHER_ENABLED:
-        schedule_watcher_jobs(app, WATCHER_TFS, WATCHER_INTERVAL_SEC)
-        log.info(
-            "Watcher scheduled every %ss for TFs: %s",
-            WATCHER_INTERVAL_SEC,
-            ", ".join(WATCHER_TFS),
-        )
+        try:
+            created = schedule_watcher_jobs(
+                app=app,
+                tfs=WATCHER_TFS if isinstance(WATCHER_TFS, Iterable) else [],
+                interval_sec=int(WATCHER_INTERVAL_SEC),
+            )
+            log.info(
+                "Watcher scheduled every %ss for TFs: %s",
+                WATCHER_INTERVAL_SEC,
+                ", ".join([c.replace('watch_', '') for c in created]) if created else "[]",
+            )
+        except Exception:
+            log.exception("Failed to schedule watcher jobs")
 
-    app.run_polling(allowed_updates=None, drop_pending_updates=False)
+    # Запускаем polling
+    # drop_pending_updates уже сделан в _post_init, но пусть будет True и здесь.
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
