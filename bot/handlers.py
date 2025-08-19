@@ -1,113 +1,182 @@
 # bot/handlers.py
-from __future__ import annotations
-
 import logging
-from typing import Iterable, List, Optional
+from typing import List
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
-# Ожидаем, что эти функции есть и асинхронные:
-# - strategy.base_strategy.analyze_symbol(symbol: str, tf: str = "1h") -> dict
-# - strategy.base_strategy.format_signal(res: dict) -> str
 from strategy.base_strategy import analyze_symbol, format_signal
+from services.state import get_favorites, add_favorite, remove_favorite, init_favorites
+from services.market_data import search_symbols  # async
 
-logger = logging.getLogger("bot.handlers")
-
-
-async def _send_text(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int | str, text: str) -> None:
-    try:
-        await ctx.bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        logger.exception("send_message failed: %s", e)
+log = logging.getLogger(__name__)
 
 
-async def _analyze_and_send(
-    symbol: str,
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int | str,
-    tf: str = "1h",
-) -> None:
+# ---------- helpers ----------
+
+def _chunk_buttons(btns: List[InlineKeyboardButton], n: int = 2) -> List[List[InlineKeyboardButton]]:
+    return [btns[i:i+n] for i in range(0, len(btns), n)]
+
+
+def _kb_favorites(symbols: List[str]) -> InlineKeyboardMarkup:
     """
-    Выполнить анализ одной пары и отправить отформатированный результат.
-    Все вызовы — через await, без run_until_complete.
+    Клавиатура избранного: на символ — кнопка анализа и кнопка удаления ✖️
     """
-    try:
-        result = await analyze_symbol(symbol, tf=tf)  # ожидаем dict
-        text = format_signal(result)                  # форматируем
-        await _send_text(ctx, chat_id, text)
-    except Exception as e:
-        logger.exception("analyze/send failed for %s %s", symbol, tf)
-        await _send_text(ctx, chat_id, f"⚠️ Ошибка при анализе {symbol}: {e}")
+    rows = []
+    for s in symbols:
+        rows.append([
+            InlineKeyboardButton(text=s, callback_data=f"pair:{s}"),
+            InlineKeyboardButton(text="✖️", callback_data=f"favdel:{s}"),
+        ])
+    if not rows:
+        rows = [[InlineKeyboardButton(text="Добавить BTCUSDT ➕", callback_data="favadd:BTCUSDT")]]
+    return InlineKeyboardMarkup(rows)
 
 
-# ==== Командные хендлеры ====
+def _kb_search_results(symbols: List[str]) -> InlineKeyboardMarkup:
+    """
+    Для каждого найденного символа: [Анализ] [➕ Избранное]
+    """
+    rows = []
+    for s in symbols[:30]:  # не спамим кнопками
+        rows.append([
+            InlineKeyboardButton(text=f"{s} — анализ", callback_data=f"pair:{s}"),
+            InlineKeyboardButton(text="➕", callback_data=f"favadd:{s}"),
+        ])
+    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton(text="Ничего не найдено", callback_data="noop")]])
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_text(
-        context,
-        update.effective_chat.id,
-        "Привет! Я запущен и готов. Команды: /help, /check, /find <SYMBOL>.",
+
+# ---------- commands ----------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    init_favorites()
+    await update.message.reply_text(
+        "Привет! Доступно:\n"
+        "• /list — показать избранные пары\n"
+        "• /find <часть_названия> — поиск пары (например: /find fart)\n"
+        "• /check — анализ всех избранных\n"
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_text(
-        context,
-        update.effective_chat.id,
-        "Доступные команды:\n"
-        "• /check — анализ всех пар из watchlist\n"
-        "• /find <SYMBOL> — анализ конкретной пары (например, /find BTCUSDT)\n"
-        "• /help — помощь",
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/list — список избранного (кнопки)\n"
+        "/find <query> — поиск тикеров по подстроке, с добавлением в избранное\n"
+        "/check — анализ всех избранных пар\n"
     )
 
 
-def _normalize_watchlist(watchlist: Optional[Iterable[str]]) -> List[str]:
-    if not watchlist:
-        return []
-    # фильтруем пустые/пробельные и приводим к верхнему регистру
-    return [s.strip().upper() for s in watchlist if isinstance(s, str) and s.strip()]
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    favs = get_favorites()
+    kb = _kb_favorites(favs)
+    await update.message.reply_text("Избранные пары:", reply_markup=kb)
 
 
-def register_handlers(
-    app: Application,
-    watchlist: Optional[Iterable[str]] = None,
-    alert_chat_id: Optional[int | str] = None,   # зарезервировано, если понадобится
-) -> None:
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Регистрирует хендлеры. Сигнатура совместима с вызовом из main.py.
+    Использование: /find fart
     """
-    wl = _normalize_watchlist(watchlist)
+    query = ""
+    if update.message and update.message.text:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            query = parts[1].strip()
+    if not query:
+        await update.message.reply_text("Укажи строку для поиска. Пример: /find fart")
+        return
 
-    async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat_id = update.effective_chat.id
-        if not wl:
-            await _send_text(context, chat_id, "⚠️ Watchlist пуст. Добавь пары в конфиг.")
-            return
+    try:
+        symbols = await search_symbols(query)
+    except Exception as e:
+        log.exception("search_symbols failed")
+        await update.message.reply_text(f"⚠️ Ошибка поиска: {e}")
+        return
 
-        await _send_text(
-            context,
-            chat_id,
-            f"🔎 Запускаю анализ по списку: {', '.join(wl)} (TF: 1h)…",
-        )
-        # Последовательно, чтобы не плодить одновременных запросов
-        for symbol in wl:
-            await _analyze_and_send(symbol, context, chat_id, tf="1h")
+    if not symbols:
+        await update.message.reply_text("Ничего не нашёл.")
+        return
 
-    async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        chat_id = update.effective_chat.id
-        # символ берём из аргументов команды
-        if not context.args:
-            await _send_text(context, chat_id, "Использование: /find SYMBOL (например, /find BTCUSDT)")
-            return
-        symbol = context.args[0].strip().upper()
-        await _send_text(context, chat_id, f"🔎 Анализ {symbol} (TF: 1h)…")
-        await _analyze_and_send(symbol, context, chat_id, tf="1h")
+    kb = _kb_search_results(symbols)
+    await update.message.reply_text(f"Найдено ({len(symbols)}):", reply_markup=kb)
 
-    # Регистрируем команды
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("find", cmd_find))
 
-    logger.info("Handlers зарегистрированы: /start, /help, /check, /find")
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Гоняем анализ по всем избранным и шлём отдельным сообщением каждую пару в «брендовом» формате.
+    """
+    favs = get_favorites()
+    if not favs:
+        await update.message.reply_text("В избранном пусто. Добавь через /find или /list.")
+        return
+
+    await update.message.reply_text(f"Запускаю анализ {len(favs)} пар…")
+
+    for symbol in favs:
+        try:
+            res = await analyze_symbol(symbol, tf="1h")
+            await update.message.reply_text(format_signal(res))
+        except Exception as e:
+            log.exception("analyze/send failed for %s", symbol)
+            await update.message.reply_text(f"⚠️ Ошибка при анализе {symbol}: {e}")
+
+
+# ---------- callbacks ----------
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+
+    try:
+        if data.startswith("pair:"):
+            symbol = data.split(":", 1)[1]
+            res = await analyze_symbol(symbol, tf="1h")
+            await q.message.reply_text(format_signal(res))
+
+        elif data.startswith("favadd:"):
+            symbol = data.split(":", 1)[1]
+            add_favorite(symbol)
+            # Обновим клавиатуру если это было под сообщением поиска
+            await q.answer("Добавлено в избранное ✅", show_alert=False)
+
+        elif data.startswith("favdel:"):
+            symbol = data.split(":", 1)[1]
+            remove_favorite(symbol)
+            # Перерисуем список избранного, если удаляем прямо в /list
+            try:
+                favs = get_favorites()
+                await q.message.edit_reply_markup(reply_markup=_kb_favorites(favs))
+            except Exception:
+                pass
+            await q.answer("Удалено из избранного ✅", show_alert=False)
+
+        else:
+            # noop/неизвестное
+            pass
+
+    except Exception as e:
+        log.exception("callback handling error")
+        await q.message.reply_text(f"⚠️ Ошибка: {e}")
+
+
+def register_handlers(app: Application):
+    """
+    Подключаем все команды и колбэки.
+    """
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    log.info("Handlers зарегистрированы: /start, /help, /list, /find, /check")
