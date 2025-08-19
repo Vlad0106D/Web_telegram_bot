@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Iterable
 
-from telegram.ext import ApplicationBuilder, Application
 from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, Application, Defaults
 
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
@@ -19,8 +19,7 @@ log = logging.getLogger("main")
 
 
 async def _post_init(app: Application) -> None:
-    # На всякий случай выключаем вебхук перед polling,
-    # чтобы не было конфликтов 409.
+    # Сброс вебхука перед polling, чтобы не ловить 409 Conflict
     await app.bot.delete_webhook(drop_pending_updates=True)
     log.info("Webhook deleted (drop_pending_updates=True)")
 
@@ -32,11 +31,12 @@ def main() -> None:
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(_post_init)
-        .parse_mode(ParseMode.HTML)
+        # В 21.x parse_mode задаётся через Defaults:
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
     )
 
-    # Базовые хендлеры (ничего тут не меняем)
+    # Базовые хендлеры
     register_handlers(app)
     log.info("Base handlers registered via bot.handlers.register_handlers()")
 
@@ -57,7 +57,6 @@ def main() -> None:
             log.exception("Failed to schedule watcher jobs")
 
     # Запускаем polling
-    # drop_pending_updates уже сделан в _post_init, но пусть будет True и здесь.
     app.run_polling(drop_pending_updates=True)
 
 
