@@ -1,5 +1,5 @@
 # bot/handlers.py
-# Регистрация команд и обработчиков. Всё async. Никакого run_until_complete.
+# Чистый async. Никаких run_until_complete. /check шлёт по отдельному сообщению на каждую пару.
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ log = logging.getLogger("bot.handlers")
 
 async def _analyze_and_send(chat_id: int, symbol: str, tf: str, context: ContextTypes.DEFAULT_TYPE):
     """
-    Универсальный помощник: анализ символа и отправка сообщения.
+    Анализ символа и отправка сообщения.
     """
     try:
         result = await analyze_symbol(symbol, tf=tf)
