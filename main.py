@@ -1,71 +1,48 @@
 # main.py
 import os
-import asyncio
 import logging
 from telegram.ext import Application, ApplicationBuilder
-from telegram.error import Conflict
 
-# ====== ЛОГГЕР ======
+# ───────────────────── ЛОГИ ─────────────────────
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("main")
 
+# ─────────────────── ПЕРЕМЕННЫЕ ─────────────────
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
 
-# ====== ХЭНДЛЕРЫ ======
+# ─────────────── РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ───────────
 def safe_register_handlers(app: Application) -> None:
     try:
-        from bot.handlers import register_handlers  # type: ignore
+        from bot.handlers import register_handlers  # твоя функция регистрации
         register_handlers(app)
         log.info("Handlers registered.")
     except Exception as e:
-        # Не заваливаем запуск, чтобы можно было ловить 409 и чинить окружение
+        # Не валим процесс, чтобы бот мог хотя бы стартовать
         log.warning(f"register_handlers not imported/failed: {e}")
 
-async def run_polling_once(app: Application) -> None:
-    # Сносим webhook и сбрасываем «висящие» апдейты, чтобы polling был единственным источником
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    log.info("Webhook deleted (drop_pending_updates=True).")
-
-    # ВАЖНО: не используем .updater.start_polling() вручную.
-    # Используем ровно ОДИН вызов .run_polling(), который сам всё сделает.
-    await app.run_polling(
-        allowed_updates=None,   # все типы
-        stop_signals=None,      # Render управляет процессом
-        timeout=30,
-    )
-
-async def main() -> None:
+# ────────────────────── ENTRYPOINT ───────────────
+if __name__ == "__main__":
     log.info(">>> ENTER main.py")
 
+    # Создаём приложение
     app = ApplicationBuilder().token(TOKEN).build()
+
+    # Подвязываем команды/хендлеры
     safe_register_handlers(app)
 
-    # Бесконечный охранный цикл с бэкоффом на 409
-    backoff = 10
-    while True:
-        try:
-            log.info("Starting polling…")
-            await run_polling_once(app)
-            # Если run_polling вернулся без исключений — выходим.
-            log.info("Polling finished normally. Exit.")
-            break
-        except Conflict as e:
-            # Это означает, что где-то ЕЩЁ идёт getUpdates этим же токеном
-            log.warning(f"409 Conflict: another getUpdates is active. Retry in {backoff}s")
-            await asyncio.sleep(backoff)
-            # Можно чуть увеличивать бэкофф, но ограничим:
-            backoff = min(backoff + 5, 60)
-            continue
-        except Exception as e:
-            log.exception(f"Unexpected polling exception: {e}. Retry in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff + 5, 60)
-            continue
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # ВАЖНО:
+    # 1) НЕ используем asyncio.run() и НЕ await'им run_polling()
+    # 2) Сносим webhook и дропаем висящие апдейты флагом drop_pending_updates
+    # 3) stop_signals=None — Render сам рулит процессом, не перехватываем SIGTERM/SIGINT
+    log.info("Starting polling …")
+    app.run_polling(
+        allowed_updates=None,        # все типы апдейтов
+        stop_signals=None,           # не перехватываем сигналы
+        drop_pending_updates=True,   # снести хвост апдейтов при старте
+        timeout=30,                  # long-poll таймаут
+    )
