@@ -1,30 +1,31 @@
 # config.py
 import os
 
-def _get_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+# === Телеграм токен ===
+# В окружении у тебя переменная называется именно так:
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-def _get_int(name: str, default: int) -> int:
+# === Настройки вочера ===
+WATCHER_ENABLED = os.getenv("WATCHER_ENABLED", "1").strip() == "1"
+
+# Период между запусками джобы (в секундах)
+WATCHER_INTERVAL_SEC = int(os.getenv("WATCHER_INTERVAL_SEC", "45").strip() or "45")
+
+# Таймфреймы, через запятую. Пример: "5m,15m,1h"
+WATCHER_TFS = [
+    t.strip()
+    for t in os.getenv("WATCHER_TFS", "1h").split(",")
+    if t.strip()
+]
+
+# Куда слать алерты (chat id). Пример: 776505127
+def _read_chat_id() -> int | None:
+    raw = os.getenv("ALERT_CHAT_ID", "").strip()
+    if not raw:
+        return None
     try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+        return int(raw)
+    except ValueError:
+        return None
 
-# Основной токен: берём TELEGRAM_BOT_TOKEN, а также поддерживаем альтернативные имена
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TOKEN = TELEGRAM_BOT_TOKEN or os.getenv("BOT_TOKEN", "").strip() or os.getenv("TOKEN", "").strip()
-if not TOKEN:
-    raise RuntimeError("Не найден TELEGRAM_BOT_TOKEN (или BOT_TOKEN/TOKEN) в переменных окружения")
-
-# Настройки вотчера
-WATCHER_ENABLED = _get_bool("WATCHER_ENABLED", True)
-WATCHER_INTERVAL_SEC = _get_int("WATCHER_INTERVAL_SEC", 45)
-
-# Список таймфреймов (пример: 5m,15m,1h)
-WATCHER_TFS = [t.strip() for t in os.getenv("WATCHER_TFS", "1h").split(",") if t.strip()]
-
-# Куда слать алерты (опционально)
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID", "").strip() or None
+ALERT_CHAT_ID = _read_chat_id()
