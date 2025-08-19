@@ -1,42 +1,23 @@
-# -*- coding: utf-8 -*-
+# config.py
 import os
 
-# === TELEGRAM ===
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # токен из переменных окружения
-ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")  # строка или None
+# Telegram
+TOKEN = os.getenv("TOKEN", "7753750626:AAF17RQv-ySPqppsBMF_crvHw6p-ZNwMwtU")
+ALERT_CHAT_ID = int(os.getenv("ALERT_CHAT_ID", "776505127"))
 
-# === WATCHLIST ===
-PAIRS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "SOLUSDT",
-]
+# Вочер
+WATCHER_ENABLED = os.getenv("WATCHER_ENABLED", "true").lower() == "true"
+WATCHER_INTERVAL_SEC = int(os.getenv("WATCHER_INTERVAL_SEC", "45"))
 
-# === INTERVALS ===
-BREAKOUT_CHECK_SEC = 10
-AUTOSCAN_INTERVAL_MIN = 30
+# Параметры сигналов «возможен пробой / пробой»
+LOOKBACK_RANGE = int(os.getenv("LOOKBACK_RANGE", "48"))
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_STD = float(os.getenv("BB_STD", "2.0"))
+BB_SQUEEZE_PCT = float(os.getenv("BB_SQUEEZE_PCT", "2.5"))
+PROXIMITY_PCT = float(os.getenv("PROXIMITY_PCT", "0.35"))
+BREAK_EPS_PCT = float(os.getenv("BREAK_EPS_PCT", "0.15"))
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "30"))
 
-# === INDICATORS / STRATEGY ===
-RSI_PERIOD = 14
-ADX_PERIOD = 14
-BB_PERIOD  = 20
-EMA_FAST   = 9
-EMA_SLOW   = 21
-
-ADX_STRONG = 25
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD   = 30
-
-# === R:R правила (НОВОЕ) ===
-# минимальная кратность риска до TP1 (например, 3.0 = 1:3)
-MIN_R_MULT   = 3.0
-# TP2 как кратность риска
-TP2_R_MULT   = 4.5
-# множитель ATR для "страховочного" стопа (кроме уровня)
-ATR_MULT_SL  = 1.2
-# максимальный риск в % от цены (если стоп слишком далёкий — пропускаем)
-MAX_RISK_PCT = 0.012  # 1.2%
-
-# === FORMATTING ===
-EXCHANGE = "okx"
-SYMBOL_SUFFIX = "USDT"
+# Сеть
+HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "12"))
+HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "3"))
