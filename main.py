@@ -1,70 +1,70 @@
-# main.py
+import asyncio
 import logging
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.error import TelegramError
-from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS, ALERT_CHAT_ID
-from bot.watcher import breakout_job
-try:
-    from bot.handlers import register_handlers
-except Exception:
-    register_handlers = None
+import os
+from typing import List
+
+from telegram import BotCommand, BotCommandScopeDefault
+from telegram.ext import Application, ApplicationBuilder
+
+from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
+from bot.handlers import register_handlers, schedule_watcher_jobs
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("main")
+log = logging.getLogger("main")
 
-async def _post_init(app):
-    # Снимем вебхук, чтобы getUpdates был единственным источником
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted (drop_pending_updates=True)")
-    except TelegramError as e:
-        logger.warning("delete_webhook failed: %s", e)
 
-async def _error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error", exc_info=context.error)
+# --- список команд для системного меню Telegram ---
+BOT_COMMANDS: List[BotCommand] = [
+    BotCommand("start", "приветствие и список возможностей"),
+    BotCommand("help", "краткая справка"),
+    BotCommand("list", "избранные пары"),
+    BotCommand("find", "поиск пары по названию"),
+    BotCommand("check", "анализ избранного"),
+    BotCommand("watch_on", "включить вотчер"),
+    BotCommand("watch_off", "выключить вотчер"),
+    BotCommand("watch_status", "статус вотчера"),
+    BotCommand("menu", "показать клавиатуру команд"),
+]
 
-def main():
-    logger.info(">>> ENTER main.py")
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN пуст. Задай TELEGRAM_BOT_TOKEN.")
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .post_init(_post_init)   # <-- ключевое
-        .build()
-    )
+async def post_init(app: Application) -> None:
+    # гарантированно отключаем вебхук и настраиваем меню команд
+    me = await app.bot.get_me()
+    log.info("Bot @%s (%s) is starting…", me.username, me.first_name)
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Webhook deleted (drop_pending_updates=True)")
 
-    # Базовые команды
-    if callable(register_handlers):
-        try:
-            register_handlers(app)
-            logger.info("Base handlers registered via bot.handlers.register_handlers()")
-        except Exception as e:
-            logger.exception("register_handlers failed: %s", e)
+    await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    log.info("Bot commands set for default scope (%d commands)", len(BOT_COMMANDS))
 
-    # Глобальный обработчик ошибок, чтобы не падало без лога
-    app.add_error_handler(_error_handler)
 
-    # Вочер
+def build_app() -> Application:
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    return app
+
+
+def main() -> None:
+    log.info(">>> ENTER main.py")
+    app = build_app()
+
+    # хендлеры
+    register_handlers(app)
+
+    # планировщик вотчера
     if WATCHER_ENABLED:
-        app.job_queue.run_repeating(
-            breakout_job,
-            interval=WATCHER_INTERVAL_SEC,
-            first=0,
-            name="breakout_watcher",
-            chat_id=ALERT_CHAT_ID,
-            data={"tfs": WATCHER_TFS},
-        )
-        logger.info(
+        schedule_watcher_jobs(app, WATCHER_TFS, WATCHER_INTERVAL_SEC)
+        log.info(
             "Watcher scheduled every %ss for TFs: %s",
-            WATCHER_INTERVAL_SEC, ", ".join(WATCHER_TFS)
+            WATCHER_INTERVAL_SEC,
+            ", ".join(WATCHER_TFS),
         )
 
-    app.run_polling(close_loop=False)
+    # запуск
+    app.run_polling(allowed_updates=None, drop_pending_updates=False)
+
 
 if __name__ == "__main__":
     main()
