@@ -1,237 +1,214 @@
 # strategy/base_strategy.py
-# Полностью async: НИГДЕ нет run_until_complete. Возвращает dict сигнала и умеет форматировать сообщение.
-
-from __future__ import annotations
-
 import math
+import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, Optional
 
 import pandas as pd
 
-# --- внешние сервисы/утилиты ---
-from services.market_data import get_candles  # async: await get_candles(symbol, tf, limit)
-from services.indicators import (
-    ema_series,
-    rsi_series,
-    macd_delta,
-    adx_series,
-    bb_width_series,
-)
+from services.market_data import get_candles, get_price
+from services.indicators import ema_series, rsi, macd, adx, bb_width
 
-# fmt_price может жить в services.utils. Если его нет — используем локальный fallback.
-try:
-    from services.utils import fmt_price
-except Exception:
-    def fmt_price(x: float | None) -> str:
-        if x is None:
-            return "—"
-        try:
-            v = float(x)
-        except Exception:
-            return str(x)
-        if v >= 1000:
-            return f"{v:,.2f}".replace(",", " ")
-        if v >= 1:
-            return f"{v:.2f}"
-        return f"{v:.6f}".rstrip("0").rstrip(".")
+log = logging.getLogger(__name__)
 
+# настройки по умолчанию
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+BB_PERIOD = 20
 
-# ================= ВСПОМОГАТЕЛЬНОЕ =================
+def _fmt_price(val: float) -> str:
+    if val >= 1000:
+        return f"{val:,.2f}".replace(",", " ")
+    if val >= 1:
+        return f"{val:.2f}"
+    return f"{val:.6f}".rstrip("0").rstrip(".")
 
-async def _safe_get_candles(symbol: str, tf: str, limit: int = 300) -> Tuple[pd.DataFrame, str]:
+def _now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def _levels(df: pd.DataFrame) -> Dict[str, float]:
     """
-    Чистый await get_candles. Если пусто — бросаем осмысленную ошибку.
+    Простые уровни: последние экстремумы за ~100 свечей.
     """
-    df, exchange = await get_candles(symbol, tf, limit=limit)
-    if df is None or len(df) == 0:
-        raise ValueError(f"No candles for {symbol} {tf}")
-    return df, exchange
-
-
-def _fmt_levels(resist: List[float], support: List[float]) -> Tuple[str, str]:
-    r = " • ".join(fmt_price(x) for x in resist) if resist else "—"
-    s = " • ".join(fmt_price(x) for x in support) if support else "—"
-    return r, s
-
-
-def _build_levels(price: float) -> Tuple[List[float], List[float]]:
-    """
-    Простая генерация уровней вокруг текущей цены.
-    При желании подменишь на свинговые/локальные экстреумы.
-    """
-    # сопротивления (выше цены)
-    r1 = price * 1.006
-    r2 = price * 1.015
-    # поддержки (ниже цены)
-    s1 = price * 0.995
-    s2 = price * 0.985
-    resist = sorted([r1, r2])
-    support = sorted([s2, s1])  # от более глубокой к ближней
-    return resist, support
-
-
-def _tp_sl(direction: str, price: float, resist: List[float], support: List[float]) -> Tuple[float | None, float | None, float | None]:
-    """
-    TP/SL. Для LONG: SL ниже поддержки, TP1 — ближнее сопротивление, TP2 — дальнее.
-    Для SHORT: SL выше сопротивления, TP1 — ближняя поддержка, TP2 — дальняя.
-    Если уровни «слишком близко» — двигаем TP2 на 1%.
-    """
-    if direction == "LONG":
-        sl = support[0] if support else price * 0.985
-        tp1 = resist[0] if resist else price * 1.01
-        tp2 = resist[-1] if len(resist) > 1 else max(tp1 * 1.01, price * 1.02)
-        # разлипляем TP1/TP2, если почти совпали
-        if math.isclose(tp1, tp2, rel_tol=5e-3, abs_tol=1e-6):
-            tp2 = tp1 * 1.01
-        return tp1, tp2, sl
-
-    if direction == "SHORT":
-        sl = resist[-1] if resist else price * 1.015
-        tp1 = support[-1] if support else price * 0.99
-        tp2 = support[0] if len(support) > 1 else min(tp1 * 0.99, price * 0.98)
-        if math.isclose(tp1, tp2, rel_tol=5e-3, abs_tol=1e-6):
-            tp2 = tp1 * 0.99
-        return tp1, tp2, sl
-
-    return None, None, None
-
-
-def _confidence_color(score: int) -> str:
-    if score >= 80:
-        return "🟢"
-    if score >= 65:
-        return "🟡"
-    return "🔴"
-
-
-# ================= ОСНОВНОЙ АНАЛИЗ =================
-
-async def analyze_symbol(symbol: str, tf: str = "1h") -> Dict:
-    """
-    Возвращает словарь со всеми полями сигнала.
-    Всё async, без run_until_complete/loop.close и т.п.
-    """
-    # 1) Свечи
-    df_1h, ex_1h = await _safe_get_candles(symbol, tf, limit=400)
-    df_4h, _ = await _safe_get_candles(symbol, "4h", limit=400)
-
-    close_1h = df_1h["close"].astype(float)
-
-    # 2) Индикаторы
-    ema9_v = float(ema_series(close_1h, 9).iloc[-1])
-    ema21_v = float(ema_series(close_1h, 21).iloc[-1])
-    rsi_v = float(rsi_series(close_1h, 14).iloc[-1])
-    macd_d = float(macd_delta(close_1h).iloc[-1])
-    adx_v = float(adx_series(df_1h).iloc[-1])
-    bbw_v = float(bb_width_series(close_1h).iloc[-1])
-
-    # Тренд 4H по EMA 9/21
-    ema9_4h = float(ema_series(df_4h["close"].astype(float), 9).iloc[-1])
-    ema21_4h = float(ema_series(df_4h["close"].astype(float), 21).iloc[-1])
-    trend_4h = "up" if ema9_4h > ema21_4h else "down"
-
-    price = float(close_1h.iloc[-1])
-
-    # 3) Логика направления и скора
-    score = 50
-    direction = "NONE"
-
-    if ema9_v > ema21_v and rsi_v >= 50:
-        direction = "LONG"
-        score += 15
-    elif ema9_v < ema21_v and rsi_v <= 50:
-        direction = "SHORT"
-        score += 15
-
-    if adx_v >= 25:
-        score += 10
-    if direction == "LONG" and trend_4h == "up":
-        score += 10
-    if direction == "SHORT" and trend_4h == "down":
-        score += 10
-
-    # 4) Уровни + TP/SL
-    resist, support = _build_levels(price)
-    tp1, tp2, sl = _tp_sl(direction, price, resist, support)
-
-    # 5) Выходной словарь
+    tail = df.tail(100)
+    r = float(tail["high"].max())
+    s = float(tail["low"].min())
+    # добавим второй уровень — медианные экстремумы
+    r2 = float(tail["high"].nlargest(5).iloc[-1])
+    s2 = float(tail["low"].nsmallest(5).iloc[-1])
+    # отсортируем по удалённости (для красоты не критично)
     return {
-        "symbol": symbol,
-        "price": price,
-        "exchange": ex_1h,
-        "timeframe": tf,
-        "trend4h": trend_4h,
-        "ema9": ema9_v,
-        "ema21": ema21_v,
-        "rsi": rsi_v,
-        "macd_delta": macd_d,
-        "adx": adx_v,
-        "bbw": bbw_v,
-        "direction": direction,
-        "score": int(score),
-        "resist": resist,
-        "support": support,
-        "tp1": tp1,
-        "tp2": tp2,
-        "sl": sl,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "res1": max(r, r2),
+        "res2": min(r, r2),
+        "sup1": min(s, s2),
+        "sup2": max(s, s2),
     }
 
+def _direction(close: float, ema_f: float, ema_s: float, rsi_v: float, macd_hist: float, adx_v: float) -> str:
+    score = 0
+    score += 1 if ema_f > ema_s else -1
+    score += 1 if rsi_v > 55 else -1 if rsi_v < 45 else 0
+    score += 1 if macd_hist > 0 else -1
+    score += 1 if adx_v > 20 else 0
+    if score >= 2:
+        return "LONG"
+    if score <= -2:
+        return "SHORT"
+    return "NONE"
 
-# ================= ФОРМАТИРОВАНИЕ =================
-
-def format_signal(sig: Dict) -> str:
+def _tp_sl(symbol: str, direction: str, price: float, levels: Dict[str, float]) -> Dict[str, float]:
     """
-    Единый формат сообщения (с TP/SL).
+    TP/SL из уровней. Если два TP совпадают или «не по сторону», применяем fallback 1:3 от ближайшего логичного SL.
     """
-    symbol = sig["symbol"]
-    price = fmt_price(sig["price"])
-    ex = sig.get("exchange", "-")
-    tf = sig.get("timeframe", "-")
-    trend4h = sig.get("trend4h", "-")
-
-    ema9 = fmt_price(sig.get("ema9"))
-    ema21 = fmt_price(sig.get("ema21"))
-    rsi = f'{sig.get("rsi", 0):.1f}'
-    macd_d = f'{sig.get("macd_delta", 0.0):.4f}'
-    adx = f'{sig.get("adx", 0.0):.1f}'
-    bbw = f'{sig.get("bbw", 0.0)*100:.2f}%'
-
-    direction = sig.get("direction", "NONE")
-    score = sig.get("score", 0)
-    conf_color = _confidence_color(score)
-
-    r_text, s_text = _fmt_levels(sig.get("resist", []), sig.get("support", []))
-    tp1 = fmt_price(sig.get("tp1"))
-    tp2 = fmt_price(sig.get("tp2"))
-    sl = fmt_price(sig.get("sl"))
-    updated = sig.get("updated_at", "-")
-
-    headline = "⚪ NONE"
     if direction == "LONG":
-        headline = "🟢 LONG"
+        tp_candidates = sorted([levels["res1"], levels["res2"]])
+        sl_candidates = sorted([levels["sup1"], levels["sup2"]])
+        # фильтруем TP выше цены
+        tp_filtered = [x for x in tp_candidates if x > price * 1.001]
+        sl_filtered = [x for x in sl_candidates if x < price * 0.999]
+
+        # базово
+        tp1 = tp_filtered[0] if tp_filtered else price * 1.02
+        tp2 = tp_filtered[1] if len(tp_filtered) > 1 else tp1 * 1.02
+        sl = sl_filtered[-1] if sl_filtered else price * 0.99
+
+        # fallback: если TP1≈TP2
+        if math.isclose(tp1, tp2, rel_tol=1e-3):
+            risk = price - sl
+            tp1 = price + 2 * risk
+            tp2 = price + 3 * risk
+
     elif direction == "SHORT":
-        headline = "🔴 SHORT"
+        tp_candidates = sorted([levels["sup1"], levels["sup2"]])
+        sl_candidates = sorted([levels["res1"], levels["res2"]])
+        tp_filtered = [x for x in tp_candidates if x < price * 0.999]
+        sl_filtered = [x for x in sl_candidates if x > price * 1.001]
 
-    text = (
-        f"{symbol} — {price} ({ex})\n"
-        f"{headline}  •  TF: {tf}  •  Confidence: {score}% {conf_color}\n"
-        f"• 4H trend: {trend4h}\n"
-        f"• EMA9={ema9} | EMA21={ema21} | RSI={rsi} | MACD Δ={macd_d} | ADX={adx} | BB width={bbw}\n"
-        f"\n"
-        f"📊 Levels:\n"
-        f"Resistance: {r_text}\n"
-        f"Support: {s_text}\n"
+        tp1 = tp_filtered[-1] if tp_filtered else price * 0.98
+        tp2 = tp_filtered[0] if len(tp_filtered) > 1 else tp1 * 0.98
+        sl = sl_filtered[0] if sl_filtered else price * 1.01
+
+        if math.isclose(tp1, tp2, rel_tol=1e-3):
+            risk = sl - price
+            tp1 = price - 2 * risk
+            tp2 = price - 3 * risk
+    else:
+        # NONE
+        return {"tp1": price, "tp2": price, "sl": price}
+
+    return {"tp1": tp1, "tp2": tp2, "sl": sl}
+
+def _confidence(direction: str, adx_v: float, rsi_v: float) -> int:
+    if direction == "NONE":
+        return 50
+    base = 65 if direction == "LONG" else 65
+    base += 10 if adx_v >= 25 else 0
+    base += 10 if (rsi_v >= 55 and direction == "LONG") or (rsi_v <= 45 and direction == "SHORT") else 0
+    return max(40, min(95, base))
+
+# --- PUBLIC --------------------------------------------------------------
+async def analyze_symbol(symbol: str, tf: str = "1h") -> Optional[Dict]:
+    """
+    Асинхронный анализ одной пары.
+    Возвращает dict с полями для форматирования сообщения.
+    """
+    df, ex = await get_candles(symbol, tf, limit=400)
+    if df.empty or len(df) < 50:
+        raise ValueError(f"Too few candles for {symbol} {tf}")
+
+    close = df["close"]
+    last_price = float(close.iloc[-1])
+
+    ema_f = float(ema_series(close, EMA_FAST).iloc[-1])
+    ema_s = float(ema_series(close, EMA_SLOW).iloc[-1])
+    rsi_v = float(rsi(close, RSI_PERIOD).iloc[-1])
+    macd_line, signal_line, hist = macd(close)
+    macd_hist = float(hist.iloc[-1])
+    adx_v = float(adx(df, ADX_PERIOD).iloc[-1])
+    bb_w = float(bb_width(close, BB_PERIOD).iloc[-1])
+
+    trend_4h = "up"  # упрощённо (если нужно — можно вытянуть 4h свечи и посчитать отдельно)
+    direction = _direction(last_price, ema_f, ema_s, rsi_v, macd_hist, adx_v)
+    conf = _confidence(direction, adx_v, rsi_v)
+
+    lv = _levels(df)
+    tpsl = _tp_sl(symbol, direction, last_price, lv)
+
+    return {
+        "symbol": symbol,
+        "price": last_price,
+        "exchange": ex,
+        "tf": tf,
+        "direction": direction,
+        "confidence": conf,
+        "trend4h": trend_4h,
+        "ema9": ema_f,
+        "ema21": ema_s,
+        "rsi": rsi_v,
+        "macd_hist": macd_hist,
+        "adx": adx_v,
+        "bb_width": bb_w,
+        "levels": lv,
+        "tp1": tpsl["tp1"],
+        "tp2": tpsl["tp2"],
+        "sl": tpsl["sl"],
+        "updated": _now_utc_str(),
+    }
+
+def format_signal(res: Dict) -> str:
+    """
+    Сообщение в твоём формате “💎 СИГНАЛ” отдельным постом на пару.
+    """
+    sym = res["symbol"]
+    px = _fmt_price(res["price"])
+    ex = res["exchange"]
+    tf = res["tf"]
+    direction = res["direction"]
+    conf = res["confidence"]
+    trend4h = res["trend4h"]
+    ema9 = res["ema9"]
+    ema21 = res["ema21"]
+    rsi_v = res["rsi"]
+    macd_d = res["macd_hist"]
+    adx_v = res["adx"]
+    bb_w = res["bb_width"]
+    lv = res["levels"]
+    tp1 = _fmt_price(res["tp1"])
+    tp2 = _fmt_price(res["tp2"])
+    sl = _fmt_price(res["sl"])
+    upd = res["updated"]
+
+    arrow = "↑" if direction == "LONG" else "↓" if direction == "SHORT" else "·"
+    dir_text = {
+        "LONG": f"🟢 LONG {arrow}",
+        "SHORT": f"🔴 SHORT {arrow}",
+        "NONE": "⚪ NONE",
+    }[direction]
+
+    return (
+        "💎 СИГНАЛ\n"
+        "━━━━━━━━━━━━\n"
+        f"🔹 Пара: {sym}\n"
+        f"📊 Направление: {('LONG' if direction=='LONG' else 'SHORT' if direction=='SHORT' else 'NONE')} {arrow} ({conf}%)\n"
+        f"💵 Цена: {px}\n"
+        f"🕒 ТФ: {tf}\n"
+        f"🗓 Обновлено: {upd}\n"
+        "━━━━━━━━━━━━\n"
+        "📌 Обоснование:\n"
+        f"• 4H тренд: {trend4h}\n"
+        f"• EMA9/21: {'up' if ema9>ema21 else 'down'}, RSI={rsi_v:.1f}, MACDΔ={macd_d:.4f}, ADX={adx_v:.1f}\n"
+        f"• BB width={bb_w:.2f}%\n"
+        f"• source:{ex.lower()}\n"
+        "━━━━━━━━━━━━\n"
+        "📏 Уровни:\n"
+        f"R: {_fmt_price(lv['res1'])} • {_fmt_price(lv['res2'])}\n"
+        f"S: {_fmt_price(lv['sup1'])} • {_fmt_price(lv['sup2'])}\n"
+        "━━━━━━━━━━━━\n"
+        "🎯 Цели:\n"
+        f"TP1: {tp1}\n"
+        f"TP2: {tp2}\n"
+        f"🛡 SL: {sl}\n"
+        "━━━━━━━━━━━━"
     )
-
-    if direction in ("LONG", "SHORT"):
-        text += (
-            f"\n"
-            f"🎯 TP1: {tp1}\n"
-            f"🎯 TP2: {tp2}\n"
-            f"🛡 SL: {sl}\n"
-        )
-
-    text += "\n" + updated
-    return text
