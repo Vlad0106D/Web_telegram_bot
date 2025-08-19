@@ -1,110 +1,71 @@
-# main.py — Render Worker, polling без run_polling
+# main.py
 import os
 import asyncio
 import logging
-from contextlib import suppress
+from telegram.ext import Application, ApplicationBuilder
+from telegram.error import Conflict
 
-from telegram.error import Conflict, NetworkError
-from telegram.ext import ApplicationBuilder
-
-# --------------- Логирование ---------------
+# ====== ЛОГГЕР ======
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("main")
 
-# --------------- ENV ---------------
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("ENV TELEGRAM_BOT_TOKEN is not set")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is empty")
 
-# --------------- App ---------------
-def build_app():
-    app = ApplicationBuilder().token(TOKEN).build()
-    # регистрируем хендлеры, если модуль есть
+# ====== ХЭНДЛЕРЫ ======
+def safe_register_handlers(app: Application) -> None:
     try:
-        from bot.handlers import register_handlers
+        from bot.handlers import register_handlers  # type: ignore
         register_handlers(app)
         log.info("Handlers registered.")
     except Exception as e:
+        # Не заваливаем запуск, чтобы можно было ловить 409 и чинить окружение
         log.warning(f"register_handlers not imported/failed: {e}")
-    return app
 
-# --------------- Polling без run_polling ---------------
-async def start_polling_forever(app):
-    """
-    Инициализация/старт приложения и запуск polling через Updater,
-    без вмешательства в event loop (никаких run_until_complete/close).
-    """
-    backoff = 3
+async def run_polling_once(app: Application) -> None:
+    # Сносим webhook и сбрасываем «висящие» апдейты, чтобы polling был единственным источником
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Webhook deleted (drop_pending_updates=True).")
 
-    # Инициализация приложения и удаление вебхука один раз снаружи цикла
-    await app.initialize()
-    with suppress(Exception):
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Webhook deleted (drop_pending_updates=True).")
+    # ВАЖНО: не используем .updater.start_polling() вручную.
+    # Используем ровно ОДИН вызов .run_polling(), который сам всё сделает.
+    await app.run_polling(
+        allowed_updates=None,   # все типы
+        stop_signals=None,      # Render управляет процессом
+        timeout=30,
+    )
 
-    await app.start()
+async def main() -> None:
+    log.info(">>> ENTER main.py")
 
+    app = ApplicationBuilder().token(TOKEN).build()
+    safe_register_handlers(app)
+
+    # Бесконечный охранный цикл с бэкоффом на 409
+    backoff = 10
     while True:
         try:
-            log.info("Starting updater.start_polling() …")
-            # allowed_updates=None -> все типы; timeout=30 -> long poll
-            await app.updater.start_polling(allowed_updates=None, timeout=30)
-
-            log.info("Polling is running.")
-            # Держим процесс живым, пока polling активен
-            # (updater.start_polling() работает в фоне; ждём бесконечно)
-            while True:
-                await asyncio.sleep(3600)
-
+            log.info("Starting polling…")
+            await run_polling_once(app)
+            # Если run_polling вернулся без исключений — выходим.
+            log.info("Polling finished normally. Exit.")
+            break
         except Conflict as e:
-            # 409: есть другой getUpdates этим же токеном
-            log.warning(f"409 Conflict (another polling active): {e}. Retry in {backoff}s")
+            # Это означает, что где-то ЕЩЁ идёт getUpdates этим же токеном
+            log.warning(f"409 Conflict: another getUpdates is active. Retry in {backoff}s")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-        except NetworkError as e:
-            log.warning(f"NetworkError: {e}. Retry in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-        except asyncio.CancelledError:
-            log.info("Cancelled. Stopping updater/app …")
-            with suppress(Exception):
-                await app.updater.stop()
-                await app.stop()
-            raise
-
+            # Можно чуть увеличивать бэкофф, но ограничим:
+            backoff = min(backoff + 5, 60)
+            continue
         except Exception as e:
             log.exception(f"Unexpected polling exception: {e}. Retry in {backoff}s")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-# --------------- Entry ---------------
-async def main():
-    log.info(">>> ENTER main.py")
-    app = build_app()
-
-    if getattr(app, "job_queue", None):
-        log.info("JobQueue detected.")
-    else:
-        log.info("No JobQueue found (optional).")
-
-    try:
-        await start_polling_forever(app)
-    finally:
-        # Акуратная остановка при завершении процесса
-        with suppress(Exception):
-            await app.updater.stop()
-        with suppress(Exception):
-            await app.stop()
-        with suppress(Exception):
-            await app.shutdown()
+            backoff = min(backoff + 5, 60)
+            continue
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Shutting down by KeyboardInterrupt")
+    asyncio.run(main())
