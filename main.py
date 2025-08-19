@@ -55,9 +55,6 @@ def main():
             )
         logger.info(f"Watcher scheduled every {WATCHER_INTERVAL_SEC}s for TFs: {', '.join(tfs)}")
 
-    # важное: не закрывать loop (иначе RuntimeError в средах с внешним лупом)
-    app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
