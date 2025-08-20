@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import Iterable, Sequence, List, Dict, Any
 
@@ -12,10 +13,16 @@ from telegram.ext import (
     CommandHandler,
 )
 
-from config import WATCHER_TFS, WATCHER_INTERVAL_SEC, ALERT_CHAT_ID
+from config import (
+    WATCHER_TFS,
+    WATCHER_INTERVAL_SEC,
+    ALERT_CHAT_ID,
+    BREAKER_LOOKBACK,
+    BREAKER_EPS,
+    BREAKER_COOLDOWN_SEC,
+)
 from services.state import get_favorites
-from services.analyze import analyze_symbol
-from services.signal_text import build_signal_message
+from services.breaker import detect_breakout, format_breakout_message
 
 log = logging.getLogger(__name__)
 
@@ -52,53 +59,42 @@ def _jobs_summary(app: Application) -> str:
 
 # ----------------------- логика тика вотчера -----------------------
 
-async def _should_alert(res: Dict[str, Any]) -> bool:
-    """
-    Простая фильтрация, чтобы не спамить:
-    — если явный сигнал LONG/SHORT, шлём;
-    — либо если уверенность >= 70.
-    При желании тут можно ужесточить/ослабить условия.
-    """
-    sig = (res.get("signal") or "").lower()
-    if sig in {"long", "short"}:
-        return True
-    if int(res.get("confidence", 0)) >= 70:
-        return True
-    return False
-
 async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Один тик вотчера для конкретного TF.
     В context.job.data лежит словарь с ключами: tf, chat_id.
+    Здесь вызываем брейкер по списку избранных и шлём алерты.
     """
     data: Dict[str, Any] = context.job.data or {}
     tf: str = data.get("tf", "?")
     chat_id: int | None = data.get("chat_id")
 
+    # где храним анти-дубликаты (последний отправленный брейкаут)
+    sent_store: Dict[str, float] = context.application.bot_data.setdefault("breaker_sent", {})
+    now = time.time()
+
     try:
         favs = get_favorites()
         if not favs:
-            log.info("Watcher tick: tf=%s — favorites empty, nothing to do", tf)
+            log.info("Watcher tick: tf=%s — favorites empty", tf)
             return
 
-        log.info("Watcher tick: tf=%s, favorites=%d, chat_id=%s", tf, len(favs), chat_id)
-
-        # Перебираем избранное и отправляем только осмысленные сигналы
         for sym in favs:
-            try:
-                res = await analyze_symbol(sym)  # твоя функция анализа
-                if await _should_alert(res):
-                    text = build_signal_message(res)
-                    if chat_id:
-                        await context.bot.send_message(chat_id=chat_id, text=text)
-                else:
-                    # тихо пропускаем
-                    pass
-            except Exception as e:
-                log.exception("Watcher analyze failed for %s: %s", sym, e)
-                # по желанию можно уведомлять чат об ошибке анализа:
-                # if chat_id:
-                #     await context.bot.send_message(chat_id=chat_id, text=f"{sym}: ошибка анализа — {e}")
+            ev = await detect_breakout(sym, tf=tf, lookback=BREAKER_LOOKBACK, eps=BREAKER_EPS)
+            if not ev:
+                continue
+
+            key = f"{sym}:{tf}:{ev.direction}"
+            last_ts = sent_store.get(key, 0.0)
+            if now - last_ts < BREAKER_COOLDOWN_SEC:
+                # подавляем частые повторы
+                continue
+
+            text = format_breakout_message(ev)
+            if chat_id:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            sent_store[key] = now
+            log.info("Breakout alert sent: %s", key)
 
     except Exception:
         log.exception("Watcher tick failed for tf=%s", tf)
@@ -115,12 +111,12 @@ def schedule_watcher_jobs(
     Регистрирует/перерегистрирует повторяющиеся задачи вотчера.
     Для каждого TF создаётся job с уникальным именем 'watch_{tf}'.
     Если job с таким именем уже есть — он удаляется и создаётся заново.
+    Возвращает список имён созданных jobs.
     """
     jq = app.job_queue
     created: List[str] = []
     norm_tfs = _normalize_tfs(tfs)
 
-    # запомним чат по умолчанию
     if chat_id is not None:
         app.bot_data["watch_chat_id"] = int(chat_id)
     default_chat = app.bot_data.get("watch_chat_id") or ALERT_CHAT_ID
@@ -128,18 +124,16 @@ def schedule_watcher_jobs(
     for tf in norm_tfs:
         name = _job_name(tf)
 
-        # удалим все одноимённые задачи (если были)
         for old in jq.get_jobs_by_name(name):
             try:
                 old.schedule_removal()
             except Exception:
                 log.exception("Failed to remove old job '%s'", name)
 
-        # создаём новую периодическую задачу
         jq.run_repeating(
             _watch_tick,
             interval=timedelta(seconds=int(interval_sec)),
-            first=5,  # запуск через 5 секунд после старта приложения
+            first=5,
             name=name,
             data={"tf": tf, "chat_id": default_chat},
         )
@@ -196,9 +190,8 @@ async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     removed = _stop_all_watcher_jobs(app)
-    text = f"⛔ Вотчер остановлен. Удалено задач: {removed}"
     if update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(f"Вотчер выключен ⛔\nУдалено задач: {removed}")
 
 async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
@@ -208,6 +201,7 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "Watcher: включён ✅\n"
         f"• TF {', '.join(_normalize_tfs(WATCHER_TFS)) or '—'}\n"
         f"• interval={WATCHER_INTERVAL_SEC}s,\n"
+        f"• chat={chat_id or '—'}\n"
         f"• jobs: {jobs}"
     )
     if update.effective_message:
