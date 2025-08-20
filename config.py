@@ -29,3 +29,11 @@ def _read_chat_id() -> int | None:
         return None
 
 ALERT_CHAT_ID = _read_chat_id()
+
+# --- Breaker settings ---
+# сколько свечей образуют диапазон для пробоя
+BREAKER_LOOKBACK = int(os.getenv("BREAKER_LOOKBACK", "50").strip() or "50")
+# чувствительность пробоя: 0.001 = 0.1% сверх High/ниже Low
+BREAKER_EPS = float(os.getenv("BREAKER_EPS", "0.001").strip() or "0.001")
+# подавление повторов (сек) на один и тот же {symbol, tf, direction}
+BREAKER_COOLDOWN_SEC = int(os.getenv("BREAKER_COOLDOWN_SEC", "900").strip() or "900")
