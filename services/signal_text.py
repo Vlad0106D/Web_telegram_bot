@@ -10,6 +10,52 @@ def fmt_price(x: float) -> str:
         s = s[:-3]
     return s
 
+# --------- NEW: нормализация уровней ---------
+def _auto_ndigits(ref_price: Optional[float]) -> int:
+    if ref_price is None:
+        return 2
+    p = abs(float(ref_price))
+    if p < 1:
+        return 4
+    if p < 10:
+        return 3
+    return 2
+
+def _tidy_levels(values: List[float], ref_price: Optional[float], max_count: int = 4) -> List[float]:
+    """
+    1) динамическое округление по цене
+    2) удаление дублей/почти-дублей (eps зависит от точности)
+    3) ограничение количества
+    """
+    if not values:
+        return []
+
+    nd = _auto_ndigits(ref_price)
+    step = 10 ** (-nd)
+    eps = step * 0.5  # всё ближе этого считаем одним уровнем
+
+    # округлим и удалим почти-дубли, сохраняя порядок
+    out: List[float] = []
+    for v in values:
+        if v is None:
+            continue
+        rv = round(float(v), nd)
+        if not out:
+            out.append(rv)
+            continue
+        # проверяем близость к последнему добавленному уровню
+        if abs(rv - out[-1]) <= eps:
+            continue
+        # также проверим ко всем уже добавленным (на всякий)
+        if any(abs(rv - x) <= eps for x in out):
+            continue
+        out.append(rv)
+
+    # обрежем до нужного количества
+    if len(out) > max_count:
+        out = out[:max_count]
+    return out
+
 def _levels_line(title: str, values: List[float]) -> str:
     if not values:
         return f"{title}: —"
@@ -37,6 +83,7 @@ def build_signal_message(res: Dict) -> str:
         'scenario': Optional[str],
       }
     """
+
     symbol      = res.get("symbol", "?")
     price       = res.get("price")
     exchange    = res.get("exchange", "")
@@ -49,13 +96,17 @@ def build_signal_message(res: Dict) -> str:
     bb_width    = res.get("bb_width")
     reasons     = res.get("reasons") or []
     levels      = res.get("levels") or {}
-    res_levels  = levels.get("resistance") or []
-    sup_levels  = levels.get("support") or []
+    raw_res     = levels.get("resistance") or []
+    raw_sup     = levels.get("support") or []
     tp1         = res.get("tp1")
     tp2         = res.get("tp2")
     sl          = res.get("sl")
     tags        = res.get("tags") or []
     scenario    = res.get("scenario")
+
+    # нормализуем уровни (удалим дубли/почти-дубли и красиво округлим)
+    res_levels  = _tidy_levels(list(raw_res), price)
+    sup_levels  = _tidy_levels(list(raw_sup), price)
 
     # шапка
     if signal == "long":
@@ -75,6 +126,7 @@ def build_signal_message(res: Dict) -> str:
     if scenario:
         lines.append(f"⚠ {scenario}")
 
+    # краткие метрики
     m1 = []
     if trend_4h:
         m1.append(f"4H trend: {trend_4h}")
@@ -87,15 +139,18 @@ def build_signal_message(res: Dict) -> str:
         for x in m1:
             lines.append(f"• {x}")
 
+    # причины
     if reasons:
         for r in reasons[:6]:
             lines.append(f"• {r}")
 
+    # уровни
     lines.append("")
     lines.append("📊 Levels:")
     lines.append(_levels_line("Resistance", res_levels))
-    lines.append(_levels_line("Support", sup_levels))
+    lines.append(_levels_line("Support",    sup_levels))
 
+    # цели/стоп
     if any(v is not None for v in (tp1, tp2, sl)):
         lines.append("")
         if tp1 is not None:
@@ -105,6 +160,7 @@ def build_signal_message(res: Dict) -> str:
         if sl is not None:
             lines.append(f"🛡 SL: {fmt_price(sl)}")
 
+    # теги
     if tags:
         lines.append("")
         lines.append("🏷 " + " • ".join(str(t) for t in tags[:6]))
