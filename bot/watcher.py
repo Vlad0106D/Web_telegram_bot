@@ -1,3 +1,4 @@
+# bot/watcher.py
 from __future__ import annotations
 
 import logging
@@ -32,8 +33,15 @@ try:
 except Exception:
     SIGNAL_COOLDOWN_SEC = 900
 
+# опциональный кулдаун для разворотов
+try:
+    from config import REVERSAL_COOLDOWN_SEC
+except Exception:
+    REVERSAL_COOLDOWN_SEC = 900
+
 from services.state import get_favorites
 from services.breaker import detect_breakout, format_breakout_message
+from services.reversal import detect_reversals, format_reversal_message
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 
@@ -78,11 +86,11 @@ def _jobs_summary(app: Application) -> str:
 async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Один тик вотчера для конкретного TF.
-    В context.job.data лежит словарь с ключами: tf, chat_id.
-    Выполняем два блока:
+    Блоки:
       1) Breaker (пробой диапазона)
-      2) Strategy (analyze_symbol с порогом уверенности)
-    У обоих — отдельные кулдауны.
+      2) Strategy (analyze_symbol, порог уверенности)
+      3) Reversal (RSI-дивергенции 1h/4h + импульсные развороты 5m/10m)
+    У каждого — свой кулдаун.
     """
     data: Dict[str, Any] = context.job.data or {}
     tf: str = data.get("tf", "?")
@@ -98,6 +106,9 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     signal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
         "signal_last", {}
     )
+    reversal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
+        "reversal_last", {}
+    )
 
     try:
         favs = get_favorites()
@@ -107,6 +118,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         sent_breaker = 0
         sent_signal = 0
+        sent_reversal = 0
 
         for sym in favs:
             # ---------- 1) BREAKER ----------
@@ -149,9 +161,25 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Strategy analyze failed for %s", sym)
 
+            # ---------- 3) REVERSAL (дивергенции + импульсы) ----------
+            try:
+                rev_events = await detect_reversals(sym)
+                for ev in rev_events:
+                    key_r = (ev.symbol, ev.tf, ev.kind)
+                    last_ts = reversal_last.get(key_r, 0.0)
+                    if now - last_ts >= float(REVERSAL_COOLDOWN_SEC):
+                        if chat_id:
+                            await context.bot.send_message(
+                                chat_id=chat_id, text=format_reversal_message(ev)
+                            )
+                        reversal_last[key_r] = now
+                        sent_reversal += 1
+            except Exception:
+                log.exception("Reversal detection failed for %s", sym)
+
         log.info(
-            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d",
-            tf, len(favs), sent_breaker, sent_signal
+            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d",
+            tf, len(favs), sent_breaker, sent_signal, sent_reversal
         )
 
     except Exception:
@@ -166,13 +194,6 @@ def schedule_watcher_jobs(
     interval_sec: int,
     chat_id: int | None = None,
 ) -> Sequence[str]:
-    """
-    Регистрирует/перерегистрирует повторяющиеся задачи вотчера.
-    Для каждого TF создаётся job с уникальным именем 'watch_{tf}'.
-    Если job с таким именем уже есть — он удаляется и создаётся заново.
-
-    Возвращает список имён созданных jobs.
-    """
     jq = app.job_queue
     created: List[str] = []
     norm_tfs = _normalize_tfs(tfs)
@@ -191,20 +212,17 @@ def schedule_watcher_jobs(
             except Exception:
                 log.exception("Failed to remove old job '%s'", name)
 
-        # создаём новую периодическую задачу
         jq.run_repeating(
             _watch_tick,
             interval=timedelta(seconds=int(interval_sec)),
-            first=5,  # старт через 5 секунд после запуска приложения
+            first=5,
             name=name,
             data={"tf": tf, "chat_id": default_chat},
         )
         created.append(name)
         log.info(
             "Watcher job scheduled: name=%s, interval=%ss, chat_id=%s",
-            name,
-            interval_sec,
-            default_chat,
+            name, interval_sec, default_chat,
         )
 
     log.info(
