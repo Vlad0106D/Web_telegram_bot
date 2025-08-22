@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 
 from services.market_data import get_candles, get_price
-from services.indicators import ema_series, rsi as rsi_series, bb_width as bb_width_series
+from services.indicators import ema_series, rsi as rsi_series
 
 # ===== Параметры с безопасными дефолтами (можно переопределить через config.py) =====
 try:
@@ -74,7 +74,7 @@ class ReversalEvent:
     price: float
     exchange: str
     rsi_last: Optional[float]
-    details: dict
+    details: Dict
     ts: int  # unix-ms последней свечи
 
 
@@ -116,6 +116,14 @@ def _rsi_at(series_rsi: pd.Series, i: int) -> Optional[float]:
     return None
 
 
+async def _safe_price(symbol: str, fallback_price: Optional[float]) -> tuple[float, str]:
+    try:
+        p, ex = await get_price(symbol)
+        return p, ex
+    except Exception:
+        return float(fallback_price or 0.0), "—"
+
+
 # ---------------------------- divergence ----------------------------
 
 async def _detect_divergence(symbol: str, tf: str) -> List[ReversalEvent]:
@@ -124,22 +132,27 @@ async def _detect_divergence(symbol: str, tf: str) -> List[ReversalEvent]:
       • bearish: цена делает HH, RSI — LH
       • bullish: цена делает LL, RSI — HL
     """
+    events: List[ReversalEvent] = []
+
     # чуть запасных баров
     limit = max(DIV_LOOKBACK_BARS + 50, 220)
-    df, _ = await get_candles(symbol, tf=tf, limit=limit)
-    if df.empty or len(df) < DIV_PIVOT_WINDOW * 4:
-        return []
+    try:
+        df, _ = await get_candles(symbol, tf=tf, limit=limit)
+    except Exception:
+        return events  # тихо пропускаем TF, если источник не отдал данные
+
+    if df.empty or len(df) < max(DIV_PIVOT_WINDOW * 4, 30):
+        return events
 
     close = df["close"]
     rsi = rsi_series(close, DIV_RSI_PERIOD)
 
     peaks, troughs = _local_extrema(close, DIV_PIVOT_WINDOW)
-    events: List[ReversalEvent] = []
 
     # --- bearish divergence (HH price, LH RSI)
     if len(peaks) >= 2:
         p1, p2 = peaks[-2], peaks[-1]
-        if p2 - p1 <= DIV_LOOKBACK_BARS:
+        if p2 > p1 and (p2 - p1) <= DIV_LOOKBACK_BARS:
             price_hh = close.iloc[p2] > close.iloc[p1]
             rsi1, rsi2 = _rsi_at(rsi, p1), _rsi_at(rsi, p2)
             if (
@@ -149,7 +162,7 @@ async def _detect_divergence(symbol: str, tf: str) -> List[ReversalEvent]:
                 and rsi1 >= DIV_MIN_RSI_PEAK
                 and rsi2 < rsi1
             ):
-                price, ex = await get_price(symbol)
+                price, ex = await _safe_price(symbol, close.iloc[-1])
                 events.append(
                     ReversalEvent(
                         symbol=symbol.upper(),
@@ -169,7 +182,7 @@ async def _detect_divergence(symbol: str, tf: str) -> List[ReversalEvent]:
     # --- bullish divergence (LL price, HL RSI)
     if len(troughs) >= 2:
         t1, t2 = troughs[-2], troughs[-1]
-        if t2 - t1 <= DIV_LOOKBACK_BARS:
+        if t2 > t1 and (t2 - t1) <= DIV_LOOKBACK_BARS:
             price_ll = close.iloc[t2] < close.iloc[t1]
             rsi1, rsi2 = _rsi_at(rsi, t1), _rsi_at(rsi, t2)
             if (
@@ -179,7 +192,7 @@ async def _detect_divergence(symbol: str, tf: str) -> List[ReversalEvent]:
                 and rsi1 <= DIV_MAX_RSI_TROUGH
                 and rsi2 > rsi1
             ):
-                price, ex = await get_price(symbol)
+                price, ex = await _safe_price(symbol, close.iloc[-1])
                 events.append(
                     ReversalEvent(
                         symbol=symbol.upper(),
@@ -224,33 +237,42 @@ async def _detect_impulse(symbol: str, tf: str) -> List[ReversalEvent]:
       • RSI экстремален (ниже LOW / выше HIGH)
       • триггер: кросс EMA(IMPULSE_EMA) на последней свече ИЛИ свечной паттерн (engulfing/hammer)
     """
+    events: List[ReversalEvent] = []
+
     limit = max(IMPULSE_LOOKBACK + 40, 120)
-    df, _ = await get_candles(symbol, tf=tf, limit=limit)
+    try:
+        df, _ = await get_candles(symbol, tf=tf, limit=limit)
+    except Exception:
+        return events
+
     if df.empty or len(df) < IMPULSE_LOOKBACK + 2:
-        return []
+        return events
 
     o = df["open"]; h = df["high"]; l = df["low"]; c = df["close"]
     ema = ema_series(c, IMPULSE_EMA)
     rsi = rsi_series(c, 14)
 
+    # гварды от NaN
+    if pd.isna(c.iloc[-1]) or pd.isna(c.iloc[-2]) or pd.isna(ema.iloc[-1]) or pd.isna(ema.iloc[-2]):
+        return events
+
     c_last, c_prev = float(c.iloc[-1]), float(c.iloc[-2])
     o_last, o_prev = float(o.iloc[-1]), float(o.iloc[-2])
-    h_prev, l_prev = float(h.iloc[-2]), float(l.iloc[-2])
 
     ema_last, ema_prev = float(ema.iloc[-1]), float(ema.iloc[-2])
     rsi_last = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
 
     c_k_ago = float(c.iloc[-(IMPULSE_LOOKBACK + 1)])
+    if c_k_ago == 0:
+        return events
     delta = (c_last / c_k_ago - 1.0)
-
-    events: List[ReversalEvent] = []
 
     # Потенциальный бычий разворот после обвала
     if delta <= -IMPULSE_PCT and (rsi_last is not None and rsi_last <= IMPULSE_RSI_LOW):
         cross_up = (c_prev < ema_prev) and (c_last > ema_last)
         pattern = _engulfing_bull(o_prev, c_prev, o_last, c_last) or _hammer_like(o_last, float(h.iloc[-1]), float(l.iloc[-1]), c_last)
         if cross_up or pattern:
-            price, ex = await get_price(symbol)
+            price, ex = await _safe_price(symbol, c_last)
             events.append(
                 ReversalEvent(
                     symbol=symbol.upper(),
@@ -273,7 +295,7 @@ async def _detect_impulse(symbol: str, tf: str) -> List[ReversalEvent]:
         cross_dn = (c_prev > ema_prev) and (c_last < ema_last)
         pattern = _engulfing_bear(o_prev, c_prev, o_last, c_last) or _shooting_star_like(o_last, float(h.iloc[-1]), float(l.iloc[-1]), c_last)
         if cross_dn or pattern:
-            price, ex = await get_price(symbol)
+            price, ex = await _safe_price(symbol, c_last)
             events.append(
                 ReversalEvent(
                     symbol=symbol.upper(),
@@ -304,10 +326,21 @@ async def detect_reversals(symbol: str) -> List[ReversalEvent]:
     Возвращает список событий (может быть несколько разных tf/типов).
     """
     out: List[ReversalEvent] = []
+
+    # по каждому TF ловим исключения отдельно, чтобы один источник не ронял всё
     for tf in _normalize_tfs(REVERSAL_TFS_DIVERGENCE):
-        out.extend(await _detect_divergence(symbol, tf))
+        try:
+            out.extend(await _detect_divergence(symbol, tf))
+        except Exception:
+            # тихий пропуск TF
+            continue
+
     for tf in _normalize_tfs(REVERSAL_TFS_IMPULSE):
-        out.extend(await _detect_impulse(symbol, tf))
+        try:
+            out.extend(await _detect_impulse(symbol, tf))
+        except Exception:
+            continue
+
     return out
 
 
