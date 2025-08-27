@@ -1,4 +1,3 @@
-# bot/watcher.py
 from __future__ import annotations
 
 import logging
@@ -22,6 +21,7 @@ from config import (
     BREAKER_EPS,
     BREAKER_COOLDOWN_SEC,
 )
+
 # опциональные настройки для «старого» вотчера (если нет в config — используем дефолты)
 try:
     from config import SIGNAL_MIN_CONF  # int
@@ -39,11 +39,18 @@ try:
 except Exception:
     REVERSAL_COOLDOWN_SEC = 900
 
+# Fusion настройки
+try:
+    from config import FUSION_ENABLED, FUSION_COOLDOWN_SEC
+except Exception:
+    FUSION_ENABLED, FUSION_COOLDOWN_SEC = True, 900
+
 from services.state import get_favorites
 from services.breaker import detect_breakout, format_breakout_message
 from services.reversal import detect_reversals, format_reversal_message
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
+from services.fusion import analyze_fusion, format_fusion_message
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +97,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
       1) Breaker (пробой диапазона)
       2) Strategy (analyze_symbol, порог уверенности)
       3) Reversal (RSI-дивергенции 1h/4h + импульсные развороты 5m/10m)
+      4) Fusion (сводный сигнал по конвергенции модулей)
     У каждого — свой кулдаун.
     """
     data: Dict[str, Any] = context.job.data or {}
@@ -109,6 +117,9 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     reversal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
         "reversal_last", {}
     )
+    fusion_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
+        "fusion_last", {}
+    )
 
     try:
         favs = get_favorites()
@@ -119,6 +130,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_breaker = 0
         sent_signal = 0
         sent_reversal = 0
+        sent_fusion = 0
 
         for sym in favs:
             # ---------- 1) BREAKER ----------
@@ -177,9 +189,26 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Reversal detection failed for %s", sym)
 
+            # ---------- 4) FUSION (сводный сигнал) ----------
+            try:
+                if FUSION_ENABLED:
+                    fev = await analyze_fusion(sym, tf)
+                    if fev:
+                        key_f = (fev.symbol, fev.tf, fev.side)
+                        last_ts = fusion_last.get(key_f, 0.0)
+                        if now - last_ts >= float(FUSION_COOLDOWN_SEC):
+                            if chat_id:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=format_fusion_message(fev)
+                                )
+                            fusion_last[key_f] = now
+                            sent_fusion += 1
+            except Exception:
+                log.exception("Fusion analysis failed for %s %s", sym, tf)
+
         log.info(
-            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d",
-            tf, len(favs), sent_breaker, sent_signal, sent_reversal
+            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d",
+            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion
         )
 
     except Exception:
