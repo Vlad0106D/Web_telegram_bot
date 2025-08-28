@@ -1,6 +1,18 @@
 # -*- coding: utf-8 -*-
 from typing import Dict, List, Optional
 
+# ===== BB-width hint thresholds (можно переопределить в config.py) =====
+try:
+    from config import BB_HINT_T1, BB_HINT_T2, BB_HINT_T3, BB_HINT_T4
+except Exception:
+    # По умолчанию: <4% — сжатие; 4–8% — ранняя экспансия; 8–15% — активный тренд;
+    # 15–25% — сильная экспансия; >=25% — перегрев/оверэкспансия
+    BB_HINT_T1 = 4.0
+    BB_HINT_T2 = 8.0
+    BB_HINT_T3 = 15.0
+    BB_HINT_T4 = 25.0
+
+
 def fmt_price(x: float) -> str:
     # аккуратное форматирование цены: тысячные пробелами, до 2 знаков (или без знаков для целых)
     if x is None:
@@ -10,7 +22,8 @@ def fmt_price(x: float) -> str:
         s = s[:-3]
     return s
 
-# --------- NEW: нормализация уровней ---------
+
+# --------- нормализация уровней ---------
 def _auto_ndigits(ref_price: Optional[float]) -> int:
     if ref_price is None:
         return 2
@@ -20,6 +33,7 @@ def _auto_ndigits(ref_price: Optional[float]) -> int:
     if p < 10:
         return 3
     return 2
+
 
 def _tidy_levels(values: List[float], ref_price: Optional[float], max_count: int = 4) -> List[float]:
     """
@@ -56,11 +70,36 @@ def _tidy_levels(values: List[float], ref_price: Optional[float], max_count: int
         out = out[:max_count]
     return out
 
+
 def _levels_line(title: str, values: List[float]) -> str:
     if not values:
         return f"{title}: —"
     vals = " • ".join(fmt_price(v) for v in values[:4])
     return f"{title}: {vals}"
+
+
+# --------- BB-width hint ---------
+def _bb_hint(bbw: Optional[float]) -> Optional[str]:
+    """
+    Возвращает человекочитаемую подсказку по режиму волатильности.
+    """
+    if bbw is None:
+        return None
+    try:
+        v = float(bbw)
+    except Exception:
+        return None
+
+    if v < BB_HINT_T1:
+        return f"BB режим: сжатие (<{BB_HINT_T1:.0f}%) — дождаться выхода/пробоя."
+    if v < BB_HINT_T2:
+        return f"BB режим: ранняя экспансия ({BB_HINT_T1:.0f}–{BB_HINT_T2:.0f}%) — аккуратные входы, нужен триггер."
+    if v < BB_HINT_T3:
+        return f"BB режим: активный тренд ({BB_HINT_T2:.0f}–{BB_HINT_T3:.0f}%) — нормальные сделки по тренду."
+    if v < BB_HINT_T4:
+        return f"BB режим: сильная экспансия ({BB_HINT_T3:.0f}–{BB_HINT_T4:.0f}%) — осмотрительно, учитывай расширенный риск."
+    return f"BB режим: перегрев (≥{BB_HINT_T4:.0f}%) — высокая волатильность, входы осторожно/по подтверждениям."
+
 
 def build_signal_message(res: Dict) -> str:
     """
@@ -126,7 +165,7 @@ def build_signal_message(res: Dict) -> str:
     if scenario:
         lines.append(f"⚠ {scenario}")
 
-    # краткие метрики
+    # краткие метрики (теперь подписываем текущий entry_tf)
     m1 = []
     if trend_4h:
         m1.append(f"4H trend: {trend_4h}")
@@ -134,10 +173,15 @@ def build_signal_message(res: Dict) -> str:
         adx_s = f"ADX={h_adx:.1f}" if h_adx is not None else "ADX=–"
         rsi_s = f"RSI={h_rsi:.1f}" if h_rsi is not None else "RSI=–"
         bb_s  = f"BB width={bb_width:.2f}%" if bb_width is not None else "BB width=–"
-        m1.append(f"1H {adx_s} | {rsi_s} | {bb_s}")
+        m1.append(f"{entry_tf.upper()} {adx_s} | {rsi_s} | {bb_s}")
     if m1:
         for x in m1:
             lines.append(f"• {x}")
+
+    # подсказка по BB-режиму волатильности
+    bb_tip = _bb_hint(bb_width)
+    if bb_tip:
+        lines.append(f"💡 {bb_tip}")
 
     # причины
     if reasons:
