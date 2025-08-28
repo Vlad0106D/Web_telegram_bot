@@ -10,7 +10,7 @@ def fmt_price(x: float) -> str:
         s = s[:-3]
     return s
 
-# --------- NEW: нормализация уровней ---------
+# --------- нормализация уровней ---------
 def _auto_ndigits(ref_price: Optional[float]) -> int:
     if ref_price is None:
         return 2
@@ -138,6 +138,17 @@ def build_signal_message(res: Dict) -> str:
     if m1:
         for x in m1:
             lines.append(f"• {x}")
+
+    # безопасная подсказка по режиму волатильности (без символов < и >)
+    if bb_width is not None:
+        try:
+            bw = float(bb_width)
+            if bw <= 4:
+                lines.append("• BB regime: squeeze (≤ 4%)")
+            elif bw >= 12:
+                lines.append("• BB regime: expansion (≥ 12%)")
+        except Exception:
+            pass
 
     # причины
     if reasons:
