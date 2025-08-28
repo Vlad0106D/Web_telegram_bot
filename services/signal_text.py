@@ -1,7 +1,3 @@
-Давай еще раз попробуем 
-Если будут опять ошибки, я верну обратно 
-
-
 # -*- coding: utf-8 -*-
 from typing import Dict, List, Optional
 
@@ -170,8 +166,3 @@ def build_signal_message(res: Dict) -> str:
         lines.append("🏷 " + " • ".join(str(t) for t in tags[:6]))
 
     return "\n".join(lines)
-
-
-
-
-Это рабочий код
