@@ -1,3 +1,7 @@
+Давай еще раз попробуем 
+Если будут опять ошибки, я верну обратно 
+
+
 # -*- coding: utf-8 -*-
 from typing import Dict, List, Optional
 
@@ -10,7 +14,7 @@ def fmt_price(x: float) -> str:
         s = s[:-3]
     return s
 
-# --------- нормализация уровней ---------
+# --------- NEW: нормализация уровней ---------
 def _auto_ndigits(ref_price: Optional[float]) -> int:
     if ref_price is None:
         return 2
@@ -139,17 +143,6 @@ def build_signal_message(res: Dict) -> str:
         for x in m1:
             lines.append(f"• {x}")
 
-    # безопасная подсказка по режиму волатильности (без символов < и >)
-    if bb_width is not None:
-        try:
-            bw = float(bb_width)
-            if bw <= 4:
-                lines.append("• BB regime: squeeze (≤ 4%)")
-            elif bw >= 12:
-                lines.append("• BB regime: expansion (≥ 12%)")
-        except Exception:
-            pass
-
     # причины
     if reasons:
         for r in reasons[:6]:
@@ -177,3 +170,8 @@ def build_signal_message(res: Dict) -> str:
         lines.append("🏷 " + " • ".join(str(t) for t in tags[:6]))
 
     return "\n".join(lines)
+
+
+
+
+Это рабочий код
