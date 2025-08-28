@@ -10,12 +10,7 @@ def fmt_price(x: float) -> str:
         s = s[:-3]
     return s
 
-# --- HTML safe ---
-def _escape_html(s: str) -> str:
-    # Телеграм в parse_mode=HTML ломается на < и > — экранируем
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-# --------- нормализация уровней ---------
+# --------- NEW: нормализация уровней ---------
 def _auto_ndigits(ref_price: Optional[float]) -> int:
     if ref_price is None:
         return 2
@@ -129,8 +124,7 @@ def build_signal_message(res: Dict) -> str:
     lines.append(f"{sig_mark}  •  TF: {entry_tf}  •  Confidence: {confidence}% {conf_mark}")
 
     if scenario:
-        # заменим < и > в сценариях вроде "сужение волатильности (BB < 4%)"
-        lines.append(_escape_html(f"⚠ {scenario}"))
+        lines.append(f"⚠ {scenario}")
 
     # краткие метрики
     m1 = []
@@ -143,12 +137,12 @@ def build_signal_message(res: Dict) -> str:
         m1.append(f"1H {adx_s} | {rsi_s} | {bb_s}")
     if m1:
         for x in m1:
-            lines.append(x)
+            lines.append(f"• {x}")
 
     # причины
     if reasons:
         for r in reasons[:6]:
-            lines.append(r)
+            lines.append(f"• {r}")
 
     # уровни
     lines.append("")
@@ -171,6 +165,4 @@ def build_signal_message(res: Dict) -> str:
         lines.append("")
         lines.append("🏷 " + " • ".join(str(t) for t in tags[:6]))
 
-    # ВАЖНО: экранируем всё перед возвратом, чтобы ни один '<'/'>' не ломал HTML
-    safe_lines = [_escape_html(line) for line in lines]
-    return "\n".join(safe_lines)
+    return "\n".join(lines)
