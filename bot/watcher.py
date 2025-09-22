@@ -61,6 +61,9 @@ from services.fusion import analyze_fusion, format_fusion_message
 # новый модуль Фибо
 from strategy.fibo_watcher import analyze_fibo, format_fibo_message
 
+# >>> добавлено: агрегатор ATTENTION (TrueTrading без торговли)
+from services.true_trading import get_tt
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -108,6 +111,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
       3) Reversal (RSI-дивергенции 1h/4h + импульсные развороты 5m/10m)
       4) Fusion (сводный сигнал по конвергенции модулей)
       5) Fibo (уровни Фибоначчи)
+      6) ATTENTION (объединённый сигнал Fibo + Fusion)
     """
     data: Dict[str, Any] = context.job.data or {}
     tf: str = data.get("tf", "?")
@@ -144,6 +148,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_reversal = 0
         sent_fusion = 0
         sent_fibo = 0
+        sent_attention = 0  # <<< добавили
 
         for sym in favs:
             # ---------- 1) BREAKER ----------
@@ -216,6 +221,21 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 )
                             fusion_last[key_f] = now
                             sent_fusion += 1
+
+                        # >>> кэш для ATTENTION
+                        try:
+                            get_tt(app).update_fusion(
+                                sym, tf,
+                                {
+                                    "symbol": fev.symbol,
+                                    "tf": fev.tf,
+                                    "side": getattr(fev, "side", None),
+                                    "score": int(getattr(fev, "score", getattr(fev, "confidence", 0) or 0)),
+                                    "trend1d": getattr(fev, "trend_1d", None),
+                                },
+                            )
+                        except Exception:
+                            log.exception("Failed to cache fusion for ATTENTION %s %s", sym, tf)
             except Exception:
                 log.exception("Fusion analysis failed for %s %s", sym, tf)
 
@@ -233,12 +253,47 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 )
                             fibo_last[key_fi] = now
                             sent_fibo += 1
+
+                        # >>> кэш для ATTENTION (берём план сделки из Фибо)
+                        try:
+                            get_tt(app).update_fibo(
+                                sym, tf,
+                                {
+                                    "symbol": ev.symbol,
+                                    "tf": ev.tf,
+                                    "side": getattr(ev, "side", "").lower(),
+                                    "level_kind": getattr(ev, "level_kind", None),   # "retr" | "ext"
+                                    "level_pct": float(getattr(ev, "level_pct", 0.0)),
+                                    "trend_1d": getattr(ev, "trend_1d", None),
+
+                                    # торговый план (как в сообщении Фибо)
+                                    "entry": float(getattr(ev, "entry", getattr(ev, "touch_price", 0.0))),
+                                    "sl": float(getattr(ev, "sl", 0.0)),
+                                    "tp1": float(getattr(ev, "tp1", 0.0)),
+                                    "tp2": float(getattr(ev, "tp2", 0.0)),
+                                    "tp3": float(getattr(ev, "tp3", 0.0)),
+
+                                    "rr_tp1": float(getattr(ev, "rr_tp1", 0.0)),
+                                    "rr_tp2": float(getattr(ev, "rr_tp2", 0.0)),
+                                    "rr_tp3": float(getattr(ev, "rr_tp3", 0.0)),
+                                },
+                            )
+                        except Exception:
+                            log.exception("Failed to cache fibo for ATTENTION %s %s", sym, tf)
             except Exception:
                 log.exception("Fibo watcher failed for %s %s", sym, tf)
 
+            # ---------- 6) ATTENTION (Fibo + Fusion агрегатор) ----------
+            try:
+                attn_ev = await get_tt(app).maybe_send_attention(context, chat_id, sym, tf)
+                if attn_ev:
+                    sent_attention += 1
+            except Exception:
+                log.exception("ATTENTION aggregator failed for %s %s", sym, tf)
+
         log.info(
-            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d, fibo=%d",
-            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion, sent_fibo
+            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d, fibo=%d, attention=%d",
+            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion, sent_fibo, sent_attention
         )
 
     except Exception:
