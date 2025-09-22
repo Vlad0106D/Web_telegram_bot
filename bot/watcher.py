@@ -45,12 +45,21 @@ try:
 except Exception:
     FUSION_ENABLED, FUSION_COOLDOWN_SEC = True, 900
 
+# --- FIBO настройки ---
+try:
+    from config import FIBO_ENABLED, FIBO_TFS, FIBO_COOLDOWN_SEC
+except Exception:
+    FIBO_ENABLED, FIBO_TFS, FIBO_COOLDOWN_SEC = False, [], 1200
+
 from services.state import get_favorites
 from services.breaker import detect_breakout, format_breakout_message
 from services.reversal import detect_reversals, format_reversal_message
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 from services.fusion import analyze_fusion, format_fusion_message
+
+# новый модуль Фибо
+from strategy.fibo_watcher import analyze_fibo, format_fibo_message
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +107,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
       2) Strategy (analyze_symbol, порог уверенности)
       3) Reversal (RSI-дивергенции 1h/4h + импульсные развороты 5m/10m)
       4) Fusion (сводный сигнал по конвергенции модулей)
-    У каждого — свой кулдаун.
+      5) Fibo (уровни Фибоначчи)
     """
     data: Dict[str, Any] = context.job.data or {}
     tf: str = data.get("tf", "?")
@@ -120,6 +129,9 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     fusion_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
         "fusion_last", {}
     )
+    fibo_last: Dict[Tuple[str, str, str, float, str], float] = app.bot_data.setdefault(
+        "fibo_last", {}
+    )
 
     try:
         favs = get_favorites()
@@ -131,6 +143,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_signal = 0
         sent_reversal = 0
         sent_fusion = 0
+        sent_fibo = 0
 
         for sym in favs:
             # ---------- 1) BREAKER ----------
@@ -154,7 +167,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Breaker failed for %s %s", sym, tf)
 
-            # ---------- 2) STRATEGY (старый вотчер) ----------
+            # ---------- 2) STRATEGY ----------
             try:
                 res = await analyze_symbol(sym)
                 signal = (res.get("signal") or "none").lower()
@@ -173,7 +186,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Strategy analyze failed for %s", sym)
 
-            # ---------- 3) REVERSAL (дивергенции + импульсы) ----------
+            # ---------- 3) REVERSAL ----------
             try:
                 rev_events = await detect_reversals(sym)
                 for ev in rev_events:
@@ -189,7 +202,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Reversal detection failed for %s", sym)
 
-            # ---------- 4) FUSION (сводный сигнал) ----------
+            # ---------- 4) FUSION ----------
             try:
                 if FUSION_ENABLED:
                     fev = await analyze_fusion(sym, tf)
@@ -206,9 +219,26 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 log.exception("Fusion analysis failed for %s %s", sym, tf)
 
+            # ---------- 5) FIBO ----------
+            try:
+                if FIBO_ENABLED and tf in FIBO_TFS:
+                    fibo_events = await analyze_fibo(sym, tf)
+                    for ev in fibo_events:
+                        key_fi = (ev.symbol, ev.tf, ev.side, round(ev.level_pct, 1), ev.scenario)
+                        last_ts = fibo_last.get(key_fi, 0.0)
+                        if now - last_ts >= float(FIBO_COOLDOWN_SEC):
+                            if chat_id:
+                                await context.bot.send_message(
+                                    chat_id=chat_id, text=format_fibo_message(ev)
+                                )
+                            fibo_last[key_fi] = now
+                            sent_fibo += 1
+            except Exception:
+                log.exception("Fibo watcher failed for %s %s", sym, tf)
+
         log.info(
-            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d",
-            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion
+            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d, fibo=%d",
+            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion, sent_fibo
         )
 
     except Exception:
