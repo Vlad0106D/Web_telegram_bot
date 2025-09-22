@@ -1,4 +1,3 @@
-# bot/handlers.py
 from __future__ import annotations
 
 import logging
@@ -22,6 +21,9 @@ from services.market_data import search_symbols
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 
+# === добавили импорт True Trading ===
+from services.true_trading import get_tt
+
 log = logging.getLogger(__name__)
 
 # ------------ Кнопка "Меню" ------------
@@ -31,6 +33,8 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("/check")],
         [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
         [KeyboardButton("/watch_status")],
+        [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
+        [KeyboardButton("/tt_status")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -67,13 +71,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /watch_on — включить вотчер\n"
         "• /watch_off — выключить вотчер\n"
         "• /watch_status — статус вотчера\n"
+        "• /tt_on — включить True Trading\n"
+        "• /tt_off — выключить True Trading\n"
+        "• /tt_status — статус True Trading\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu"
+        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /tt_on, /tt_off, /tt_status, /menu"
     )
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -84,7 +91,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Вариант 1: /find btc — сразу ищем
     q = " ".join(context.args).strip() if context.args else ""
     if q:
         syms = await search_symbols(q)
@@ -94,7 +100,6 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Вариант 2: попросить ввести строку поиска
     msg = await update.message.reply_text(
         "Напиши часть названия пары (например: btc или sol):",
         reply_markup=ForceReply(selective=True),
@@ -160,73 +165,4 @@ async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 removed += 1
             except Exception:
                 pass
-    await update.message.reply_text(f"Вотчер выключен ⛔ (удалено jobs: {removed})")
-
-async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    jq = context.application.job_queue
-    jobs = [j for j in jq.jobs() if j and j.name and j.name.startswith("watch_")]
-
-    if not jobs:
-        await update.message.reply_text("Watcher: выключен ⛔")
-        return
-
-    lines = ["Watcher: включён ✅"]
-    for j in sorted(jobs, key=lambda x: x.name):
-        tf = j.name.replace("watch_", "", 1)
-        nxt = getattr(j, "next_t", None)
-        nxt_s = nxt.strftime("%Y-%m-%d %H:%M:%S UTC") if nxt else "—"
-        lines.append(f"• TF {tf}: next={nxt_s}")
-    await update.message.reply_text("\n".join(lines))
-
-# ------------ Callback-кнопки ------------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-
-    data = q.data or ""
-    if data == "noop":
-        return
-
-    try:
-        action, sym = data.split(":", 1)
-        sym = sym.strip().upper()
-    except Exception:
-        return
-
-    if action == "sig":
-        try:
-            res = await analyze_symbol(sym)
-            text = build_signal_message(res)
-            await q.message.reply_text(text)
-        except Exception as e:
-            log.exception("signal %s failed", sym)
-            await q.message.reply_text(f"{sym}: ошибка анализа — {e}")
-
-    elif action == "del":
-        favs = remove_favorite(sym)
-        await q.message.edit_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
-
-    elif action == "add":
-        add_favorite(sym)
-        await q.message.reply_text(f"{sym} добавлена в избранное ✅")
-
-# ------------ Регистрация ------------
-def register_handlers(app: Application) -> None:
-    log.info("Handlers зарегистрированы: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /menu")
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("find", cmd_find))
-    app.add_handler(CommandHandler("check", cmd_check))
-
-    app.add_handler(CommandHandler("watch_on", cmd_watch_on))
-    app.add_handler(CommandHandler("watch_off", cmd_watch_off))
-    app.add_handler(CommandHandler("watch_status", cmd_watch_status))
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
-    app.add_handler(CallbackQueryHandler(on_callback))
+    await update.message.reply_text(f"Вотчер выключен ⛔ (удалено jobs: {removed
