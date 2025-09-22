@@ -46,38 +46,16 @@ FUSION_COOLDOWN_SEC = int(os.getenv("FUSION_COOLDOWN_SEC", "900").strip() or "90
 FUSION_MIN_CONF = int(os.getenv("FUSION_MIN_CONF", "75").strip() or "75")  # мин. уверенность Strategy, чтобы её голос засчитался
 FUSION_REQUIRE_ANY = int(os.getenv("FUSION_REQUIRE_ANY", "2").strip() or "2")  # сколько модулей должны совпасть (2 из 3)
 
-# === FIBO watcher ===
-FIBO_ENABLED = (os.getenv("FIBO_ENABLED", "1").strip() == "1")
-# По каким ТФ смотреть Фибо. Можно оставить те же, что в вотчере, но тут зададим явно:
-FIBO_TFS = [t.strip() for t in os.getenv("FIBO_TFS", "1h,4h,1d").split(",") if t.strip()]
-FIBO_COOLDOWN_SEC = int(os.getenv("FIBO_COOLDOWN_SEC", "1200").strip() or "1200")  # 20 min
-
-# Детекция импульса и уровни
-FIBO_PIVOT_WINDOW = int(os.getenv("FIBO_PIVOT_WINDOW", "3").strip() or "3")       # свинг-пивот N слева/справа
-FIBO_CONFIRM_PULLBACK_PCT = float(os.getenv("FIBO_CONFIRM_PULLBACK_PCT", "0.15").strip() or "0.15")  # 15%
-
-# Зоны и допуски
+# === Настройки Фибоначчи (статические) ===
+FIBO_ENABLED = True                   # включить модуль
+FIBO_TFS = ["1h", "4h", "1d"]         # ТФ, на которых слать сигналы Фибо
+FIBO_COOLDOWN_SEC = 1200              # кулдаун по повторным сигналам (сек)
+FIBO_PIVOT_WINDOW = 3                 # свинг-пивот: N баров слева/справа
+FIBO_CONFIRM_PULLBACK_PCT = 0.15      # мин. откат, чтобы импульс считался завершённым (15%)
+FIBO_PROXIMITY_BPS = 25               # “толщина” зоны в б.п. (0.25%)
+FIBO_K_ATR = 0.35                     # добавочная “толщина” зоны в долях ATR(TF)
+FIBO_MIN_BODY_FRAC = 0.4              # подтверждение свечой: тело ≥ 40% диапазона свечи
+FIBO_REQUIRE_TREND_1D = True          # фильтр: работать по тренду 1D
+FIBO_IMPORTANT_TAG = "important"      # тэг для сильных сигналов
 FIBO_LEVELS_RETR = [23.6, 38.2, 50.0, 61.8, 78.6]
 FIBO_LEVELS_EXT  = [127.2, 161.8, 261.8]
-FIBO_PROXIMITY_BPS = int(os.getenv("FIBO_PROXIMITY_BPS", "25").strip() or "25")   # 0.25%
-FIBO_K_ATR = float(os.getenv("FIBO_K_ATR", "0.35").strip() or "0.35")            # ширина зоны как доля ATR
-FIBO_MIN_BODY_FRAC = float(os.getenv("FIBO_MIN_BODY_FRAC", "0.4").strip() or "0.4")  # подтверждение свечой
-
-# Фильтры/приоритизация
-FIBO_REQUIRE_TREND_1D = (os.getenv("FIBO_REQUIRE_TREND_1D", "1").strip() == "1")
-FIBO_SEND_ONLY_IMPORTANT = (os.getenv("FIBO_SEND_ONLY_IMPORTANT", "0").strip() == "0")  # по умолчанию шлём все подтверждённые
-FIBO_IMPORTANT_TAG = os.getenv("FIBO_IMPORTANT_TAG", "important").strip() or "important"
-
-# === Настройки Фибоначчи ===
-FIBO_ENABLED = True  # включить модуль
-FIBO_TFS = ["1h", "4h", "1d"]
-FIBO_COOLDOWN_SEC = 1200
-FIBO_PIVOT_WINDOW = 3
-FIBO_CONFIRM_PULLBACK_PCT = 0.15
-FIBO_PROXIMITY_BPS = 25
-FIBO_K_ATR = 0.35
-FIBO_MIN_BODY_FRAC = 0.4
-FIBO_REQUIRE_TREND_1D = True
-FIBO_IMPORTANT_TAG = "important"
-FIBO_LEVELS_RETR = [23.6, 38.2, 50.0, 61.8, 78.6]
-FIBO_LEVELS_EXT = [127.2, 161.8, 261.8]
