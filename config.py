@@ -67,3 +67,17 @@ FIBO_MIN_BODY_FRAC = float(os.getenv("FIBO_MIN_BODY_FRAC", "0.4").strip() or "0.
 FIBO_REQUIRE_TREND_1D = (os.getenv("FIBO_REQUIRE_TREND_1D", "1").strip() == "1")
 FIBO_SEND_ONLY_IMPORTANT = (os.getenv("FIBO_SEND_ONLY_IMPORTANT", "0").strip() == "0")  # по умолчанию шлём все подтверждённые
 FIBO_IMPORTANT_TAG = os.getenv("FIBO_IMPORTANT_TAG", "important").strip() or "important"
+
+# === Настройки Фибоначчи ===
+FIBO_ENABLED = True  # включить модуль
+FIBO_TFS = ["1h", "4h", "1d"]
+FIBO_COOLDOWN_SEC = 1200
+FIBO_PIVOT_WINDOW = 3
+FIBO_CONFIRM_PULLBACK_PCT = 0.15
+FIBO_PROXIMITY_BPS = 25
+FIBO_K_ATR = 0.35
+FIBO_MIN_BODY_FRAC = 0.4
+FIBO_REQUIRE_TREND_1D = True
+FIBO_IMPORTANT_TAG = "important"
+FIBO_LEVELS_RETR = [23.6, 38.2, 50.0, 61.8, 78.6]
+FIBO_LEVELS_EXT = [127.2, 161.8, 261.8]
