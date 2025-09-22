@@ -74,6 +74,7 @@ TT_MIN_RR_TP1 = 1.6                # минимальный RR до TP1 для �
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
 BYBIT_BASE_URL = "https://api.bybit.com"
+
 # === ATTENTION (агрегатор Fibo + Fusion) ===
 ATTN_ENABLED = True                 # включить агрегатор
 ATTN_FUSION_MIN = 72               # минимальный скор Fusion
