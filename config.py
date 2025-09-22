@@ -59,3 +59,18 @@ FIBO_REQUIRE_TREND_1D = True          # фильтр: работать по тр
 FIBO_IMPORTANT_TAG = "important"      # тэг для сильных сигналов
 FIBO_LEVELS_RETR = [23.6, 38.2, 50.0, 61.8, 78.6]
 FIBO_LEVELS_EXT  = [127.2, 161.8, 261.8]
+
+# === True Trading (реальный счёт) ===
+TT_ENABLED = False                 # по умолчанию выкл; включим кнопкой /tt_on
+TT_RISK_PCT = 0.01                 # риск на сделку (1% от эквити)
+TT_MAX_OPEN_POS = 3                # максимум одновременных позиций
+TT_DAILY_LOSS_LIMIT_PCT = 0.03     # дневной лимит просадки (3%) — пауза до завтра
+TT_SYMBOL_COOLDOWN_MIN = 30        # кулдаун по символу после входа (мин)
+TT_ORDER_SLIPPAGE_BPS = 20         # защита от проскальзывания (0.20%)
+TT_REQUIRE_1D_TREND = True         # торговать только в сторону 1D (можно выключить)
+TT_MIN_RR_TP1 = 1.6                # минимальный RR до TP1 для допуска сделки
+
+# Доступ к Bybit (реальный счёт) — ключи положи в Render Environment
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "").strip()
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "").strip()
+BYBIT_BASE_URL = "https://api.bybit.com"
