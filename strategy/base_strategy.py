@@ -91,6 +91,10 @@ def _confidence(direction: str, adx_v: float, rsi_v: float) -> int:
     return max(40, min(95, base))
 
 def _pick_struct_levels_for_side(price: float, levels: Dict[str, float], side: str) -> Tuple[list, list]:
+    """
+    Возвращает кандидаты TP и SL из структурных уровней
+    (уже отфильтрованные по стороне цены относительно текущего price).
+    """
     if side == "LONG":
         tp_raw = sorted([levels["res1"], levels["res2"]])
         sl_raw = sorted([levels["sup1"], levels["sup2"]])
@@ -103,7 +107,11 @@ def _pick_struct_levels_for_side(price: float, levels: Dict[str, float], side: s
         sl = [x for x in sl_raw if x > price * 1.0005]
     return tp, sl
 
-def _clamp(x: float, lo: float, hi: float) -> float:
+def _clamp(x: float, a: float, b: float) -> float:
+    """
+    Безопасный clamp: сам упорядочит границы.
+    """
+    lo, hi = (a, b) if a <= b else (b, a)
     return max(lo, min(hi, x))
 
 def _tp_sl_rr_enforced(symbol: str, direction: str, price: float, df: pd.DataFrame, levels: Dict[str, float]) -> Dict[str, float]:
@@ -118,8 +126,8 @@ def _tp_sl_rr_enforced(symbol: str, direction: str, price: float, df: pd.DataFra
     atr = _atr(df, ATR_PERIOD)
     tp_cands, sl_cands = _pick_struct_levels_for_side(price, levels, direction)
 
-    # SL от структуры, иначе ATR-фоллбек
     if direction == "LONG":
+        # SL от структуры, иначе ATR-фоллбек
         sl_level = sl_cands[-1] if sl_cands else None
         sl = sl_level if (sl_level is not None and sl_level < price) else price - ATR_MULT_SL * atr
         risk = max(1e-12, price - sl)
@@ -153,32 +161,30 @@ def _tp_sl_rr_enforced(symbol: str, direction: str, price: float, df: pd.DataFra
         sl = sl_level if (sl_level is not None and sl_level > price) else price + ATR_MULT_SL * atr
         risk = max(1e-12, sl - price)
 
-        tp1_min = price - MIN_RR_TP1 * risk
-        tp1_max = price - min(MAX_RR_TP1 * risk, ATR_TP1_CAP * atr)
-        tp2_min = price - max(MIN_RR_TP2 * risk, (MIN_RR_TP1 + MIN_GAP_R) * risk)
-        tp2_max = price - min(MAX_RR_TP2 * risk, ATR_TP2_CAP * atr)
+        # Коридоры (при SHORT «дальше» — ниже по цене)
+        tp1_near = price - MIN_RR_TP1 * risk
+        tp1_far  = price - min(MAX_RR_TP1 * risk, ATR_TP1_CAP * atr)
+        tp2_near = price - max(MIN_RR_TP2 * risk, (MIN_RR_TP1 + MIN_GAP_R) * risk)
+        tp2_far  = price - min(MAX_RR_TP2 * risk, ATR_TP2_CAP * atr)
 
-        tp1_struct = tp_cands[-1] if tp_cands else None
-        tp2_struct = tp_cands[0] if len(tp_cands) > 1 else None
+        # Кандидаты от структуры (ниже цены)
+        tp1_struct = tp_cands[-1] if tp_cands else None  # ближний к цене
+        tp2_struct = tp_cands[0] if len(tp_cands) > 1 else None  # более дальний
 
+        # TP1: в коридор между far..near (clamp сам разберётся с порядком)
         if tp1_struct is not None:
-            tp1 = _clamp(tp1_struct, tp1_max, tp1_min)  # max<min в SHORT, clamp через перестановку
-            tp1 = _clamp(tp1, tp1_max, tp1_min)         # страховка
+            tp1 = _clamp(tp1_struct, tp1_far, tp1_near)
         else:
-            tp1 = tp1_min
+            tp1 = tp1_near  # minimally acceptable
 
-        # для SHORT удобнее руками ограничить:
-        tp1 = max(tp1_max, min(tp1, tp1_min))
-
+        # TP2: дальше TP1 минимум на 1R и в своём коридоре
+        tp2_lo = min(tp2_far, tp1 - MIN_GAP_R * risk)  # более дальняя (меньше по цене)
+        tp2_hi = tp2_near                               # более близкая (выше)
         if tp2_struct is not None:
-            # TP2 должен быть дальше TP1 на ≥1R и в коридоре
-            tp2_lower = min(tp2_min, tp1 - MIN_GAP_R * risk)
-            tp2_upper = tp2_max
-            tp2 = max(tp2_upper, min(tp2_struct, tp2_lower))  # в SHORT нижняя граница меньше верхней
-            tp2 = max(tp2_upper, min(tp2, tp2_lower))
+            tp2 = _clamp(tp2_struct, tp2_lo, tp2_hi)
         else:
-            base_max = min(tp2_min, tp1 - MIN_GAP_R * risk)
-            tp2 = max(tp2_max, min(base_max, tp2_min))
+            base = min(tp2_near, tp1 - MIN_GAP_R * risk)
+            tp2 = _clamp(base, tp2_lo, tp2_hi)
 
     # Если TP2 почти равен TP1 — разнесём дополнительно
     if math.isclose(tp1, tp2, rel_tol=1e-4):
@@ -186,6 +192,22 @@ def _tp_sl_rr_enforced(symbol: str, direction: str, price: float, df: pd.DataFra
             tp2 = tp1 + MIN_GAP_R * risk
         else:
             tp2 = tp1 - MIN_GAP_R * risk
+
+    # --- Инварианты безопасности перед возвратом ---
+    if direction == "LONG":
+        # SL должен быть ниже цены; TP возрастают и выше цены
+        if not (sl < price):
+            sl = price - abs(risk)
+        tp1, tp2 = sorted([tp1, tp2])  # возрастание
+        tp1 = max(tp1, price + 1e-8)
+        tp2 = max(tp2, tp1 + 1e-8)
+    else:
+        # SL должен быть выше цены; TP убывают и ниже цены
+        if not (sl > price):
+            sl = price + abs(risk)
+        tp1, tp2 = sorted([tp1, tp2], reverse=True)  # убывание
+        tp1 = min(tp1, price - 1e-8)
+        tp2 = min(tp2, tp1 - 1e-8)
 
     return {"tp1": float(tp1), "tp2": float(tp2), "sl": float(sl)}
 
