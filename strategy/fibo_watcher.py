@@ -128,13 +128,21 @@ def _fmt(x: float) -> str:
     return s
 
 def _rr(entry: float, sl: float, tp: float, side: str) -> float:
-    if side == "long":
-        risk = max(1e-12, entry - sl)
-        reward = tp - entry
-    else:
-        risk = max(1e-12, sl - entry)
-        reward = entry - tp
-    return round(reward / risk, 2)
+    """
+    Безопасный RR:
+      - риск = abs(entry - sl) → нет «почти нуля», если SL по другой стороне
+      - знак RR показывает корректность стороны цели:
+          LONG: TP <= entry → RR отрицательный
+          SHORT: TP >= entry → RR отрицательный
+    """
+    e = float(entry); s = float(sl); t = float(tp)
+    risk = max(1e-12, abs(e - s))
+    reward = abs(t - e)
+    rr = reward / risk
+    side = (side or "").lower()
+    if (side == "long" and t <= e) or (side == "short" and t >= e):
+        rr = -rr
+    return round(rr, 2)
 
 def _next_deeper_retr(level_pct: float) -> Optional[float]:
     """Следующий 'более глубокий' retr-уровень для SL при отбойном входе."""
