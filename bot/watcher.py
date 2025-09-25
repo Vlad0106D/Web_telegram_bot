@@ -54,14 +54,19 @@ except Exception:
 from services.state import get_favorites
 from services.breaker import detect_breakout, format_breakout_message
 from services.reversal import detect_reversals, format_reversal_message
-from services.analyze import analyze_symbol
+
+# FIX: берем analyze_symbol из актуальной реализации (если он у тебя в strategy/base_strategy.py — поправь импорт)
+from services.analyze import analyze_symbol  
+
+# FIX: генератор текста сигналов (если ты уже сменил на другой модуль — оставь актуальный)
 from services.signal_text import build_signal_message
+
 from services.fusion import analyze_fusion, format_fusion_message
 
 # новый модуль Фибо
 from strategy.fibo_watcher import analyze_fibo, format_fibo_message
 
-# >>> добавлено: агрегатор ATTENTION (TrueTrading без торговли)
+# агрегатор ATTENTION (TrueTrading без торговли)
 from services.true_trading import get_tt
 
 log = logging.getLogger(__name__)
@@ -148,7 +153,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_reversal = 0
         sent_fusion = 0
         sent_fibo = 0
-        sent_attention = 0  # <<< добавили
+        sent_attention = 0
 
         for sym in favs:
             # ---------- 1) BREAKER ----------
@@ -165,7 +170,9 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if now - last_ts >= float(BREAKER_COOLDOWN_SEC):
                         if chat_id:
                             await context.bot.send_message(
-                                chat_id=chat_id, text=format_breakout_message(ev)
+                                chat_id=chat_id,
+                                text=format_breakout_message(ev),
+                                parse_mode="HTML",  # FIX: если форматируешь HTML
                             )
                         breaker_last[key_b] = now
                         sent_breaker += 1
@@ -174,8 +181,11 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # ---------- 2) STRATEGY ----------
             try:
-                res = await analyze_symbol(sym)
-                signal = (res.get("signal") or "none").lower()
+                # FIX: передаём текущий tf в анализатор
+                res = await analyze_symbol(sym, tf=tf)
+
+                # FIX: учитываем поле 'direction' (старый код смотрел на 'signal')
+                signal = (res.get("signal") or res.get("direction") or "none").lower()
                 conf = int(res.get("confidence") or 0)
 
                 if signal in ("long", "short") and conf >= int(SIGNAL_MIN_CONF):
@@ -184,12 +194,14 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if now - last_ts >= float(SIGNAL_COOLDOWN_SEC):
                         if chat_id:
                             await context.bot.send_message(
-                                chat_id=chat_id, text=build_signal_message(res)
+                                chat_id=chat_id,
+                                text=build_signal_message(res),
+                                parse_mode="HTML",  # FIX: если в тексте есть <code> и т.п.
                             )
                         signal_last[key_s] = now
                         sent_signal += 1
             except Exception:
-                log.exception("Strategy analyze failed for %s", sym)
+                log.exception("Strategy analyze failed for %s %s", sym, tf)
 
             # ---------- 3) REVERSAL ----------
             try:
@@ -200,7 +212,9 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if now - last_ts >= float(REVERSAL_COOLDOWN_SEC):
                         if chat_id:
                             await context.bot.send_message(
-                                chat_id=chat_id, text=format_reversal_message(ev)
+                                chat_id=chat_id,
+                                text=format_reversal_message(ev),
+                                parse_mode="HTML",  # FIX
                             )
                         reversal_last[key_r] = now
                         sent_reversal += 1
@@ -217,12 +231,14 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                         if now - last_ts >= float(FUSION_COOLDOWN_SEC):
                             if chat_id:
                                 await context.bot.send_message(
-                                    chat_id=chat_id, text=format_fusion_message(fev)
+                                    chat_id=chat_id,
+                                    text=format_fusion_message(fev),
+                                    parse_mode="HTML",  # FIX
                                 )
                             fusion_last[key_f] = now
                             sent_fusion += 1
 
-                        # >>> кэш для ATTENTION
+                        # кэш для ATTENTION
                         try:
                             get_tt(app).update_fusion(
                                 sym, tf,
@@ -249,12 +265,14 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                         if now - last_ts >= float(FIBO_COOLDOWN_SEC):
                             if chat_id:
                                 await context.bot.send_message(
-                                    chat_id=chat_id, text=format_fibo_message(ev)
+                                    chat_id=chat_id,
+                                    text=format_fibo_message(ev),
+                                    parse_mode="HTML",  # FIX
                                 )
                             fibo_last[key_fi] = now
                             sent_fibo += 1
 
-                        # >>> кэш для ATTENTION (берём план сделки из Фибо)
+                        # кэш для ATTENTION (берём план сделки из Фибо)
                         try:
                             get_tt(app).update_fibo(
                                 sym, tf,
@@ -273,6 +291,8 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     "tp2": float(getattr(ev, "tp2", 0.0)),
                                     "tp3": float(getattr(ev, "tp3", 0.0)),
 
+                                    # RR сейчас пересчитывается в TrueTrading безопасно — но оставим кэш,
+                                    # он больше для дебага и визуализации
                                     "rr_tp1": float(getattr(ev, "rr_tp1", 0.0)),
                                     "rr_tp2": float(getattr(ev, "rr_tp2", 0.0)),
                                     "rr_tp3": float(getattr(ev, "rr_tp3", 0.0)),
@@ -385,8 +405,7 @@ async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Jobs: {', '.join(created) if created else '—'}"
     )
     if update.effective_message:
-        await update.effective_message.reply_text(text)
-
+        await update.effective_message.reply_text(text, parse_mode="HTML")  # FIX
 
 async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
@@ -394,7 +413,6 @@ async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = f"⛔ Вотчер остановлен. Удалено задач: {removed}"
     if update.effective_message:
         await update.effective_message.reply_text(text)
-
 
 async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
@@ -409,8 +427,7 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Активные jobs: {jobs}"
     )
     if update.effective_message:
-        await update.effective_message.reply_text(text)
-
+        await update.effective_message.reply_text(text, parse_mode="HTML")  # FIX
 
 def register_watch_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("watch_on", cmd_watch_on))
