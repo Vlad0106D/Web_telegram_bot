@@ -53,9 +53,82 @@ class AttentionEvent:
     tp1: float
     tp2: float
     tp3: float
-    rr_tp1: float
-    rr_tp2: float
-    rr_tp3: float
+    rr_tp1: Optional[float]
+    rr_tp2: Optional[float]
+    rr_tp3: Optional[float]
+    bad_sl: bool = False     # SL по «не той» стороне
+
+
+# ---------- локальные утилиты ----------
+
+def _fmt_price(x: float) -> str:
+    if x >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}".rstrip("0").rstrip(".")
+
+def _fmt_rr(rr: Optional[float], bad_side: bool = False) -> str:
+    if rr is None:
+        return "(RR=–)"
+    # защита от «космоса»
+    if rr > 9999:
+        return "(RR>9999)"
+    if rr < -9999:
+        return "(RR<-9999)"
+    s = f"{rr:.2f}"
+    if (rr < 0) or bad_side:
+        return f"(RR={s} ⚠)"
+    return f"(RR={s})"
+
+def _norm_side(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in ("long", "buy", "bull"):
+        return "long"
+    if s in ("short", "sell", "bear"):
+        return "short"
+    return "none"
+
+def _safe_rr(side: str, entry: float, sl: float, tp: float) -> Tuple[Optional[float], bool]:
+    """
+    Считает RR безопасно. Возвращает (rr, bad_side),
+    где bad_side=True если SL/TP на «не тех» сторонах.
+    RR положительный — TP на «правильной» стороне; отрицательный — TP на «неправильной».
+    """
+    side = _norm_side(side)
+    e = float(entry); s = float(sl); t = float(tp)
+
+    # проверка «плохого SL»
+    bad_sl = (side == "long" and s >= e) or (side == "short" and s <= e)
+
+    # риск считаем по модулю: это убирает деление на ~0, когда SL ошибочно по другой стороне
+    risk = abs(e - s)
+    if risk <= 0:
+        return None, True
+
+    reward = abs(t - e)
+    rr = reward / risk
+
+    # знак RR по стороне TP
+    if (side == "long" and t <= e) or (side == "short" and t >= e):
+        rr = -rr  # TP не на той стороне
+
+    return rr, bad_sl
+
+# ---------- формат ATTENTION ----------
+
+def format_attention_message(ev: AttentionEvent) -> str:
+    arrow = "↑" if ev.side == "long" else "↓"
+    return (
+        "⚠️ <b>[ATTENTION]</b>\n"
+        f"{ev.symbol} {ev.tf}\n"
+        f"{ev.side.upper()} {arrow} | {ev.fibo_level} | Fusion={ev.fusion_score}\n"
+        "━━━━━━━━━━━━\n"
+        f"Вход: <code>{_fmt_price(ev.entry)}</code>\n"
+        f"SL:   <code>{_fmt_price(ev.sl)}</code>{'  ⚠ неверная сторона SL' if ev.bad_sl else ''}\n"
+        f"TP1:  <code>{_fmt_price(ev.tp1)}</code> {_fmt_rr(ev.rr_tp1, ev.bad_sl)}\n"
+        f"TP2:  <code>{_fmt_price(ev.tp2)}</code> {_fmt_rr(ev.rr_tp2, ev.bad_sl)}\n"
+        f"TP3:  <code>{_fmt_price(ev.tp3)}</code> {_fmt_rr(ev.rr_tp3, ev.bad_sl)}\n"
+        "━━━━━━━━━━━━"
+    )
 
 
 class TrueTrading:
@@ -138,8 +211,8 @@ class TrueTrading:
             return None
 
         # 1) Совпадение направления
-        side_fibo = (fibo.get("side") or "").lower()
-        side_fusion = (fusion.get("side") or "").lower()
+        side_fibo = _norm_side(fibo.get("side"))
+        side_fusion = _norm_side(fusion.get("side"))
         if side_fibo not in ("long", "short") or side_fusion != side_fibo:
             return None
 
@@ -150,17 +223,30 @@ class TrueTrading:
 
         # 3) Тренд 1D (по флагу)
         if ATTN_REQUIRE_1D_TREND:
-            t1d = (fibo.get("trend_1d") or fusion.get("trend1d") or "").lower()
+            t1d = str(fibo.get("trend_1d") or fusion.get("trend1d") or "").lower()
             if side_fibo == "long" and t1d != "up":
                 return None
             if side_fibo == "short" and t1d != "down":
                 return None
 
-        # 4) RR минимальный
-        rr1 = float(fibo.get("rr_tp1") or 0.0)
-        rr2 = float(fibo.get("rr_tp2") or 0.0)
-        rr3 = float(fibo.get("rr_tp3") or 0.0)
-        if rr1 < float(ATTN_MIN_RR_TP1):
+        # 4) Уровни из Fibo (не доверяем rr_*, пересчитаем сами)
+        try:
+            entry = float(fibo["entry"])
+            sl    = float(fibo["sl"])
+            tp1   = float(fibo["tp1"])
+            tp2   = float(fibo["tp2"])
+            tp3   = float(fibo["tp3"])
+        except Exception:
+            return None
+
+        rr1, bad_sl_1 = _safe_rr(side_fibo, entry, sl, tp1)
+        rr2, bad_sl_2 = _safe_rr(side_fibo, entry, sl, tp2)
+        rr3, bad_sl_3 = _safe_rr(side_fibo, entry, sl, tp3)
+        bad_sl = bool(bad_sl_1 or bad_sl_2 or bad_sl_3)
+
+        # 4.1 Фильтр по RR1: принимаем только если RR1 положительный и >= порога
+        #    (т.е. TP1 на правильной стороне и RR достаточный)
+        if rr1 is None or rr1 <= 0 or rr1 < float(ATTN_MIN_RR_TP1):
             return None
 
         # 5) Кулдаун
@@ -171,22 +257,25 @@ class TrueTrading:
             return None
 
         # 6) Формирование события
-        lvl_kind = fibo.get("level_kind")
-        lvl_pct = fibo.get("level_pct")
-        lvl_str = f"{'retr' if lvl_kind=='retr' else 'ext'} {float(lvl_pct):.1f}%"
+        lvl_kind = str(fibo.get("level_kind") or "ext").lower()
+        lvl_pct_raw = fibo.get("level_pct")
+        try:
+            lvl_pct = float(lvl_pct_raw)
+            lvl_str = f"{'retr' if lvl_kind=='retr' else 'ext'} {lvl_pct:.1f}%"
+        except Exception:
+            lvl_str = f"{'retr' if lvl_kind=='retr' else 'ext'}"
 
         ev = AttentionEvent(
             symbol=key[0], tf=key[1], side=side_fibo,
             fusion_score=score, fibo_level=lvl_str,
-            entry=float(fibo["entry"]), sl=float(fibo["sl"]),
-            tp1=float(fibo["tp1"]), tp2=float(fibo["tp2"]), tp3=float(fibo["tp3"]),
-            rr_tp1=rr1, rr_tp2=rr2, rr_tp3=rr3,
+            entry=entry, sl=sl, tp1=tp1, tp2=tp2, tp3=tp3,
+            rr_tp1=rr1, rr_tp2=rr2, rr_tp3=rr3, bad_sl=bad_sl,
         )
 
         # 7) Отправка сообщения
         text = format_attention_message(ev)
         try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
             self._attention_last[cd_key] = now
         except Exception:
             # не роняем тикер, просто не записываем кулдаун если отправка не удалась
@@ -195,27 +284,7 @@ class TrueTrading:
         return ev
 
 
-# --- Утилиты форматирования и singleton-доступ --- #
-
-def _fmt_price(x: float) -> str:
-    if x >= 1:
-        return f"{x:.4f}"
-    return f"{x:.6f}".rstrip("0").rstrip(".")
-
-def format_attention_message(ev: AttentionEvent) -> str:
-    arrow = "↑" if ev.side == "long" else "↓"
-    return (
-        "⚠️ <b>[ATTENTION]</b>\n"
-        f"{ev.symbol} {ev.tf}\n"
-        f"{ev.side.upper()} {arrow} | {ev.fibo_level} | Fusion={ev.fusion_score}\n"
-        "━━━━━━━━━━━━\n"
-        f"Вход: <code>{_fmt_price(ev.entry)}</code>\n"
-        f"SL:   <code>{_fmt_price(ev.sl)}</code>\n"
-        f"TP1:  <code>{_fmt_price(ev.tp1)}</code> (RR={ev.rr_tp1:.2f})\n"
-        f"TP2:  <code>{_fmt_price(ev.tp2)}</code> (RR={ev.rr_tp2:.2f})\n"
-        f"TP3:  <code>{_fmt_price(ev.tp3)}</code> (RR={ev.rr_tp3:.2f})\n"
-        "━━━━━━━━━━━━"
-    )
+# --- Singleton доступ --- #
 
 def get_tt(app) -> TrueTrading:
     """Singleton доступ к агрегатору через app.bot_data."""
