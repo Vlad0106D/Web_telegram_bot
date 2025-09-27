@@ -2,24 +2,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 from services.analyze import analyze_symbol
 from services.breaker import detect_breakout
 from services.reversal import detect_reversals
 from services.market_data import get_price, get_candles
 
-# Безопасные дефолты (можно переопределить в config.py)
+# Порог для учёта Strategy в голосовании
 try:
     from config import FUSION_MIN_CONF
 except Exception:
-    FUSION_MIN_CONF = 75  # минимальная уверенность Strategy, чтобы её голос засчитался
+    FUSION_MIN_CONF = 75
 
+# Сколько модулей должно совпасть по направлению (2 из 3)
 try:
     from config import FUSION_REQUIRE_ANY
 except Exception:
-    FUSION_REQUIRE_ANY = 2  # сколько модулей должны совпасть по направлению (2 из 3)
+    FUSION_REQUIRE_ANY = 2
 
+# Параметры брейкера
 try:
     from config import BREAKER_LOOKBACK, BREAKER_EPS
 except Exception:
@@ -29,24 +31,23 @@ except Exception:
 @dataclass
 class FusionEvent:
     """
-    Универсальный и самодостаточный контейнер Fusion-сигнала.
-    ВАЖНО: добавлены поля 'score' (синоним confidence) и 'trend1d'
-    — именно их ждёт TrueTrading.
+    Контейнер Fusion-сигнала.
+    ВАЖНО: поле 'score' (дубликат confidence) — то, что читает TrueTrading.
     """
     symbol: str
-    tf: str                       # TF вотчер-цикла (для breaker), информативно
-    side: str                     # "long" | "short"
-    confidence: int               # 0..100
-    score: int                    # дубликат confidence для совместимости с TrueTrading
+    tf: str                    # TF вотчер-цикла (для breaker), информативно
+    side: str                  # "long" | "short"
+    confidence: int            # 0..100
+    score: int                 # == confidence (для TrueTrading)
     price: float
     exchange: str
-    components: Dict[str, str]    # {"strategy": "long/short/none", "breaker": "up/down/none", "reversal": "bull/bear/none"}
+    components: Dict[str, str] # {"strategy": "...", "breaker": "...", "reversal": "..."}
     reasons: List[str]
 
-    # Новые / опциональные поля для TrueTrading и "истинного" конфлюэнса:
-    trend1d: Optional[str] = None         # "up" | "down"
-    zone_center: Optional[float] = None   # центр зоны Fusion (если используешь зоны)
-    zone_halfwidth: Optional[float] = None  # полу-ширина зоны (допуск вокруг center)
+    # Дополнительно для TrueTrading и проверки конфлюэнса по цене:
+    trend1d: Optional[str] = None          # "up" | "down"
+    zone_center: Optional[float] = None    # центр зоны Fusion (если используешь зоны)
+    zone_halfwidth: Optional[float] = None # полу-ширина зоны
 
 
 def _reversal_side(kind: str) -> Optional[str]:
@@ -67,8 +68,8 @@ def _breaker_side(direction: Optional[str]) -> Optional[str]:
 
 async def _calc_trend_1d(symbol: str) -> Optional[str]:
     """
-    Простой тренд 1D: EMA21 - EMA50.
-    Возвращает "up" или "down" (или None при ошибке).
+    Простой тренд 1D по EMA(21) и EMA(50).
+    Возвращает "up"/"down" или None при ошибке.
     """
     try:
         dfd, _ = await get_candles(symbol, "1d", limit=150)
@@ -76,23 +77,18 @@ async def _calc_trend_1d(symbol: str) -> Optional[str]:
             return None
         ema21 = dfd["close"].ewm(span=21, adjust=False).mean()
         ema50 = dfd["close"].ewm(span=50, adjust=False).mean()
-        t = "up" if (ema21.iloc[-1] - ema50.iloc[-1]) >= 0 else "down"
-        return t
+        return "up" if (ema21.iloc[-1] - ema50.iloc[-1]) >= 0 else "down"
     except Exception:
         return None
 
 
 async def analyze_fusion(symbol: str, tf: str) -> Optional[FusionEvent]:
     """
-    Простая «схема голосования»:
-      • Strategy: analyze_symbol(). Голос засчитывается, если conf >= FUSION_MIN_CONF.
-      • Breaker: detect_breakout(tf). up -> long, down -> short.
-      • Reversal: берём ПОСЛЕДНЕЕ событие из detect_reversals() (приор. импульсы 5m/10m),
-                  bull -> long, bear -> short.
-
-      Если не менее FUSION_REQUIRE_ANY модулей сошлись по направлению — формируем FusionEvent.
-      Итоговая confidence = среднее «весов» модулей + бонус за конвергенцию (+10 если 3/3).
-      Дополнительно считаем trend1d и кладём его в поле, которое может использовать TrueTrading.
+    «Голосовалка»:
+      • Strategy: analyze_symbol(); голос идёт, если conf >= FUSION_MIN_CONF.
+      • Breaker: detect_breakout(); up -> long, down -> short.
+      • Reversal: берём самое свежее событие; bull->long, bear->short.
+    Итог: если хотя бы FUSION_REQUIRE_ANY модулей сошлись — формируем FusionEvent.
     """
     # 1) Strategy
     S = await analyze_symbol(symbol)
@@ -104,12 +100,11 @@ async def analyze_fusion(symbol: str, tf: str) -> Optional[FusionEvent]:
     B = await detect_breakout(symbol, tf=tf, lookback=BREAKER_LOOKBACK, eps=BREAKER_EPS)
     b_side = _breaker_side(B.direction) if B else None
 
-    # 3) Reversal
+    # 3) Reversal (берём самое «весомое и свежее»)
     R = await detect_reversals(symbol)
     r_side = None
     r_kind = None
     if R:
-        # выберем «самое свежее» событие, отдавая приоритет импульсным (5m/10m)
         tf_weight = {"5m": 3, "10m": 3, "15m": 2, "30m": 2, "1h": 1, "4h": 0}
         R_sorted = sorted(R, key=lambda e: (tf_weight.get(e.tf, -1), e.ts), reverse=True)
         r_sel = R_sorted[0]
@@ -123,32 +118,31 @@ async def analyze_fusion(symbol: str, tf: str) -> Optional[FusionEvent]:
 
     if s_side:
         votes[s_side] += 1
-        weights[s_side].append(s_conf)  # Strategy вносит свой real conf
+        weights[s_side].append(s_conf)
         reasons.append(f"Strategy: {s_side} (conf={s_conf})")
     else:
         reasons.append("Strategy: none / low-confidence")
 
     if b_side:
         votes[b_side] += 1
-        weights[b_side].append(70)      # Breaker — фикс. вес (можно вынести в конфиг)
+        weights[b_side].append(70)
         reasons.append(f"Breaker: {b_side}")
     else:
         reasons.append("Breaker: none")
 
     if r_side:
         votes[r_side] += 1
-        weights[r_side].append(75)      # Reversal — фикс. вес (можно вынести в конфиг)
+        weights[r_side].append(75)
         reasons.append(f"Reversal: {r_side} ({r_kind})")
     else:
         reasons.append("Reversal: none")
 
-    # Ищем сторону с нужным количеством совпадений
+    # Выбор стороны
     side = None
     for k in ("long", "short"):
         if votes[k] >= FUSION_REQUIRE_ANY:
             side = k
             break
-
     if side is None:
         return None
 
@@ -171,20 +165,20 @@ async def analyze_fusion(symbol: str, tf: str) -> Optional[FusionEvent]:
         "reversal": r_side or "none",
     }
 
-    # Тренд 1D для TrueTrading (если не нужен — можно не использовать)
+    # Тренд 1D (для TrueTrading)
     t1d = await _calc_trend_1d(symbol)
 
-    # Опционально можно задавать центр/ширину зоны Fusion:
+    # Зона Fusion (опционально): центр — текущая цена; ширину можно задать позже
     zone_center = price
-    zone_halfwidth = None  # если есть свой расчет зоны — подставь сюда полу-ширину
+    zone_halfwidth = None
 
-    # ВАЖНО: 'score' = confidence (для TrueTrading)
+    # ВАЖНО: score = confidence
     ev = FusionEvent(
-        symbol=symbol,          # не меняем регистр, чтобы совпало с Fibo-ключом
+        symbol=symbol,      # без .upper(), чтобы совпало с тем, как приходит в Fibo
         tf=tf,
         side=side,
         confidence=base_conf,
-        score=base_conf,        # <-- ключевая строка для TrueTrading
+        score=base_conf,    # ключ для TrueTrading
         price=price,
         exchange=ex,
         components=components,
@@ -214,22 +208,19 @@ def format_fusion_message(ev: FusionEvent) -> str:
     return "\n".join(parts)
 
 
-# ==== ВАЖНО для TrueTrading: подготовить dict в нужном формате ====
+# ==== Для TrueTrading: подготовка словаря ровно в нужном формате ====
 
 def fusion_to_tt_dict(ev: FusionEvent) -> Dict[str, object]:
     """
-    Преобразует FusionEvent в словарь, который ожидает TrueTrading.update_fusion():
+    Возвращает словарь, который ожидает TrueTrading.update_fusion():
       • side: "long"/"short"
       • score: int (используется фильтром ATTN_FUSION_MIN)
-      • trend1d: "up"/"down" (опционально; TrueTrading берёт также из Fibo)
-      • zone_center / zone_halfwidth: опционально (для строгого совпадения по цене)
-      • tf / symbol — информативно; TrueTrading использует их как ключ кэша
+      • trend1d: "up"/"down" (опционально)
+      • zone_center / zone_halfwidth: опционально
+      • price/components — информативны
     """
     d = asdict(ev)
-    # TrueTrading читает именно 'score'
     d["score"] = int(ev.score)
-    # Оставляем 'trend1d' как есть ("up"/"down"/None)
-    # Поля зоны опциональны — если есть ширина, TrueTrading может проверить близость
     return {
         "symbol": ev.symbol,
         "tf": ev.tf,
@@ -238,7 +229,6 @@ def fusion_to_tt_dict(ev: FusionEvent) -> Dict[str, object]:
         "trend1d": ev.trend1d,
         "zone_center": ev.zone_center,
         "zone_halfwidth": ev.zone_halfwidth,
-        # плюс можем вернуть price/компоненты — не мешают
         "price": ev.price,
         "components": ev.components,
     }
