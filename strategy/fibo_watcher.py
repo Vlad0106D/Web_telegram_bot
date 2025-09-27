@@ -174,34 +174,65 @@ async def analyze_fibo(symbol: str, tf: str) -> List[FiboEvent]:
 
     def plan_rejection(kind: str, pct_level: float, lvl_price: float, zl: float, zh: float, side: str) -> Tuple[float,float,float,float,float]:
         """
-        Возвращает Entry, SL, TP1, TP2, TP3 для отбойного входа.
-        Правила:
-          - Entry: середина зоны (консервативно) или текущая цена внутри зоны — берём текущую.
-          - SL: за 'следующим' более глубоким retr-уровнем (или за 78.6), с микробуфером 0.1*ATR или 0.1% от цены.
-          - TP1: 0% (точка B), TP2: 127.2%, TP3: 161.8%.
+        Отбой от зоны:
+          - Entry: середина зоны (или текущая, если внутри).
+          - SL:
+              retr: за 'следующим' более глубоким retr (или 78.6) с micro-буфером
+              ext:  за границей зоны (zl/zh) с micro-буфером — НЕ использовать retr-уровни для SL
+          - TP:
+              retr:  TP1=B; TP2/TP3 — EXT по ходу сделки (в сторону профита)
+              ext:   TP1=B; TP2/TP3 — RETR на стороне профита (mean-reversion)
         """
         mid = (zl + zh) / 2.0
         entry = last if zl <= last <= zh else mid
 
-        # микробуфер
         micro = max(0.001 * lvl_price, 0.1 * atr_tf)  # 0.1% цены или 0.1 ATR
-
-        # SL по следующему глубже retr (или 78.6)
-        deeper = _next_deeper_retr(pct_level)
         retr_prices = levels["retr"]
-        ext_prices = levels["ext"]
-        if side == "long":
-            sl_base = retr_prices.get(deeper, retr_prices.get(78.6, lvl_price))
-            sl = sl_base - micro
-            tp1 = levels["core"]["0"]  # B
-            tp2 = ext_prices.get(127.2, levels["core"]["0"])
-            tp3 = ext_prices.get(161.8, tp2)
-        else:  # short
-            sl_base = retr_prices.get(deeper, retr_prices.get(78.6, lvl_price))
-            sl = sl_base + micro
-            tp1 = levels["core"]["0"]
-            tp2 = ext_prices.get(127.2, levels["core"]["0"])
-            tp3 = ext_prices.get(161.8, tp2)
+        ext_prices  = levels["ext"]
+        B = levels["core"]["0"]
+
+        def pick_levels_above(x: float, candidates: List[Optional[float]]) -> List[float]:
+            return sorted([p for p in candidates if p is not None and p > x])
+
+        def pick_levels_below(x: float, candidates: List[Optional[float]]) -> List[float]:
+            return sorted([p for p in candidates if p is not None and p < x], reverse=True)
+
+        if kind == "retr":
+            deeper = _next_deeper_retr(pct_level)
+            if side == "long":
+                sl_base = retr_prices.get(deeper, retr_prices.get(78.6, lvl_price))
+                sl = (sl_base if sl_base is not None else lvl_price) - micro
+                tp1 = B
+                ext_chain = [ext_prices.get(x) for x in (127.2, 161.8, 261.8)]
+                ups = pick_levels_above(entry, [tp1] + ext_chain)
+                tp2 = ups[1] if len(ups) >= 2 else (ups[0] if ups else B)
+                tp3 = ups[2] if len(ups) >= 3 else tp2
+            else:  # short
+                sl_base = retr_prices.get(deeper, retr_prices.get(78.6, lvl_price))
+                sl = (sl_base if sl_base is not None else lvl_price) + micro
+                tp1 = B
+                ext_chain = [ext_prices.get(x) for x in (127.2, 161.8, 261.8)]
+                downs = pick_levels_below(entry, [tp1] + ext_chain)
+                tp2 = downs[1] if len(downs) >= 2 else (downs[0] if downs else B)
+                tp3 = downs[2] if len(downs) >= 3 else tp2
+
+        else:  # kind == "ext"
+            # ВАЖНО: стоп — от границы зоны, не от retr-уровней.
+            if side == "long":
+                sl = zl - micro  # стоп ниже зоны
+                tp1 = B
+                # цели вверх: RETR уровни (mean-reversion к A->B)
+                retr_chain = [retr_prices.get(x) for x in (23.6, 38.2, 50.0, 61.8, 78.6)]
+                ups = pick_levels_above(entry, [tp1] + retr_chain)
+                tp2 = ups[1] if len(ups) >= 2 else (ups[0] if ups else B)
+                tp3 = ups[2] if len(ups) >= 3 else tp2
+            else:  # short
+                sl = zh + micro  # стоп выше зоны
+                tp1 = B
+                retr_chain = [retr_prices.get(x) for x in (23.6, 38.2, 50.0, 61.8, 78.6)]
+                downs = pick_levels_below(entry, [tp1] + retr_chain)
+                tp2 = downs[1] if len(downs) >= 2 else (downs[0] if downs else B)
+                tp3 = downs[2] if len(downs) >= 3 else tp2
 
         return entry, sl, tp1, tp2, tp3
 
@@ -257,6 +288,14 @@ async def analyze_fibo(symbol: str, tf: str) -> List[FiboEvent]:
                 entry, sl, tp1, tp2, tp3 = plan_rejection(kind, pct_level, lvl_price, zl, zh, side)
             else:
                 entry, sl, tp1, tp2, tp3 = plan_breakout(kind, pct_level, lvl_price, zl, zh, side)
+
+            # --- САНИТИ-ПРОВЕРКИ перед RR ---
+            if side == "long":
+                assert sl < entry, "LONG: SL must be below entry (ext case: use zone low - micro)"
+                assert tp1 > entry and tp2 > entry and tp3 > entry, "LONG: TPs must be above entry"
+            else:
+                assert sl > entry, "SHORT: SL must be above entry (ext case: use zone high + micro)"
+                assert tp1 < entry and tp2 < entry and tp3 < entry, "SHORT: TPs must be below entry"
 
             rr1 = _rr(entry, sl, tp1, side)
             rr2 = _rr(entry, sl, tp2, side)
