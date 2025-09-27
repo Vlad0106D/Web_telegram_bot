@@ -366,3 +366,4 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
         "tags": list(dict.fromkeys(tags))[:8],  # уникализируем, сохраняем порядок
         "scenario": scenario,
     }
+    
