@@ -55,15 +55,10 @@ def _fmt_pct(x: Optional[float], nd: int = 3) -> str:
 
 
 def _fmt_oi(x: Optional[float]) -> str:
-    """
-    OI на OKX приходит числом-строкой; единицы зависят от инструмента.
-    Мы форматируем просто как “крупное число” без лишних обещаний.
-    """
     if x is None:
         return "—"
     try:
         v = float(x)
-        # формат с разделителем тысяч
         if abs(v) >= 1_000_000:
             return f"{v/1_000_000:.2f}M"
         if abs(v) >= 1_000:
@@ -74,11 +69,6 @@ def _fmt_oi(x: Optional[float]) -> str:
 
 
 def _funding_bias(fr: Optional[float]) -> str:
-    """
-    Интерпретация funding как “перекос толпы” (очень мягко, без сигналов):
-      + funding -> толпа чаще в лонгах
-      - funding -> толпа чаще в шортах
-    """
     if fr is None:
         return "—"
     try:
@@ -96,8 +86,28 @@ def _funding_bias(fr: Optional[float]) -> str:
         return "—"
 
 
+def _execution_hint(state: str, stage: str) -> str:
+    """
+    Очень мягкая подсказка по исполнению (НЕ сигнал).
+    Нужна, чтобы сопоставлять MM-контекст с твоей стратегией вручную.
+    """
+    if state == "ACTIVE_DOWN":
+        return "Execution: ждать sweep вниз → reclaim; лимитный набор — ближе к цели вниз, подтверждение — возврат над зоной."
+    if state == "ACTIVE_UP":
+        return "Execution: ждать sweep вверх → reclaim; шорт/контртрейд — только после возврата под зону, иначе не спешить."
+    if state == "DECISION":
+        return "Execution: зона решения — вход только после реакции/удержания; без подтверждения лучше WAIT."
+    if state == "WAIT":
+        return "Execution: явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона."
+    # на будущее
+    if state == "EFFECTIVE_UP":
+        return "Execution: движение вверх подтверждено — приоритет лонгов на откатах/ретестах, без догоняния."
+    if state == "EFFECTIVE_DOWN":
+        return "Execution: движение вниз подтверждено — приоритет шортов на откатах/ретестах, без догоняния."
+    return "Execution: —"
+
+
 def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
-    # report_type: H1 / H4 / DAILY_OPEN / DAILY_CLOSE / WEEKLY_OPEN / WEEKLY_CLOSE / MANUAL
     dt = s.now_dt.strftime("%Y-%m-%d %H:%M UTC")
 
     head = {
@@ -128,15 +138,18 @@ def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
         lines.append("")
         lines.append(f"Ключевая зона: {s.key_zone}")
 
-    # NEW: Деривативы (OKX SWAP) — просто контекст
     lines.append("")
     lines.append("Деривативы (OKX SWAP):")
     lines.append(
-        f"• BTC {s.btc.swap_inst_id or '—'} | OI: {_fmt_oi(s.btc.open_interest)} | Funding: {_fmt_pct(s.btc.funding_rate)} | { _funding_bias(s.btc.funding_rate) }"
+        f"• BTC {s.btc.swap_inst_id or '—'} | OI: {_fmt_oi(s.btc.open_interest)} | Funding: {_fmt_pct(s.btc.funding_rate)} | {_funding_bias(s.btc.funding_rate)}"
     )
     lines.append(
-        f"• ETH {s.eth.swap_inst_id or '—'} | OI: {_fmt_oi(s.eth.open_interest)} | Funding: {_fmt_pct(s.eth.funding_rate)} | { _funding_bias(s.eth.funding_rate) }"
+        f"• ETH {s.eth.swap_inst_id or '—'} | OI: {_fmt_oi(s.eth.open_interest)} | Funding: {_fmt_pct(s.eth.funding_rate)} | {_funding_bias(s.eth.funding_rate)}"
     )
+
+    # NEW: execution hint
+    lines.append("")
+    lines.append(_execution_hint(s.state, s.stage))
 
     lines.append("")
     lines.append("Что дальше:")
