@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
 from services.market_data import get_candles
 from services.indicators import true_range as true_range_series
+
+# NEW: деривативные метрики OKX (public, без ключей)
+from services.mm_mode.okx_derivatives import get_derivatives_snapshot
 
 
 @dataclass
@@ -21,6 +24,12 @@ class DriverView:
     swing_low: float
     targets_up: List[float]
     targets_down: List[float]
+
+    # NEW: деривативы (OKX SWAP)
+    swap_inst_id: Optional[str] = None
+    open_interest: Optional[float] = None
+    funding_rate: Optional[float] = None
+    next_funding_time_ms: Optional[int] = None
 
 
 @dataclass
@@ -118,6 +127,13 @@ async def _driver(symbol: str) -> DriverView:
     sh, sl = _pivot_swings(df4, w=3)
     up, dn = _targets(px, rh, rl, sh, sl)
 
+    # NEW: деривативы OKX (OI + funding) — безопасно, без ключей
+    snap = None
+    try:
+        snap = await get_derivatives_snapshot(symbol)
+    except Exception:
+        snap = None
+
     return DriverView(
         symbol=symbol,
         price=px,
@@ -128,6 +144,11 @@ async def _driver(symbol: str) -> DriverView:
         swing_low=sl,
         targets_up=up,
         targets_down=dn,
+
+        swap_inst_id=getattr(snap, "inst_id", None) if snap else None,
+        open_interest=getattr(snap, "open_interest", None) if snap else None,
+        funding_rate=getattr(snap, "funding_rate", None) if snap else None,
+        next_funding_time_ms=getattr(snap, "next_funding_time_ms", None) if snap else None,
     )
 
 
@@ -183,9 +204,6 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         # сжать уверенность
         p_down = int((p_down + 50) / 2)
         p_up = 100 - p_down
-
-    # EFFECTIVE (упрощённо): если вышли из DECISION и получили подтверждение направления
-    # (в MVP оставим как будущую донастройку)
 
     return MMSnapshot(
         now_dt=now_dt,
