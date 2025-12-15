@@ -78,3 +78,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+            BotCommand("mm", "MM mode: ручной отчёт"),
+        BotCommand("mm_on", "MM mode: включить авто-отчёты"),
+        BotCommand("mm_off", "MM mode: выключить"),
+        BotCommand("mm_status", "MM mode: статус"),
