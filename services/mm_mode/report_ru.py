@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from services.signal_text import fmt_price
 from services.mm_mode.core import MMSnapshot
@@ -45,6 +45,57 @@ def _targets_line(title: str, vals: List[float]) -> str:
     return f"{title}: " + " → ".join(fmt_price(v) for v in vals[:3])
 
 
+def _fmt_pct(x: Optional[float], nd: int = 3) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{float(x) * 100:.{nd}f}%"
+    except Exception:
+        return "—"
+
+
+def _fmt_oi(x: Optional[float]) -> str:
+    """
+    OI на OKX приходит числом-строкой; единицы зависят от инструмента.
+    Мы форматируем просто как “крупное число” без лишних обещаний.
+    """
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+        # формат с разделителем тысяч
+        if abs(v) >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        if abs(v) >= 1_000:
+            return f"{v/1_000:.2f}K"
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return "—"
+
+
+def _funding_bias(fr: Optional[float]) -> str:
+    """
+    Интерпретация funding как “перекос толпы” (очень мягко, без сигналов):
+      + funding -> толпа чаще в лонгах
+      - funding -> толпа чаще в шортах
+    """
+    if fr is None:
+        return "—"
+    try:
+        v = float(fr)
+        if v >= 0.0003:
+            return "лонги перегреты (риск выноса вниз)"
+        if v >= 0.0001:
+            return "перекос в лонг"
+        if v <= -0.0003:
+            return "шорты перегреты (риск выноса вверх)"
+        if v <= -0.0001:
+            return "перекос в шорт"
+        return "нейтрально"
+    except Exception:
+        return "—"
+
+
 def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
     # report_type: H1 / H4 / DAILY_OPEN / DAILY_CLOSE / WEEKLY_OPEN / WEEKLY_CLOSE / MANUAL
     dt = s.now_dt.strftime("%Y-%m-%d %H:%M UTC")
@@ -76,6 +127,16 @@ def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
     if s.key_zone:
         lines.append("")
         lines.append(f"Ключевая зона: {s.key_zone}")
+
+    # NEW: Деривативы (OKX SWAP) — просто контекст
+    lines.append("")
+    lines.append("Деривативы (OKX SWAP):")
+    lines.append(
+        f"• BTC {s.btc.swap_inst_id or '—'} | OI: {_fmt_oi(s.btc.open_interest)} | Funding: {_fmt_pct(s.btc.funding_rate)} | { _funding_bias(s.btc.funding_rate) }"
+    )
+    lines.append(
+        f"• ETH {s.eth.swap_inst_id or '—'} | OI: {_fmt_oi(s.eth.open_interest)} | Funding: {_fmt_pct(s.eth.funding_rate)} | { _funding_bias(s.eth.funding_rate) }"
+    )
 
     lines.append("")
     lines.append("Что дальше:")
