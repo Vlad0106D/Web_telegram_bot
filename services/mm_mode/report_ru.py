@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from services.signal_text import fmt_price
 from services.mm_mode.core import MMSnapshot
+
+
+# =========================
+# ΔOI cache (строго по отчётам)
+# Ключ: (report_type, symbol) -> last_oi
+# Перезапуск бота = новый контекст (это нормально для MM).
+# =========================
+_OI_LAST: Dict[Tuple[str, str], float] = {}
 
 
 def _state_ru(state: str) -> str:
@@ -55,6 +63,10 @@ def _fmt_pct(x: Optional[float], nd: int = 3) -> str:
 
 
 def _fmt_oi(x: Optional[float]) -> str:
+    """
+    OI на OKX приходит числом-строкой; единицы зависят от инструмента.
+    Мы форматируем “крупно”, без лишних обещаний.
+    """
     if x is None:
         return "—"
     try:
@@ -69,6 +81,9 @@ def _fmt_oi(x: Optional[float]) -> str:
 
 
 def _funding_bias(fr: Optional[float]) -> str:
+    """
+    Мягкая интерпретация funding как перекоса толпы.
+    """
     if fr is None:
         return "—"
     try:
@@ -86,10 +101,41 @@ def _funding_bias(fr: Optional[float]) -> str:
         return "—"
 
 
+def _oi_delta_str(report_type: str, symbol: str, current_oi: Optional[float]) -> str:
+    """
+    ΔOI строго по типу отчёта: H1 сравнивается только с прошлым H1, H4 с прошлым H4 и т.д.
+    Для MANUAL — только с прошлым MANUAL.
+    """
+    if current_oi is None:
+        return ""
+
+    key = (str(report_type), str(symbol).upper())
+    prev = _OI_LAST.get(key)
+
+    # обновляем кэш всегда, чтобы следующий отчёт имел базу
+    try:
+        _OI_LAST[key] = float(current_oi)
+    except Exception:
+        return ""
+
+    if prev is None:
+        return " (Δ —)"
+
+    try:
+        prev_f = float(prev)
+        cur_f = float(current_oi)
+        if prev_f <= 0:
+            return " (Δ —)"
+        pct = (cur_f - prev_f) / prev_f * 100.0
+        arrow = "↑" if pct > 0 else ("↓" if pct < 0 else "→")
+        return f" (Δ {arrow} {pct:+.2f}% с прошлого {report_type})"
+    except Exception:
+        return " (Δ —)"
+
+
 def _execution_hint(state: str, stage: str) -> str:
     """
     Очень мягкая подсказка по исполнению (НЕ сигнал).
-    Нужна, чтобы сопоставлять MM-контекст с твоей стратегией вручную.
     """
     if state == "ACTIVE_DOWN":
         return "Execution: ждать sweep вниз → reclaim; лимитный набор — ближе к цели вниз, подтверждение — возврат над зоной."
@@ -99,7 +145,6 @@ def _execution_hint(state: str, stage: str) -> str:
         return "Execution: зона решения — вход только после реакции/удержания; без подтверждения лучше WAIT."
     if state == "WAIT":
         return "Execution: явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона."
-    # на будущее
     if state == "EFFECTIVE_UP":
         return "Execution: движение вверх подтверждено — приоритет лонгов на откатах/ретестах, без догоняния."
     if state == "EFFECTIVE_DOWN":
@@ -108,6 +153,7 @@ def _execution_hint(state: str, stage: str) -> str:
 
 
 def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
+    # report_type: H1 / H4 / DAILY_OPEN / DAILY_CLOSE / WEEKLY_OPEN / WEEKLY_CLOSE / MANUAL
     dt = s.now_dt.strftime("%Y-%m-%d %H:%M UTC")
 
     head = {
@@ -138,16 +184,23 @@ def format_mm_report_ru(s: MMSnapshot, report_type: str = "H1") -> str:
         lines.append("")
         lines.append(f"Ключевая зона: {s.key_zone}")
 
+    # Деривативы (OKX SWAP): OI + ΔOI (строго по типу отчёта) + Funding
     lines.append("")
     lines.append("Деривативы (OKX SWAP):")
+
+    btc_oi_delta = _oi_delta_str(report_type, "BTCUSDT", s.btc.open_interest)
+    eth_oi_delta = _oi_delta_str(report_type, "ETHUSDT", s.eth.open_interest)
+
     lines.append(
-        f"• BTC {s.btc.swap_inst_id or '—'} | OI: {_fmt_oi(s.btc.open_interest)} | Funding: {_fmt_pct(s.btc.funding_rate)} | {_funding_bias(s.btc.funding_rate)}"
+        f"• BTC {s.btc.swap_inst_id or '—'} | OI: {_fmt_oi(s.btc.open_interest)}{btc_oi_delta} | "
+        f"Funding: {_fmt_pct(s.btc.funding_rate)} | {_funding_bias(s.btc.funding_rate)}"
     )
     lines.append(
-        f"• ETH {s.eth.swap_inst_id or '—'} | OI: {_fmt_oi(s.eth.open_interest)} | Funding: {_fmt_pct(s.eth.funding_rate)} | {_funding_bias(s.eth.funding_rate)}"
+        f"• ETH {s.eth.swap_inst_id or '—'} | OI: {_fmt_oi(s.eth.open_interest)}{eth_oi_delta} | "
+        f"Funding: {_fmt_pct(s.eth.funding_rate)} | {_funding_bias(s.eth.funding_rate)}"
     )
 
-    # NEW: execution hint
+    # Execution hint
     lines.append("")
     lines.append(_execution_hint(s.state, s.stage))
 
