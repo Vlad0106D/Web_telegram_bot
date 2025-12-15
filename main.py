@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 
 import logging
@@ -35,9 +34,19 @@ async def _post_init(app: Application) -> None:
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
         BotCommand("menu", "Показать меню-кнопки внутри чата"),
+
+        # --- MM mode ---
+        BotCommand("mm", "MM mode: ручной отчёт"),
+        BotCommand("mm_on", "MM mode: включить авто-отчёты"),
+        BotCommand("mm_off", "MM mode: выключить"),
+        BotCommand("mm_status", "MM mode: статус"),
     ]
+
     await app.bot.set_my_commands(commands)
-    log.info("Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands))
+    log.info(
+        "Bot commands set globally: %s",
+        ", ".join(f"/{c.command}" for c in commands),
+    )
 
 
 def main() -> None:
@@ -47,16 +56,16 @@ def main() -> None:
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(_post_init)
-        # В 21.x parse_mode задаётся через Defaults:
+        # В PTB 21.x parse_mode задаётся через Defaults
         .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
     )
 
-    # Базовые хендлеры
+    # Базовые хендлеры (включая MM mode)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
-    # Планирование вотчера
+    # Планирование вотчера (основного, не MM)
     if WATCHER_ENABLED:
         try:
             created = schedule_watcher_jobs(
@@ -67,18 +76,14 @@ def main() -> None:
             log.info(
                 "Watcher scheduled every %ss for TFs: %s",
                 WATCHER_INTERVAL_SEC,
-                ", ".join([c.replace('watch_', '') for c in created]) if created else "[]",
+                ", ".join([c.replace("watch_", "") for c in created]) if created else "[]",
             )
         except Exception:
             log.exception("Failed to schedule watcher jobs")
 
-    # Запускаем polling
+    # Запуск polling
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-            BotCommand("mm", "MM mode: ручной отчёт"),
-        BotCommand("mm_on", "MM mode: включить авто-отчёты"),
-        BotCommand("mm_off", "MM mode: выключить"),
-        BotCommand("mm_status", "MM mode: статус"),
