@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler
@@ -27,7 +26,7 @@ __all__ = [
 ]
 
 MM_JOB_NAME = "mm_tick"
-MM_INTERVAL_SEC_DEFAULT = 30  # частая проверка закрытий, без спама
+MM_INTERVAL_SEC_DEFAULT = 30  # частая проверка закрытий, без спама (спам режется sent_*)
 
 SYMS = ("BTCUSDT", "ETHUSDT")
 
@@ -54,20 +53,23 @@ def _ensure_mm_state(app: Application) -> Dict[str, Any]:
     # last seen candle open-times (ms) to detect closures
     mm.setdefault("last_h1_open", None)   # last seen H1 open time (ms)
     mm.setdefault("last_h4_open", None)
-    mm.setdefault("last_d1_open", None)
 
     # sent markers
     mm.setdefault("sent_h1_open", None)
     mm.setdefault("sent_h4_open", None)
-    mm.setdefault("sent_day_close_id", None)     # (Y,M,D) for recap
-    mm.setdefault("sent_day_open_id", None)      # (Y,M,D) for open pulse
-    mm.setdefault("sent_week_close_id", None)    # (iso_year, iso_week)
-    mm.setdefault("sent_week_open_id", None)
+    mm.setdefault("sent_day_close_id", None)     # (Y,M,D) for recap (yesterday id)
+    mm.setdefault("sent_day_open_id", None)      # (Y,M,D) for day open pulse (today id)
+    mm.setdefault("sent_week_close_id", None)    # (iso_year, iso_week) for prev week
+    mm.setdefault("sent_week_open_id", None)     # (iso_year, iso_week) for current week
 
     return mm
 
 
 async def _get_last_open_ms(symbol: str, tf: str) -> Optional[int]:
+    """
+    Берём последнюю свечу (по времени открытия).
+    get_candles() уже сортирует по time asc, поэтому iloc[-1] корректен.
+    """
     df, _ = await get_candles(symbol, tf=tf, limit=3)
     if df is None or df.empty:
         return None
@@ -85,54 +87,51 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_id:
         return
 
-    now = time.time()
+    # Один тик = проверяем, появился ли новый H1 бар (значит прошлый H1 закрылся)
+    try:
+        last_h1_open = await _get_last_open_ms("BTCUSDT", "1h")
+        if last_h1_open is None:
+            return
 
-    # 1) Detect H1 close events (via change in last open)
-    last_h1_open = await _get_last_open_ms("BTCUSDT", "1h")
-    if last_h1_open is None:
-        return
+        prev_h1_open = mm.get("last_h1_open")
+        if prev_h1_open is None:
+            mm["last_h1_open"] = last_h1_open
+            return
 
-    prev_h1_open = mm.get("last_h1_open")
-    if prev_h1_open is None:
+        if last_h1_open == prev_h1_open:
+            return  # всё ещё в том же H1
+
+        # Новый H1 бар появился -> фиксируем
         mm["last_h1_open"] = last_h1_open
-        return
+        dt_new = _utc_dt(last_h1_open)  # время открытия нового часа (значит прошлый час закрылся)
 
-    if last_h1_open != prev_h1_open:
-        # A new H1 candle appeared => previous hour closed at last_h1_open
-        mm["last_h1_open"] = last_h1_open
-
-        # Priority ladder in that hour:
-        # weekly close/open (on day/week boundaries) > daily close/open > H4 close > H1
-        # We'll evaluate “period boundary” based on the *new candle open time*.
-
-        dt_new = _utc_dt(last_h1_open)
-
-        # --- Day boundary: if hour == 0, previous day closed.
+        # ---------------------------------------------
+        # 1) DAILY CLOSE / WEEKLY CLOSE (граница дня)
+        # ---------------------------------------------
+        # Если новый час = 00:00 UTC => закрылись сутки (вчера)
         if dt_new.hour == 0:
-            prev_day = _iso_day(dt_new.replace(hour=0, minute=0, second=0, microsecond=0) )
-            # prev_day is "new day" id; recap should be for yesterday:
-            yday_dt = dt_new.replace(hour=0, minute=0, second=0, microsecond=0)  # start of new day
-            yday = _iso_day((yday_dt.timestamp() - 1) * 1000)  # not used directly
-            # safer:
-            yday_real = _iso_day(_utc_dt(last_h1_open - 1))
+            yday_dt = _utc_dt(last_h1_open - 1)          # любая точка "вчера"
+            yday_id = _iso_day(yday_dt)
 
-            if mm.get("sent_day_close_id") != yday_real:
+            if mm.get("sent_day_close_id") != yday_id:
                 snap = await build_mm_snapshot(now_dt=dt_new, mode="daily_close")
                 text = format_mm_report_ru(snap, report_type="DAILY_CLOSE")
                 await context.bot.send_message(chat_id=chat_id, text=text)
-                mm["sent_day_close_id"] = yday_real
+                mm["sent_day_close_id"] = yday_id
 
-            # --- Week boundary: Monday 00:00 UTC (ISO week start) — weekly close
+            # Если это понедельник 00:00 UTC => закрылась неделя (предыдущая ISO-неделя)
             if dt_new.weekday() == 0:
-                prev_week = _iso_week(_utc_dt(last_h1_open - 1))
-                if mm.get("sent_week_close_id") != prev_week:
+                prev_week_id = _iso_week(_utc_dt(last_h1_open - 1))
+                if mm.get("sent_week_close_id") != prev_week_id:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="weekly_close")
                     text = format_mm_report_ru(snap, report_type="WEEKLY_CLOSE")
                     await context.bot.send_message(chat_id=chat_id, text=text)
-                    mm["sent_week_close_id"] = prev_week
+                    mm["sent_week_close_id"] = prev_week_id
 
-        # --- Daily open pulse: after the first hour of the day is CLOSED,
-        # i.e. when we see 01:00 open.
+        # ---------------------------------------------
+        # 2) DAILY OPEN / WEEKLY OPEN (после закрытия 1-го часа)
+        # ---------------------------------------------
+        # "Открытие дня": когда мы видим бар 01:00, значит час 00:00–01:00 закрылся.
         if dt_new.hour == 1:
             day_id = _iso_day(dt_new)
             if mm.get("sent_day_open_id") != day_id:
@@ -141,7 +140,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=text)
                 mm["sent_day_open_id"] = day_id
 
-            # Weekly open pulse: after first hour of the week is closed
+            # "Открытие недели": понедельник, после закрытия 1-го часа недели
             if dt_new.weekday() == 0:
                 week_id = _iso_week(dt_new)
                 if mm.get("sent_week_open_id") != week_id:
@@ -150,28 +149,36 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_week_open_id"] = week_id
 
-        # 2) Detect H4 close (based on BTC H4 open change)
+        # ---------------------------------------------
+        # 3) H4 UPDATE (приоритетнее H1)
+        # ---------------------------------------------
         last_h4_open = await _get_last_open_ms("BTCUSDT", "4h")
         prev_h4_open = mm.get("last_h4_open")
+
         if last_h4_open is not None:
             if prev_h4_open is None:
                 mm["last_h4_open"] = last_h4_open
             elif last_h4_open != prev_h4_open:
                 mm["last_h4_open"] = last_h4_open
-                # send H4 update once per new H4 candle
                 if mm.get("sent_h4_open") != last_h4_open:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="h4_close")
                     text = format_mm_report_ru(snap, report_type="H4")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_h4_open"] = last_h4_open
-                return  # H4 has priority over H1 in this hour
+                return  # H4 приоритетнее H1
 
-        # 3) H1 brief (if not already sent for this hour open)
+        # ---------------------------------------------
+        # 4) H1 REPORT (если H4 не сработал в этот час)
+        # ---------------------------------------------
         if mm.get("sent_h1_open") != last_h1_open:
             snap = await build_mm_snapshot(now_dt=dt_new, mode="h1_close")
             text = format_mm_report_ru(snap, report_type="H1")
             await context.bot.send_message(chat_id=chat_id, text=text)
             mm["sent_h1_open"] = last_h1_open
+
+    except Exception:
+        # чтобы джоба не умирала
+        log.exception("MM tick failed")
 
 
 def schedule_mm_jobs(app: Application, interval_sec: int, chat_id: Optional[int] = None) -> str:
@@ -264,7 +271,7 @@ async def cmd_mm_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_mm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ручной снимок (H1+H4 в одном сообщении)
+    # ручной снимок
     now_dt = datetime.now(timezone.utc)
     snap = await build_mm_snapshot(now_dt=now_dt, mode="manual")
     text = format_mm_report_ru(snap, report_type="MANUAL")
