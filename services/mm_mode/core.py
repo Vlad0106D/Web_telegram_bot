@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import pandas as pd
 
@@ -11,6 +11,75 @@ from services.indicators import true_range as true_range_series
 
 # NEW: деривативные метрики OKX (public, без ключей)
 from services.mm_mode.okx_derivatives import get_derivatives_snapshot
+
+
+# ======================================================================
+# MM state cache (in-memory)
+# Чтобы “снятый лой/хай” не показывался снова в следующих отчётах.
+# Перезапуск бота = обнуление (нормально для MVP).
+#
+# Ключ: symbol ("BTCUSDT"/"ETHUSDT")
+# Значения:
+#   - last_swept_down: float | None
+#   - last_swept_up: float | None
+#   - sig: режимный “подпись диапазона”, чтобы сбрасывать sweep при смене режима
+# ======================================================================
+_MM_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _mm_get(symbol: str) -> Dict[str, Any]:
+    s = symbol.upper()
+    if s not in _MM_CACHE:
+        _MM_CACHE[s] = {
+            "last_swept_down": None,
+            "last_swept_up": None,
+            "sig": None,
+        }
+    return _MM_CACHE[s]
+
+
+def _sig(rh: float, rl: float, sh: float, sl: float) -> Tuple[float, float, float, float]:
+    # округляем, чтобы из-за микро-шума не сбрасывало кэш
+    return (round(rh, 2), round(rl, 2), round(sh, 2), round(sl, 2))
+
+
+def _floor_tf_open_ms(dt: datetime, tf: str) -> int:
+    """
+    Возвращает open-time (ms) текущей свечи для данного tf, округляя вниз.
+    tf: "1h" или "4h" (в MM используется именно так).
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+
+    if tf == "1h":
+        floored = dt.replace(minute=0, second=0, microsecond=0)
+    elif tf == "4h":
+        h = (dt.hour // 4) * 4
+        floored = dt.replace(hour=h, minute=0, second=0, microsecond=0)
+    else:
+        floored = dt.replace(minute=0, second=0, microsecond=0)
+
+    return int(floored.timestamp() * 1000)
+
+
+def _last_closed_bar(df: pd.DataFrame, now_dt: datetime, tf: str) -> pd.Series:
+    """
+    Возвращает “последнюю закрытую” свечу.
+    Важно: API часто отдаёт текущую (ещё не закрытую) свечу как последнюю строку.
+    Мы проверяем совпадение open-time с текущим tf-open => тогда закрытая = предпоследняя.
+    """
+    if df is None or df.empty:
+        raise ValueError("empty df")
+
+    cur_open_ms = _floor_tf_open_ms(now_dt, tf=tf)
+    last_open_ms = int(df["time"].iloc[-1])
+
+    # если последняя строка — это текущая формирующаяся свеча
+    if abs(last_open_ms - cur_open_ms) <= 60_000:  # допуск 1 мин
+        if len(df) >= 2:
+            return df.iloc[-2]
+    return df.iloc[-1]
 
 
 @dataclass
@@ -68,7 +137,6 @@ def _pivot_swings(df: pd.DataFrame, w: int = 3) -> Tuple[float, float]:
     x = df.tail(60)
     highs = x["high"].rolling(w * 2 + 1, center=True).max()
     lows = x["low"].rolling(w * 2 + 1, center=True).min()
-    # берем последние “значимые” значения
     sh = float(highs.dropna().iloc[-1]) if not highs.dropna().empty else float(x["high"].max())
     sl = float(lows.dropna().iloc[-1]) if not lows.dropna().empty else float(x["low"].min())
     return sh, sl
@@ -91,14 +159,13 @@ def _targets(px: float, range_high: float, range_low: float, swing_high: float, 
 
 
 def _bias_from_liquidity(px: float, up: List[float], dn: List[float]) -> Tuple[str, int, int]:
-    # простая логика “куда ближе и жирнее”
     def dist(v: float) -> float:
         return abs(v - px) / max(px, 1e-9)
 
     du = min([dist(v) for v in up], default=1.0)
     dd = min([dist(v) for v in dn], default=1.0)
 
-    if abs(du - dd) < 0.002:  # близко
+    if abs(du - dd) < 0.002:
         return "WAIT", 52, 48
 
     if dd < du:
@@ -117,7 +184,104 @@ def _eth_relation(btc_state: str, eth_state: str) -> str:
     return "diverges"
 
 
-async def _driver(symbol: str) -> DriverView:
+def _apply_sweep_memory(
+    symbol: str,
+    rh: float,
+    rl: float,
+    sh: float,
+    sl: float,
+    targets_up: List[float],
+    targets_down: List[float],
+) -> Tuple[List[float], List[float]]:
+    """
+    Убираем из списков цели, которые уже были “sweep”.
+    Сбрасываем sweep-память, если изменилась подпись диапазона.
+    """
+    mem = _mm_get(symbol)
+    sig_now = _sig(rh, rl, sh, sl)
+
+    if mem.get("sig") != sig_now:
+        mem["sig"] = sig_now
+        mem["last_swept_down"] = None
+        mem["last_swept_up"] = None
+
+    sd = mem.get("last_swept_down")
+    su = mem.get("last_swept_up")
+
+    if sd is not None:
+        targets_down = [x for x in targets_down if abs(float(x) - float(sd)) > 1e-9]
+    if su is not None:
+        targets_up = [x for x in targets_up if abs(float(x) - float(su)) > 1e-9]
+
+    return targets_up, targets_down
+
+
+def _detect_and_store_sweep(
+    symbol: str,
+    state: str,
+    now_dt: datetime,
+    df_h1: pd.DataFrame,
+    atr_h1: float,
+    targets_up: List[float],
+    targets_down: List[float],
+) -> Tuple[str, Optional[float], Optional[float]]:
+    """
+    Определяем факт sweep по последней закрытой H1-свече:
+      - ACTIVE_DOWN: если low <= ближайшей down-цели (с небольшим допуском)
+      - ACTIVE_UP:   если high >= ближайшей up-цели
+    Возвращает:
+      stage_override, swept_down_level, swept_up_level
+    """
+    try:
+        bar = _last_closed_bar(df_h1, now_dt, tf="1h")
+        lo = float(bar["low"])
+        hi = float(bar["high"])
+        cl = float(bar["close"])
+    except Exception:
+        return "NONE", None, None
+
+    mem = _mm_get(symbol)
+
+    # допуск: либо часть ATR, либо фикс % от цены
+    px = cl
+    tol = max(0.10 * float(atr_h1 or 0.0), float(px) * 0.0008)  # ~0.08% или 0.1*ATR
+
+    swept_down = None
+    swept_up = None
+
+    # sweep вниз
+    if state == "ACTIVE_DOWN" and targets_down:
+        lvl = float(targets_down[0])  # ближайшая вниз (по твоей сортировке)
+        if lo <= (lvl + tol):
+            swept_down = lvl
+            mem["last_swept_down"] = lvl
+
+    # sweep вверх
+    if state == "ACTIVE_UP" and targets_up:
+        lvl = float(targets_up[0])
+        if hi >= (lvl - tol):
+            swept_up = lvl
+            mem["last_swept_up"] = lvl
+
+    # stage override
+    if swept_down is not None or swept_up is not None:
+        return "SWEEP_DONE", swept_down, swept_up
+
+    # reclaim done (упрощённо): если уже есть sweep в памяти и закрылись обратно “за” уровень
+    # DOWN sweep: reclaim = close > swept_level + tol
+    sd = mem.get("last_swept_down")
+    if sd is not None and cl > float(sd) + tol:
+        return "RECLAIM_DONE", None, None
+
+    # UP sweep: reclaim = close < swept_level - tol
+    su = mem.get("last_swept_up")
+    if su is not None and cl < float(su) - tol:
+        return "RECLAIM_DONE", None, None
+
+    return "NONE", None, None
+
+
+async def _driver(symbol: str, now_dt: datetime) -> DriverView:
     df1, _ = await get_candles(symbol, "1h", limit=300)
     df4, _ = await get_candles(symbol, "4h", limit=200)
 
@@ -125,9 +289,11 @@ async def _driver(symbol: str) -> DriverView:
     atr = _atr_h1(df1)
     rh, rl = _range_hi_lo(df4, lookback=40)
     sh, sl = _pivot_swings(df4, w=3)
-    up, dn = _targets(px, rh, rl, sh, sl)
 
-    # NEW: деривативы OKX (OI + funding) — безопасно, без ключей
+    up, dn = _targets(px, rh, rl, sh, sl)
+    up, dn = _apply_sweep_memory(symbol, rh, rl, sh, sl, up, dn)
+
+    # NEW: деривативы OKX (OI + funding)
     snap = None
     try:
         snap = await get_derivatives_snapshot(symbol)
@@ -144,7 +310,6 @@ async def _driver(symbol: str) -> DriverView:
         swing_low=sl,
         targets_up=up,
         targets_down=dn,
-
         swap_inst_id=getattr(snap, "inst_id", None) if snap else None,
         open_interest=getattr(snap, "open_interest", None) if snap else None,
         funding_rate=getattr(snap, "funding_rate", None) if snap else None,
@@ -156,27 +321,28 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=timezone.utc)
 
-    btc = await _driver("BTCUSDT")
-    eth = await _driver("ETHUSDT")
+    # drivers (уже с фильтром sweep-памяти)
+    btc = await _driver("BTCUSDT", now_dt=now_dt)
+    eth = await _driver("ETHUSDT", now_dt=now_dt)
 
     btc_state, p_down, p_up = _bias_from_liquidity(btc.price, btc.targets_up, btc.targets_down)
     eth_state, _, _ = _bias_from_liquidity(eth.price, eth.targets_up, eth.targets_down)
 
     relation = _eth_relation(btc_state, eth_state)
 
-    # Простая DECISION-зона: если BTC близко к диапазонному low/high на H4
+    # базовые поля
     key_zone = None
     stage = "NONE"
     next_steps: List[str] = []
     invalidation = "Закрытие H4 против сценария"
 
-    # “decision” если близко к range_low/high (как proxy HTF зоны)
+    # Decision zone (как было)
     near_low = abs(btc.price - btc.range_low) <= max(0.35 * btc.h1_atr, btc.price * 0.003)
     near_high = abs(btc.price - btc.range_high) <= max(0.35 * btc.h1_atr, btc.price * 0.003)
+
     if near_low or near_high:
         key_zone = f"H4 RANGE {'LOW' if near_low else 'HIGH'}"
         state = "DECISION"
-        # этап: ждём реакции
         stage = "WAIT_RECLAIM"
         next_steps = [
             "Ждём подтверждение реакции (возврат/удержание)",
@@ -186,6 +352,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     else:
         state = btc_state
         stage = "WAIT_SWEEP" if "ACTIVE" in state else "NONE"
+
         if state == "ACTIVE_DOWN":
             next_steps = ["Ожидается снятие ближайших лоев", "После снятия — ждём возврат (reclaim)"]
             invalidation = "H4 закрытие выше ближайшей цели сверху"
@@ -196,12 +363,49 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             next_steps = ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"]
             invalidation = "—"
 
-    # корректировка confidence через ETH
+    # ----------------------------
+    # NEW: sweep detection (H1 low/high)
+    # ----------------------------
+    try:
+        df1_btc, _ = await get_candles("BTCUSDT", "1h", limit=120)
+        stage_over, swept_dn, swept_up = _detect_and_store_sweep(
+            symbol="BTCUSDT",
+            state=state,
+            now_dt=now_dt,
+            df_h1=df1_btc,
+            atr_h1=btc.h1_atr,
+            targets_up=btc.targets_up,
+            targets_down=btc.targets_down,
+        )
+
+        if stage_over == "SWEEP_DONE":
+            stage = "SWEEP_DONE"
+            # пересоберём цели с учётом sweep памяти (чтобы снятая не показывалась)
+            btc.targets_up, btc.targets_down = _apply_sweep_memory(
+                "BTCUSDT", btc.range_high, btc.range_low, btc.swing_high, btc.swing_low, btc.targets_up, btc.targets_down
+            )
+            # обновим подсказки
+            if state == "ACTIVE_DOWN":
+                next_steps = ["Ликвидность по лоям снята", "Теперь ждём возврат (reclaim) над уровнем"]
+            elif state == "ACTIVE_UP":
+                next_steps = ["Ликвидность по хаям снята", "Теперь ждём возврат (reclaim) под уровнем"]
+
+        elif stage_over == "RECLAIM_DONE":
+            stage = "RECLAIM_DONE"
+            if state == "ACTIVE_DOWN":
+                next_steps = ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления лоя"]
+            elif state == "ACTIVE_UP":
+                next_steps = ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления хая"]
+
+    except Exception:
+        # не ломаем отчёты, если API шалит
+        pass
+
+    # корректировка confidence через ETH (как было)
     if relation == "confirms":
         p_down = min(90, p_down + 5)
         p_up = 100 - p_down
     elif relation == "diverges":
-        # сжать уверенность
         p_down = int((p_down + 50) / 2)
         p_up = 100 - p_down
 
