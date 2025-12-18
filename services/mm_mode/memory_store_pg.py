@@ -6,38 +6,45 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import asyncpg
+from psycopg_pool import AsyncConnectionPool
 
 log = logging.getLogger(__name__)
 
-_DB_POOL: Optional[asyncpg.Pool] = None
+_POOL: Optional[AsyncConnectionPool] = None
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def _get_pool() -> asyncpg.Pool:
+def _get_dsn() -> str:
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL is not set")
+    return dsn
+
+
+async def _get_pool() -> AsyncConnectionPool:
     """
     Ленивая инициализация пула подключений к Postgres (Neon).
     Используем DATABASE_URL из env.
     """
-    global _DB_POOL
+    global _POOL
+    if _POOL is not None:
+        return _POOL
 
-    if _DB_POOL is not None:
-        return _DB_POOL
+    dsn = _get_dsn()
 
-    dsn = os.getenv("DATABASE_URL")
-    if not dsn:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    _DB_POOL = await asyncpg.create_pool(
-        dsn=dsn,
+    # Важно: открывать pool лениво, чтобы импорт файла не делал I/O.
+    _POOL = AsyncConnectionPool(
+        conninfo=dsn,
         min_size=1,
         max_size=3,
-        command_timeout=10,
+        timeout=10,
+        open=False,
     )
-    return _DB_POOL
+    await _POOL.open()
+    return _POOL
 
 
 async def append_snapshot(
@@ -56,19 +63,16 @@ async def append_snapshot(
     try:
         pool = await _get_pool()
         ts_utc = ts_utc or _now_utc()
-
         payload_json = json.dumps(snap, ensure_ascii=False)
 
-        async with pool.acquire() as con:
-            await con.execute(
-                """
-                INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
-                VALUES ($1, $2, $3, $4::jsonb)
-                """,
-                ts_utc,
-                source_mode,
-                symbols,
-                payload_json,
-            )
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    """,
+                    (ts_utc, source_mode, symbols, payload_json),
+                )
     except Exception:
         log.exception("MM memory: append_snapshot failed")
