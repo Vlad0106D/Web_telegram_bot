@@ -65,6 +65,32 @@ def _ensure_mm_state(app: Application) -> Dict[str, Any]:
     return mm
 
 
+async def _try_save_snapshot(
+    *,
+    snap: Dict[str, Any],
+    source_mode: str,
+    ts_utc: datetime,
+    symbols: str = "BTCUSDT,ETHUSDT",
+) -> None:
+    """
+    Безопасная запись snapshot в внешнюю память.
+    Если модуль памяти/БД ещё не подключены — ничего не ломаем.
+    """
+    try:
+        # локальный импорт, чтобы файл работал даже если memory_store_pg ещё не создан
+        from services.mm_mode.memory_store_pg import append_snapshot  # type: ignore
+
+        await append_snapshot(
+            snap=snap,
+            source_mode=source_mode,
+            symbols=symbols,
+            ts_utc=ts_utc,
+        )
+    except Exception:
+        # Память не должна ломать MM MODE
+        log.exception("MM memory: failed to save snapshot (%s)", source_mode)
+
+
 async def _get_last_open_ms(symbol: str, tf: str) -> Optional[int]:
     """
     Берём последнюю свечу (по времени открытия).
@@ -274,6 +300,10 @@ async def cmd_mm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ручной снимок
     now_dt = datetime.now(timezone.utc)
     snap = await build_mm_snapshot(now_dt=now_dt, mode="manual")
+
+    # Пишем в память (безопасно). На этом этапе пишем только MANUAL.
+    await _try_save_snapshot(snap=snap, source_mode="manual", ts_utc=now_dt)
+
     text = format_mm_report_ru(snap, report_type="MANUAL")
     await update.effective_message.reply_text(text)
 
