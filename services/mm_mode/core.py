@@ -12,6 +12,9 @@ from services.indicators import true_range as true_range_series
 # NEW: деривативные метрики OKX (public, без ключей)
 from services.mm_mode.okx_derivatives import get_derivatives_snapshot
 
+# NEW: запись событий (sweep/reclaim) в Postgres
+from services.mm_mode.memory_events_pg import append_event
+
 
 # ======================================================================
 # MM state cache (in-memory)
@@ -251,7 +254,7 @@ def _detect_and_store_sweep(
 
     # sweep вниз
     if state == "ACTIVE_DOWN" and targets_down:
-        lvl = float(targets_down[0])  # ближайшая вниз (по твоей сортировке)
+        lvl = float(targets_down[0])  # ближайшая вниз
         if lo <= (lvl + tol):
             swept_down = lvl
             mem["last_swept_down"] = lvl
@@ -267,13 +270,11 @@ def _detect_and_store_sweep(
     if swept_down is not None or swept_up is not None:
         return "SWEEP_DONE", swept_down, swept_up
 
-    # reclaim done (упрощённо): если уже есть sweep в памяти и закрылись обратно “за” уровень
-    # DOWN sweep: reclaim = close > swept_level + tol
+    # reclaim done (упрощённо)
     sd = mem.get("last_swept_down")
     if sd is not None and cl > float(sd) + tol:
         return "RECLAIM_DONE", None, None
 
-    # UP sweep: reclaim = close < swept_level - tol
     su = mem.get("last_swept_up")
     if su is not None and cl < float(su) - tol:
         return "RECLAIM_DONE", None, None
@@ -336,7 +337,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     next_steps: List[str] = []
     invalidation = "Закрытие H4 против сценария"
 
-    # Decision zone (как было)
+    # Decision zone
     near_low = abs(btc.price - btc.range_low) <= max(0.35 * btc.h1_atr, btc.price * 0.003)
     near_high = abs(btc.price - btc.range_high) <= max(0.35 * btc.h1_atr, btc.price * 0.003)
 
@@ -364,7 +365,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             invalidation = "—"
 
     # ----------------------------
-    # NEW: sweep detection (H1 low/high)
+    # sweep detection (H1 low/high) + запись события в mm_events
     # ----------------------------
     try:
         df1_btc, _ = await get_candles("BTCUSDT", "1h", limit=120)
@@ -380,10 +381,34 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
         if stage_over == "SWEEP_DONE":
             stage = "SWEEP_DONE"
-            # пересоберём цели с учётом sweep памяти (чтобы снятая не показывалась)
+
+            # LOG -> DB EVENT (SWEEP)
+            if swept_dn is not None:
+                await append_event(
+                    event_type="SWEEP",
+                    symbol="BTCUSDT",
+                    tf="1h",
+                    direction="down",
+                    level=float(swept_dn),
+                    source_mode=mode,
+                    details={"state": state, "stage": stage},
+                )
+            if swept_up is not None:
+                await append_event(
+                    event_type="SWEEP",
+                    symbol="BTCUSDT",
+                    tf="1h",
+                    direction="up",
+                    level=float(swept_up),
+                    source_mode=mode,
+                    details={"state": state, "stage": stage},
+                )
+
+            # пересоберём цели с учётом sweep памяти
             btc.targets_up, btc.targets_down = _apply_sweep_memory(
                 "BTCUSDT", btc.range_high, btc.range_low, btc.swing_high, btc.swing_low, btc.targets_up, btc.targets_down
             )
+
             # обновим подсказки
             if state == "ACTIVE_DOWN":
                 next_steps = ["Ликвидность по лоям снята", "Теперь ждём возврат (reclaim) над уровнем"]
@@ -392,6 +417,18 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
         elif stage_over == "RECLAIM_DONE":
             stage = "RECLAIM_DONE"
+
+            # LOG -> DB EVENT (RECLAIM)
+            await append_event(
+                event_type="RECLAIM",
+                symbol="BTCUSDT",
+                tf="1h",
+                direction=("down" if state == "ACTIVE_DOWN" else "up" if state == "ACTIVE_UP" else None),
+                level=None,
+                source_mode=mode,
+                details={"state": state, "stage": stage},
+            )
+
             if state == "ACTIVE_DOWN":
                 next_steps = ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления лоя"]
             elif state == "ACTIVE_UP":
@@ -401,7 +438,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         # не ломаем отчёты, если API шалит
         pass
 
-    # корректировка confidence через ETH (как было)
+    # корректировка confidence через ETH
     if relation == "confirms":
         p_down = min(90, p_down + 5)
         p_up = 100 - p_down
