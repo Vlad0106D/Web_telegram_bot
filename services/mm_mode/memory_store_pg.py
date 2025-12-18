@@ -78,6 +78,33 @@ def _to_jsonable(obj: Any) -> Any:
     return str(obj)
 
 
+def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
+    """getattr/ dict.get в одном месте."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _as_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _as_text(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        return str(v)
+    except Exception:
+        return None
+
+
 async def _get_pool() -> AsyncConnectionPool:
     """
     Ленивая инициализация пула подключений к Postgres (Neon).
@@ -100,21 +127,128 @@ async def _get_pool() -> AsyncConnectionPool:
     return _POOL
 
 
+async def _insert_features(
+    conn: Any,
+    *,
+    snapshot_id: int,
+    snap: Any,
+    source_mode: str,
+    symbols: str,
+    ts_utc: datetime,
+) -> None:
+    """
+    Пишем “фичи” в mm_features.
+    Если таблицы нет/схема не совпала — просто логируем и не ломаем бота.
+    """
+    try:
+        btc = _safe_get(snap, "btc")
+        eth = _safe_get(snap, "eth")
+
+        pressure = _as_text(_safe_get(snap, "state"))
+        phase = _as_text(_safe_get(snap, "stage"))
+        prob_up = _as_float(_safe_get(snap, "p_up"))
+        prob_down = _as_float(_safe_get(snap, "p_down"))
+
+        price_btc = _as_float(_safe_get(btc, "price"))
+        range_low = _as_float(_safe_get(btc, "range_low"))
+        range_high = _as_float(_safe_get(btc, "range_high"))
+        swing_low = _as_float(_safe_get(btc, "swing_low"))
+        swing_high = _as_float(_safe_get(btc, "swing_high"))
+
+        targets_up = _safe_get(btc, "targets_up", [])
+        targets_down = _safe_get(btc, "targets_down", [])
+
+        oi_btc = _as_float(_safe_get(btc, "open_interest"))
+        funding_btc = _as_float(_safe_get(btc, "funding_rate"))
+        oi_eth = _as_float(_safe_get(eth, "open_interest"))
+        funding_eth = _as_float(_safe_get(eth, "funding_rate"))
+
+        eth_confirm = _as_text(_safe_get(snap, "eth_relation"))
+
+        await conn.execute(
+            """
+            INSERT INTO mm_features (
+                snapshot_id,
+                ts_utc,
+                source_mode,
+                symbols,
+
+                pressure,
+                phase,
+                prob_up,
+                prob_down,
+
+                price_btc,
+                range_low,
+                range_high,
+                swing_low,
+                swing_high,
+
+                targets_up,
+                targets_down,
+
+                oi_btc,
+                funding_btc,
+                oi_eth,
+                funding_eth,
+
+                eth_confirm
+            )
+            VALUES (
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb,
+                %s, %s, %s, %s,
+                %s
+            )
+            """,
+            (
+                snapshot_id,
+                ts_utc,
+                source_mode,
+                symbols,
+                pressure,
+                phase,
+                prob_up,
+                prob_down,
+                price_btc,
+                range_low,
+                range_high,
+                swing_low,
+                swing_high,
+                json.dumps(_to_jsonable(targets_up), ensure_ascii=False),
+                json.dumps(_to_jsonable(targets_down), ensure_ascii=False),
+                oi_btc,
+                funding_btc,
+                oi_eth,
+                funding_eth,
+                eth_confirm,
+            ),
+        )
+    except Exception:
+        log.exception("MM memory: insert into mm_features failed")
+
+
 async def append_snapshot(
     *,
-    snap: Any,  # важно: может быть dict или объект (MMSnapshot)
+    snap: Any,  # может быть dict или объект (MMSnapshot)
     source_mode: str,
     symbols: str = "BTCUSDT,ETHUSDT",
     ts_utc: Optional[datetime] = None,
 ) -> None:
     """
-    Append-only запись снапшота в таблицу mm_snapshots.
-
-    Важно: этот метод НЕ должен ломать работу бота.
-    Поэтому исключения ловим внутри и только логируем.
+    Пишем снапшот в mm_snapshots + параллельно фичи в mm_features.
+    Всё append-only. Ошибки не должны ломать бота.
     """
     try:
         pool = await _get_pool()
+
+        # Если у снапшота есть now_dt — используем его как ts_utc (логичнее для обучения)
+        snap_now = _safe_get(snap, "now_dt")
+        if ts_utc is None and isinstance(snap_now, datetime):
+            ts_utc = snap_now
+
         ts_utc = ts_utc or _now_utc()
 
         payload_obj = _to_jsonable(snap)
@@ -122,12 +256,26 @@ async def append_snapshot(
 
         async with pool.connection() as conn:
             async with conn.transaction():
-                await conn.execute(
+                cur = await conn.execute(
                     """
                     INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
                     VALUES (%s, %s, %s, %s::jsonb)
+                    RETURNING id
                     """,
                     (ts_utc, source_mode, symbols, payload_json),
                 )
+                row = await cur.fetchone()
+                snapshot_id = int(row[0]) if row and row[0] is not None else None
+
+                # features — только если получили id
+                if snapshot_id is not None:
+                    await _insert_features(
+                        conn,
+                        snapshot_id=snapshot_id,
+                        snap=snap,
+                        source_mode=source_mode,
+                        symbols=symbols,
+                        ts_utc=ts_utc,
+                    )
     except Exception:
         log.exception("MM memory: append_snapshot failed")
