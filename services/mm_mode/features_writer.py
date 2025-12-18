@@ -9,6 +9,42 @@ from services.mm_mode.memory_store_pg import _get_pool
 log = logging.getLogger(__name__)
 
 
+def _pressure_from_state(state: str) -> str:
+    s = (state or "").upper()
+    if "ACTIVE_UP" in s:
+        return "up"
+    if "ACTIVE_DOWN" in s:
+        return "down"
+    return "neutral"
+
+
+def _eth_confirm_from_relation(rel: str) -> str:
+    r = (rel or "").lower()
+    if r == "confirms":
+        return "confirm"
+    if r == "diverges":
+        return "diverge"
+    return "neutral"
+
+
+def _prob01_from_pct(pct: Any) -> float | None:
+    try:
+        if pct is None:
+            return None
+        v = float(pct)
+        # если пришло 0..100 -> конвертим в 0..1
+        if v > 1.0:
+            v = v / 100.0
+        # чуть-чуть нормализуем
+        if v < 0:
+            v = 0.0
+        if v > 1:
+            v = 1.0
+        return v
+    except Exception:
+        return None
+
+
 async def append_features(
     *,
     snapshot_id: int,
@@ -22,6 +58,15 @@ async def append_features(
     """
     try:
         pool = await _get_pool()
+
+        pressure = _pressure_from_state(getattr(snap, "state", None))
+        phase = getattr(snap, "stage", None)
+
+        # ВАЖНО: в core p_up/p_down — это проценты int.
+        prob_up = _prob01_from_pct(getattr(snap, "p_up", None))
+        prob_down = _prob01_from_pct(getattr(snap, "p_down", None))
+
+        eth_confirm = _eth_confirm_from_relation(getattr(snap, "eth_relation", None))
 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -69,10 +114,10 @@ async def append_features(
                         source_mode,
                         symbols,
 
-                        snap.state,
-                        snap.stage,
-                        snap.p_up,
-                        snap.p_down,
+                        pressure,
+                        phase,
+                        prob_up,
+                        prob_down,
 
                         snap.btc.price,
                         snap.btc.range_low,
@@ -88,7 +133,7 @@ async def append_features(
                         snap.eth.open_interest,
                         snap.eth.funding_rate,
 
-                        snap.eth_relation,
+                        eth_confirm,
                     ),
                 )
     except Exception:
