@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from typing import Any, Optional
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -24,6 +26,50 @@ def _get_dsn() -> str:
     return dsn
 
 
+def _json_default(o: Any) -> Any:
+    """
+    Превращает сложные объекты (dataclass / pydantic / datetime / numpy / etc.)
+    в JSON-совместимый вид.
+    """
+    # datetime/date
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+
+    # Decimal
+    if isinstance(o, Decimal):
+        return float(o)
+
+    # dataclass
+    if dataclasses.is_dataclass(o):
+        return dataclasses.asdict(o)
+
+    # pydantic v2
+    if hasattr(o, "model_dump") and callable(getattr(o, "model_dump")):
+        return o.model_dump()
+
+    # pydantic v1 (или любые объекты с dict())
+    if hasattr(o, "dict") and callable(getattr(o, "dict")):
+        return o.dict()
+
+    # numpy scalars (если вдруг попадутся)
+    if hasattr(o, "item") and callable(getattr(o, "item")):
+        try:
+            return o.item()
+        except Exception:
+            pass
+
+    # set/tuple
+    if isinstance(o, (set, tuple)):
+        return list(o)
+
+    # fallback: __dict__
+    if hasattr(o, "__dict__"):
+        return o.__dict__
+
+    # последний шанс
+    return str(o)
+
+
 async def _get_pool() -> AsyncConnectionPool:
     """
     Ленивая инициализация пула подключений к Postgres (Neon).
@@ -35,7 +81,6 @@ async def _get_pool() -> AsyncConnectionPool:
 
     dsn = _get_dsn()
 
-    # Важно: открывать pool лениво, чтобы импорт файла не делал I/O.
     _POOL = AsyncConnectionPool(
         conninfo=dsn,
         min_size=1,
@@ -49,7 +94,7 @@ async def _get_pool() -> AsyncConnectionPool:
 
 async def append_snapshot(
     *,
-    snap: Dict[str, Any],
+    snap: Any,  # может быть dict или MMSnapshot (dataclass/pydantic/obj)
     source_mode: str,
     symbols: str = "BTCUSDT,ETHUSDT",
     ts_utc: Optional[datetime] = None,
@@ -63,7 +108,12 @@ async def append_snapshot(
     try:
         pool = await _get_pool()
         ts_utc = ts_utc or _now_utc()
-        payload_json = json.dumps(snap, ensure_ascii=False)
+
+        payload_json = json.dumps(
+            snap,
+            ensure_ascii=False,
+            default=_json_default,
+        )
 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
