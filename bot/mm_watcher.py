@@ -67,7 +67,7 @@ def _ensure_mm_state(app: Application) -> Dict[str, Any]:
 
 async def _try_save_snapshot(
     *,
-    snap: Dict[str, Any],
+    snap: Any,  # MMSnapshot или dict
     source_mode: str,
     ts_utc: datetime,
     symbols: str = "BTCUSDT,ETHUSDT",
@@ -141,6 +141,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if mm.get("sent_day_close_id") != yday_id:
                 snap = await build_mm_snapshot(now_dt=dt_new, mode="daily_close")
+                await _try_save_snapshot(snap=snap, source_mode="daily_close", ts_utc=dt_new)
                 text = format_mm_report_ru(snap, report_type="DAILY_CLOSE")
                 await context.bot.send_message(chat_id=chat_id, text=text)
                 mm["sent_day_close_id"] = yday_id
@@ -150,6 +151,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 prev_week_id = _iso_week(_utc_dt(last_h1_open - 1))
                 if mm.get("sent_week_close_id") != prev_week_id:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="weekly_close")
+                    await _try_save_snapshot(snap=snap, source_mode="weekly_close", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="WEEKLY_CLOSE")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_week_close_id"] = prev_week_id
@@ -162,6 +164,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             day_id = _iso_day(dt_new)
             if mm.get("sent_day_open_id") != day_id:
                 snap = await build_mm_snapshot(now_dt=dt_new, mode="daily_open")
+                await _try_save_snapshot(snap=snap, source_mode="daily_open", ts_utc=dt_new)
                 text = format_mm_report_ru(snap, report_type="DAILY_OPEN")
                 await context.bot.send_message(chat_id=chat_id, text=text)
                 mm["sent_day_open_id"] = day_id
@@ -171,6 +174,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 week_id = _iso_week(dt_new)
                 if mm.get("sent_week_open_id") != week_id:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="weekly_open")
+                    await _try_save_snapshot(snap=snap, source_mode="weekly_open", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="WEEKLY_OPEN")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_week_open_id"] = week_id
@@ -188,6 +192,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 mm["last_h4_open"] = last_h4_open
                 if mm.get("sent_h4_open") != last_h4_open:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="h4_close")
+                    await _try_save_snapshot(snap=snap, source_mode="h4_close", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="H4")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_h4_open"] = last_h4_open
@@ -198,6 +203,7 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         # ---------------------------------------------
         if mm.get("sent_h1_open") != last_h1_open:
             snap = await build_mm_snapshot(now_dt=dt_new, mode="h1_close")
+            await _try_save_snapshot(snap=snap, source_mode="h1_close", ts_utc=dt_new)
             text = format_mm_report_ru(snap, report_type="H1")
             await context.bot.send_message(chat_id=chat_id, text=text)
             mm["sent_h1_open"] = last_h1_open
@@ -301,7 +307,7 @@ async def cmd_mm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now_dt = datetime.now(timezone.utc)
     snap = await build_mm_snapshot(now_dt=now_dt, mode="manual")
 
-    # Пишем в память (безопасно). На этом этапе пишем только MANUAL.
+    # Пишем в память (безопасно).
     await _try_save_snapshot(snap=snap, source_mode="manual", ts_utc=now_dt)
 
     text = format_mm_report_ru(snap, report_type="MANUAL")
