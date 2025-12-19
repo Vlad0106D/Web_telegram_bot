@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -7,12 +8,15 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from psycopg import InterfaceError, OperationalError
 from psycopg_pool import AsyncConnectionPool
 
 log = logging.getLogger(__name__)
 
 _POOL: Optional[AsyncConnectionPool] = None
+_POOL_LOCK = asyncio.Lock()
+
+# сколько раз пробуем повторить запись при сетевых/SSL обрывах
+_MAX_RETRIES = 2
 
 
 def _now_utc() -> datetime:
@@ -24,7 +28,7 @@ def _get_dsn() -> str:
     if not dsn:
         raise RuntimeError("DATABASE_URL is not set")
 
-    # ВАЖНО: DATABASE_URL должен быть только URL (postgresql://...), без "psql '...'"
+    # DATABASE_URL должен быть URL (postgresql://...), без "psql '...'"
     dsn = dsn.strip().strip("'").strip('"')
     if dsn.lower().startswith("psql "):
         raise RuntimeError("DATABASE_URL looks like a psql command. Put only the postgresql://... URL")
@@ -75,12 +79,10 @@ def _to_jsonable(obj: Any) -> Any:
         except Exception:
             pass
 
-    # крайний случай
     return str(obj)
 
 
 def _safe_get(obj: Any, key: str, default: Any = None) -> Any:
-    """getattr/ dict.get в одном месте."""
     if obj is None:
         return default
     if isinstance(obj, dict):
@@ -106,39 +108,64 @@ def _as_text(v: Any) -> Optional[str]:
         return None
 
 
-async def _get_pool() -> AsyncConnectionPool:
+def _is_transient_db_error(e: Exception) -> bool:
     """
-    Ленивая инициализация пула подключений к Postgres (Neon).
-    Используем DATABASE_URL из env.
+    Ловим сетевые/SSL/обрыв соединения.
+    Мы не импортим psycopg типы жёстко, чтобы не зависеть от версий.
     """
+    msg = (str(e) or "").lower()
+    if any(
+        s in msg
+        for s in [
+            "ssl connection has been closed unexpectedly",
+            "server closed the connection unexpectedly",
+            "terminating connection",
+            "connection reset by peer",
+            "connection refused",
+            "network is unreachable",
+            "connection timed out",
+            "broken pipe",
+            "eof detected",
+            "consuming input failed",
+        ]
+    ):
+        return True
+    return False
+
+
+async def _close_pool() -> None:
     global _POOL
-    if _POOL is not None:
-        return _POOL
-
-    dsn = _get_dsn()
-
-    _POOL = AsyncConnectionPool(
-        conninfo=dsn,
-        min_size=1,
-        max_size=3,
-        timeout=10,
-        open=False,
-    )
-    await _POOL.open()
-    return _POOL
-
-
-async def _reset_pool() -> None:
-    """
-    Сбрасываем пул при 'SSL connection has been closed unexpectedly' и похожих обрывах.
-    """
-    global _POOL
+    if _POOL is None:
+        return
     try:
-        if _POOL is not None:
-            await _POOL.close()
+        await _POOL.close()
     except Exception:
         pass
     _POOL = None
+
+
+async def _get_pool() -> AsyncConnectionPool:
+    """
+    Ленивая инициализация пула. Если пул умер — пересоздаём.
+    """
+    global _POOL
+
+    async with _POOL_LOCK:
+        if _POOL is not None:
+            return _POOL
+
+        dsn = _get_dsn()
+
+        # Важно: маленький пул = меньше “полумёртвых” коннектов в проде.
+        _POOL = AsyncConnectionPool(
+            conninfo=dsn,
+            min_size=1,
+            max_size=3,
+            timeout=10,
+            open=False,
+        )
+        await _POOL.open()
+        return _POOL
 
 
 async def _insert_features(
@@ -151,8 +178,7 @@ async def _insert_features(
     ts_utc: datetime,
 ) -> None:
     """
-    Пишем “фичи” в mm_features.
-    Если таблицы нет/схема не совпала — просто логируем и не ломаем бота.
+    Пишем фичи в mm_features.
     """
     try:
         btc = _safe_get(snap, "btc")
@@ -246,28 +272,27 @@ async def _insert_features(
 
 async def append_snapshot(
     *,
-    snap: Any,  # может быть dict или объект (MMSnapshot)
+    snap: Any,
     source_mode: str,
     symbols: str = "BTCUSDT,ETHUSDT",
     ts_utc: Optional[datetime] = None,
 ) -> None:
     """
-    Пишем снапшот в mm_snapshots + параллельно фичи в mm_features.
-    Всё append-only. Ошибки не должны ломать бота.
+    Пишем снапшот в mm_snapshots + фичи в mm_features.
+    Retry + пересоздание пула при SSL/сетевых обрывах.
     """
-
-    # Если у снапшота есть now_dt — используем его как ts_utc (логичнее для обучения)
+    # Если у снапшота есть now_dt — используем его как ts_utc
     snap_now = _safe_get(snap, "now_dt")
     if ts_utc is None and isinstance(snap_now, datetime):
         ts_utc = snap_now
-
     ts_utc = ts_utc or _now_utc()
 
     payload_obj = _to_jsonable(snap)
     payload_json = json.dumps(payload_obj, ensure_ascii=False)
 
-    # 2 попытки: если SSL/conn умер — сбрасываем пул и пробуем ещё раз
-    for attempt in (1, 2):
+    last_err: Optional[Exception] = None
+
+    for attempt in range(_MAX_RETRIES + 1):
         try:
             pool = await _get_pool()
 
@@ -284,7 +309,6 @@ async def append_snapshot(
                     row = await cur.fetchone()
                     snapshot_id = int(row[0]) if row and row[0] is not None else None
 
-                    # features — только если получили id
                     if snapshot_id is not None:
                         await _insert_features(
                             conn,
@@ -295,14 +319,21 @@ async def append_snapshot(
                             ts_utc=ts_utc,
                         )
 
-            return  # успех
-
-        except (OperationalError, InterfaceError):
-            log.exception("MM memory: db connection dropped (%s) attempt=%s", source_mode, attempt)
-            await _reset_pool()
-            if attempt == 2:
-                return
-
-        except Exception:
-            log.exception("MM memory: append_snapshot failed (%s)", source_mode)
+            # успех
             return
+
+        except Exception as e:
+            last_err = e
+
+            # если ошибка похожа на сетевой/SSL обрыв — пересоздаём пул и пробуем ещё раз
+            if _is_transient_db_error(e) and attempt < _MAX_RETRIES:
+                log.warning("MM memory: transient DB error, retry %s/%s: %s", attempt + 1, _MAX_RETRIES, e)
+                async with _POOL_LOCK:
+                    await _close_pool()
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+
+            # иначе — выходим
+            break
+
+    log.exception("MM memory: append_snapshot failed (%s)", source_mode, exc_info=last_err)
