@@ -5,8 +5,9 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
+from psycopg import InterfaceError, OperationalError
 from psycopg_pool import AsyncConnectionPool
 
 log = logging.getLogger(__name__)
@@ -127,6 +128,19 @@ async def _get_pool() -> AsyncConnectionPool:
     return _POOL
 
 
+async def _reset_pool() -> None:
+    """
+    Сбрасываем пул при 'SSL connection has been closed unexpectedly' и похожих обрывах.
+    """
+    global _POOL
+    try:
+        if _POOL is not None:
+            await _POOL.close()
+    except Exception:
+        pass
+    _POOL = None
+
+
 async def _insert_features(
     conn: Any,
     *,
@@ -241,41 +255,54 @@ async def append_snapshot(
     Пишем снапшот в mm_snapshots + параллельно фичи в mm_features.
     Всё append-only. Ошибки не должны ломать бота.
     """
-    try:
-        pool = await _get_pool()
 
-        # Если у снапшота есть now_dt — используем его как ts_utc (логичнее для обучения)
-        snap_now = _safe_get(snap, "now_dt")
-        if ts_utc is None and isinstance(snap_now, datetime):
-            ts_utc = snap_now
+    # Если у снапшота есть now_dt — используем его как ts_utc (логичнее для обучения)
+    snap_now = _safe_get(snap, "now_dt")
+    if ts_utc is None and isinstance(snap_now, datetime):
+        ts_utc = snap_now
 
-        ts_utc = ts_utc or _now_utc()
+    ts_utc = ts_utc or _now_utc()
 
-        payload_obj = _to_jsonable(snap)
-        payload_json = json.dumps(payload_obj, ensure_ascii=False)
+    payload_obj = _to_jsonable(snap)
+    payload_json = json.dumps(payload_obj, ensure_ascii=False)
 
-        async with pool.connection() as conn:
-            async with conn.transaction():
-                cur = await conn.execute(
-                    """
-                    INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
-                    VALUES (%s, %s, %s, %s::jsonb)
-                    RETURNING id
-                    """,
-                    (ts_utc, source_mode, symbols, payload_json),
-                )
-                row = await cur.fetchone()
-                snapshot_id = int(row[0]) if row and row[0] is not None else None
+    # 2 попытки: если SSL/conn умер — сбрасываем пул и пробуем ещё раз
+    for attempt in (1, 2):
+        try:
+            pool = await _get_pool()
 
-                # features — только если получили id
-                if snapshot_id is not None:
-                    await _insert_features(
-                        conn,
-                        snapshot_id=snapshot_id,
-                        snap=snap,
-                        source_mode=source_mode,
-                        symbols=symbols,
-                        ts_utc=ts_utc,
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    cur = await conn.execute(
+                        """
+                        INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
+                        VALUES (%s, %s, %s, %s::jsonb)
+                        RETURNING id
+                        """,
+                        (ts_utc, source_mode, symbols, payload_json),
                     )
-    except Exception:
-        log.exception("MM memory: append_snapshot failed")
+                    row = await cur.fetchone()
+                    snapshot_id = int(row[0]) if row and row[0] is not None else None
+
+                    # features — только если получили id
+                    if snapshot_id is not None:
+                        await _insert_features(
+                            conn,
+                            snapshot_id=snapshot_id,
+                            snap=snap,
+                            source_mode=source_mode,
+                            symbols=symbols,
+                            ts_utc=ts_utc,
+                        )
+
+            return  # успех
+
+        except (OperationalError, InterfaceError):
+            log.exception("MM memory: db connection dropped (%s) attempt=%s", source_mode, attempt)
+            await _reset_pool()
+            if attempt == 2:
+                return
+
+        except Exception:
+            log.exception("MM memory: append_snapshot failed (%s)", source_mode)
+            return
