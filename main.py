@@ -18,6 +18,41 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+def _normalize_tfs(value) -> List[str]:
+    """
+    WATCHER_TFS может приехать как:
+    - list/tuple/set: ["1h","4h"]
+    - строка: "1h,4h" или "1h 4h"
+    - None
+    """
+    if value is None:
+        return []
+
+    # ВАЖНО: str тоже Iterable, поэтому обрабатываем отдельно
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        # поддержка "1h,4h" и "1h 4h"
+        parts = [p.strip() for p in s.replace(",", " ").split()]
+        return [p for p in parts if p]
+
+    # нормальные коллекции
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    # какой-то другой iterable (на всякий) — но не строка
+    if isinstance(value, Iterable):
+        out = []
+        for x in value:
+            xs = str(x).strip()
+            if xs:
+                out.append(xs)
+        return out
+
+    return []
+
+
 async def _post_init(app: Application) -> None:
     # 1) Сброс вебхука перед polling, чтобы не ловить 409 Conflict
     await app.bot.delete_webhook(drop_pending_updates=True)
@@ -56,7 +91,6 @@ def main() -> None:
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(_post_init)
-        # В PTB 21.x parse_mode задаётся через Defaults
         .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
     )
@@ -66,20 +100,27 @@ def main() -> None:
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
     # Планирование вотчера (основного, не MM)
+    tfs = _normalize_tfs(WATCHER_TFS)
+    log.info("WATCHER_ENABLED=%s | WATCHER_INTERVAL_SEC=%s | WATCHER_TFS=%r -> %s",
+             WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS, tfs)
+
     if WATCHER_ENABLED:
         try:
             created = schedule_watcher_jobs(
                 app=app,
-                tfs=WATCHER_TFS if isinstance(WATCHER_TFS, Iterable) else [],
+                tfs=tfs,
                 interval_sec=int(WATCHER_INTERVAL_SEC),
             )
             log.info(
-                "Watcher scheduled every %ss for TFs: %s",
+                "Watcher scheduled every %ss for TFs: %s | jobs: %s",
                 WATCHER_INTERVAL_SEC,
-                ", ".join([c.replace("watch_", "") for c in created]) if created else "[]",
+                ", ".join(tfs) if tfs else "[]",
+                ", ".join(created) if created else "[]",
             )
         except Exception:
             log.exception("Failed to schedule watcher jobs")
+    else:
+        log.warning("Watcher is disabled (WATCHER_ENABLED=False) — auto signals will NOT run")
 
     # Запуск polling
     app.run_polling(drop_pending_updates=True)
