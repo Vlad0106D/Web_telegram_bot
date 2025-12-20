@@ -55,10 +55,7 @@ from services.state import get_favorites
 from services.breaker import detect_breakout, format_breakout_message
 from services.reversal import detect_reversals, format_reversal_message
 
-# FIX: берем analyze_symbol из актуальной реализации (если он у тебя в strategy/base_strategy.py — поправь импорт)
-from services.analyze import analyze_symbol  
-
-# FIX: генератор текста сигналов (если ты уже сменил на другой модуль — оставь актуальный)
+from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 
 from services.fusion import analyze_fusion, format_fusion_message
@@ -126,21 +123,11 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = time.time()
 
     # Кулдауны в app.bot_data
-    breaker_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
-        "breaker_last", {}
-    )
-    signal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
-        "signal_last", {}
-    )
-    reversal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
-        "reversal_last", {}
-    )
-    fusion_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault(
-        "fusion_last", {}
-    )
-    fibo_last: Dict[Tuple[str, str, str, float, str], float] = app.bot_data.setdefault(
-        "fibo_last", {}
-    )
+    breaker_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault("breaker_last", {})
+    signal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault("signal_last", {})
+    reversal_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault("reversal_last", {})
+    fusion_last: Dict[Tuple[str, str, str], float] = app.bot_data.setdefault("fusion_last", {})
+    fibo_last: Dict[Tuple[str, str, str, float, str], float] = app.bot_data.setdefault("fibo_last", {})
 
     try:
         favs = get_favorites()
@@ -172,7 +159,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                             await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=format_breakout_message(ev),
-                                parse_mode="HTML",  # FIX: если форматируешь HTML
+                                parse_mode="HTML",
                             )
                         breaker_last[key_b] = now
                         sent_breaker += 1
@@ -181,10 +168,13 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             # ---------- 2) STRATEGY ----------
             try:
-                # FIX: передаём текущий tf в анализатор
-                res = await analyze_symbol(sym, tf=tf)
+                # ВАЖНО: analyze_symbol может быть без аргумента tf.
+                # Делаем совместимую попытку.
+                try:
+                    res = await analyze_symbol(sym, tf=tf)
+                except TypeError:
+                    res = await analyze_symbol(sym)
 
-                # FIX: учитываем поле 'direction' (старый код смотрел на 'signal')
                 signal = (res.get("signal") or res.get("direction") or "none").lower()
                 conf = int(res.get("confidence") or 0)
 
@@ -196,7 +186,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                             await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=build_signal_message(res),
-                                parse_mode="HTML",  # FIX: если в тексте есть <code> и т.п.
+                                parse_mode="HTML",
                             )
                         signal_last[key_s] = now
                         sent_signal += 1
@@ -214,7 +204,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                             await context.bot.send_message(
                                 chat_id=chat_id,
                                 text=format_reversal_message(ev),
-                                parse_mode="HTML",  # FIX
+                                parse_mode="HTML",
                             )
                         reversal_last[key_r] = now
                         sent_reversal += 1
@@ -233,7 +223,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 await context.bot.send_message(
                                     chat_id=chat_id,
                                     text=format_fusion_message(fev),
-                                    parse_mode="HTML",  # FIX
+                                    parse_mode="HTML",
                                 )
                             fusion_last[key_f] = now
                             sent_fusion += 1
@@ -267,7 +257,7 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 await context.bot.send_message(
                                     chat_id=chat_id,
                                     text=format_fibo_message(ev),
-                                    parse_mode="HTML",  # FIX
+                                    parse_mode="HTML",
                                 )
                             fibo_last[key_fi] = now
                             sent_fibo += 1
@@ -280,19 +270,17 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     "symbol": ev.symbol,
                                     "tf": ev.tf,
                                     "side": getattr(ev, "side", "").lower(),
-                                    "level_kind": getattr(ev, "level_kind", None),   # "retr" | "ext"
+                                    "level_kind": getattr(ev, "level_kind", None),
                                     "level_pct": float(getattr(ev, "level_pct", 0.0)),
                                     "trend_1d": getattr(ev, "trend_1d", None),
 
-                                    # торговый план (как в сообщении Фибо)
+                                    # торговый план
                                     "entry": float(getattr(ev, "entry", getattr(ev, "touch_price", 0.0))),
                                     "sl": float(getattr(ev, "sl", 0.0)),
                                     "tp1": float(getattr(ev, "tp1", 0.0)),
                                     "tp2": float(getattr(ev, "tp2", 0.0)),
                                     "tp3": float(getattr(ev, "tp3", 0.0)),
 
-                                    # RR сейчас пересчитывается в TrueTrading безопасно — но оставим кэш,
-                                    # он больше для дебага и визуализации
                                     "rr_tp1": float(getattr(ev, "rr_tp1", 0.0)),
                                     "rr_tp2": float(getattr(ev, "rr_tp2", 0.0)),
                                     "rr_tp3": float(getattr(ev, "rr_tp3", 0.0)),
@@ -405,7 +393,8 @@ async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Jobs: {', '.join(created) if created else '—'}"
     )
     if update.effective_message:
-        await update.effective_message.reply_text(text, parse_mode="HTML")  # FIX
+        await update.effective_message.reply_text(text, parse_mode="HTML")
+
 
 async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
@@ -413,6 +402,7 @@ async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     text = f"⛔ Вотчер остановлен. Удалено задач: {removed}"
     if update.effective_message:
         await update.effective_message.reply_text(text)
+
 
 async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
@@ -427,7 +417,8 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Активные jobs: {jobs}"
     )
     if update.effective_message:
-        await update.effective_message.reply_text(text, parse_mode="HTML")  # FIX
+        await update.effective_message.reply_text(text, parse_mode="HTML")
+
 
 def register_watch_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("watch_on", cmd_watch_on))
