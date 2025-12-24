@@ -313,6 +313,46 @@ def _dir_from_state(state: str) -> Optional[str]:
     return None
 
 
+def _build_event_context(
+    *,
+    now_dt: datetime,
+    mode: str,
+    tf_mode: str,
+    state: str,
+    stage: str,
+    btc: DriverView,
+    eth: DriverView,
+    eth_relation: str,
+) -> Dict[str, Any]:
+    """
+    Контекст (meta) — НЕ влияет на логику, только “подпись” события.
+    Пишем аккуратно: допускаем None.
+    """
+    return {
+        "source": "okx_swap",
+        "ts_context_utc": now_dt.astimezone(timezone.utc).isoformat(),
+        "mode": mode,
+        "tf_mode": tf_mode,
+        "state": state,
+        "stage": stage,
+        "eth_relation": eth_relation,
+        "btc": {
+            "inst": btc.swap_inst_id,
+            "price": btc.price,
+            "oi": btc.open_interest,
+            "funding": btc.funding_rate,
+            "next_funding_time_ms": btc.next_funding_time_ms,
+        },
+        "eth": {
+            "inst": eth.swap_inst_id,
+            "price": eth.price,
+            "oi": eth.open_interest,
+            "funding": eth.funding_rate,
+            "next_funding_time_ms": eth.next_funding_time_ms,
+        },
+    }
+
+
 async def _safe_append_event(
     *,
     event_type: str,
@@ -320,6 +360,7 @@ async def _safe_append_event(
     tf: str,
     direction: Optional[str],
     level: Optional[float],
+    meta: Optional[Dict[str, Any]] = None,
     dedupe_key: Optional[Tuple[Any, ...]] = None,
     dedupe_slot: Optional[str] = None,
 ) -> None:
@@ -341,6 +382,7 @@ async def _safe_append_event(
             tf=tf,
             direction=direction,
             level=level,
+            meta=meta or {},
         )
     except Exception:
         log.exception("MM events: append_event failed (%s %s %s)", event_type, symbol, tf)
@@ -426,14 +468,25 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             next_steps = ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"]
             invalidation = "—"
 
+    # общий контекст события (meta) — один раз на снапшот
+    event_ctx = _build_event_context(
+        now_dt=now_dt,
+        mode=mode,
+        tf_mode=tf_mode,
+        state=state,
+        stage=stage,
+        btc=btc,
+        eth=eth,
+        eth_relation=relation,
+    )
+
     # ----------------------------
-    # 0) PRESSURE_CHANGE / STAGE_CHANGE (базовые события)
+    # 0) PRESSURE_CHANGE (базовые события)
     # ----------------------------
     try:
         mem = _mm_get("BTCUSDT")
 
         prev_state = mem.get("last_state")
-        prev_stage = mem.get("last_stage")
 
         # pressure change
         if prev_state is None or prev_state != state:
@@ -443,14 +496,12 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                 tf=tf_mode,
                 direction=_dir_from_state(state),
                 level=None,
+                meta=event_ctx,
                 dedupe_key=(tf_mode, state),
                 dedupe_slot="last_pressure_event",
             )
             mem["last_state"] = state
 
-        # stage change (текущий stage ещё может быть перезаписан sweep/reclaim ниже;
-        # поэтому stage-change финализируем ПОСЛЕ sweep/reclaim, см. блок ниже)
-        # тут только запомним prev_stage, а фактическую запись сделаем после sweep/reclaim.
         mem["last_mode"] = mode
 
     except Exception:
@@ -482,6 +533,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                     tf="1h",
                     direction="down",
                     level=float(swept_dn),
+                    meta={**event_ctx, "stage": stage},
                     dedupe_key=("1h", "down", round(float(swept_dn), 2)),
                     dedupe_slot="last_sweep_event",
                 )
@@ -492,6 +544,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                     tf="1h",
                     direction="up",
                     level=float(swept_up),
+                    meta={**event_ctx, "stage": stage},
                     dedupe_key=("1h", "up", round(float(swept_up), 2)),
                     dedupe_slot="last_sweep_event",
                 )
@@ -522,6 +575,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                 tf="1h",
                 direction=dir_,
                 level=None,
+                meta={**event_ctx, "stage": stage},
                 dedupe_key=("1h", dir_),
                 dedupe_slot="last_reclaim_event",
             )
@@ -548,6 +602,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                 tf=tf_mode,
                 direction=_dir_from_state(state),
                 level=None,
+                meta={**event_ctx, "stage": stage},
                 dedupe_key=(tf_mode, stage),
                 dedupe_slot="last_stage_event",
             )
