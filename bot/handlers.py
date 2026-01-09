@@ -27,17 +27,11 @@ from services.true_trading import get_tt
 # === MM mode commands ===
 from bot.mm_watcher import cmd_mm_on, cmd_mm_off, cmd_mm_status, cmd_mm
 
-# === Outcomes commands (SAFE IMPORT) ===
-# Ожидаем файл: bot/outcomes_watcher.py
-# с функциями: cmd_out, cmd_out_on, cmd_out_off, cmd_out_status
-try:
-    from bot.outcomes_watcher import cmd_out_on, cmd_out_off, cmd_out_status, cmd_out  # type: ignore
-    _OUTCOMES_AVAILABLE = True
-except Exception:
-    cmd_out_on = cmd_out_off = cmd_out_status = cmd_out = None  # type: ignore
-    _OUTCOMES_AVAILABLE = False
+# === Outcomes commands ===
+from bot.outcomes_watcher import cmd_out_on, cmd_out_off, cmd_out_status, cmd_out
 
 log = logging.getLogger(__name__)
+
 
 # ------------ Кнопка "Меню" ------------
 def _menu_keyboard() -> ReplyKeyboardMarkup:
@@ -46,16 +40,20 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("/check")],
         [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
         [KeyboardButton("/watch_status")],
+
         [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
         [KeyboardButton("/tt_status")],
+
         # --- MM mode ---
         [KeyboardButton("/mm"), KeyboardButton("/mm_status")],
         [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
+
         # --- Outcomes ---
         [KeyboardButton("/out"), KeyboardButton("/out_status")],
         [KeyboardButton("/out_on"), KeyboardButton("/out_off")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
 
 # ------------ Вспомогательные клавиатуры ------------
 def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
@@ -69,6 +67,7 @@ def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
         rows = [[InlineKeyboardButton(text="(список пуст)", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
 
+
 def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
     for s in symbols[:30]:
@@ -79,6 +78,7 @@ def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     if not rows:
         rows = [[InlineKeyboardButton(text="ничего не найдено", callback_data="noop")]]
     return InlineKeyboardMarkup(rows)
+
 
 # ------------ Команды ------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -97,7 +97,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /mm_on — MM mode: включить авто-отчёты\n"
         "• /mm_off — MM mode: выключить\n"
         "• /mm_status — MM mode: статус\n"
-        "• /out — Outcomes: ручной расчёт (батч)\n"
+        "• /out — Outcomes: ручной прогон (1 батч)\n"
         "• /out_on — Outcomes: включить авто-расчёт\n"
         "• /out_off — Outcomes: выключить\n"
         "• /out_status — Outcomes: статус\n"
@@ -105,21 +105,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, "
+        "Команды: /start, /help, /list, /find, /check, "
+        "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
         "/mm, /mm_on, /mm_off, /mm_status, "
         "/out, /out_on, /out_off, /out_status, "
         "/menu"
     )
 
+
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Меню команд:", reply_markup=_menu_keyboard())
+
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = get_favorites()
     await update.message.reply_text("Избранные пары:", reply_markup=_favorites_inline_kb(favs))
+
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = " ".join(context.args).strip() if context.args else ""
@@ -136,6 +141,7 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reply_markup=ForceReply(selective=True),
     )
     context.user_data["await_find_reply_to"] = msg.message_id
+
 
 async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     awaited_id = context.user_data.get("await_find_reply_to")
@@ -158,6 +164,7 @@ async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=_search_results_kb(syms),
     )
 
+
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = get_favorites()
     if not favs:
@@ -174,6 +181,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("check %s failed", s)
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
+
 # ------------ Вотчер ------------
 async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     created = schedule_watcher_jobs(
@@ -186,6 +194,7 @@ async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Вотчер включён ✅\nTF: {tfs_txt}\ninterval={WATCHER_INTERVAL_SEC}s\njobs: {', '.join(created) or '—'}"
     )
 
+
 async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jq = context.application.job_queue
     removed = 0
@@ -197,6 +206,7 @@ async def cmd_watch_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except Exception:
                 pass
     await update.message.reply_text(f"Вотчер выключен ⛔ (удалено jobs: {removed})")
+
 
 async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     jq = context.application.job_queue
@@ -213,6 +223,7 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         nxt_s = nxt.strftime("%Y-%m-%d %H:%M:%S UTC") if nxt else "—"
         lines.append(f"• TF {tf}: next={nxt_s}")
     await update.message.reply_text("\n".join(lines))
+
 
 # ------------ True Trading команды ------------
 async def cmd_tt_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -232,10 +243,12 @@ async def cmd_tt_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(txt)
 
+
 async def cmd_tt_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tt = get_tt(context.application)
     tt.disable()
     await update.message.reply_text("⛔ True Trading выключен. Ордеры не будут выставляться.")
+
 
 async def cmd_tt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tt = get_tt(context.application)
@@ -251,6 +264,7 @@ async def cmd_tt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"1D фильтр: {'да' if st.require_trend_1d else 'нет'} | Биржа: {'OK' if st.exchange_connected else 'нет ключей'}"
     )
     await update.message.reply_text(txt)
+
 
 # ------------ Callback-кнопки ------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -286,12 +300,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         add_favorite(sym)
         await q.message.reply_text(f"{sym} добавлена в избранное ✅")
 
-# ------------ Заглушка, если outcomes-модуля нет ------------
-async def _cmd_outcomes_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "⚠️ Outcomes модуль ещё не подключён в проект (нет bot/outcomes_watcher.py).\n"
-        "Добавь файл — и команды /out, /out_on, /out_off, /out_status заработают."
-    )
 
 # ------------ Регистрация ------------
 def register_handlers(app: Application) -> None:
@@ -328,16 +336,10 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("mm_status", cmd_mm_status))
 
     # Outcomes
-    if _OUTCOMES_AVAILABLE:
-        app.add_handler(CommandHandler("out", cmd_out))
-        app.add_handler(CommandHandler("out_on", cmd_out_on))
-        app.add_handler(CommandHandler("out_off", cmd_out_off))
-        app.add_handler(CommandHandler("out_status", cmd_out_status))
-    else:
-        app.add_handler(CommandHandler("out", _cmd_outcomes_missing))
-        app.add_handler(CommandHandler("out_on", _cmd_outcomes_missing))
-        app.add_handler(CommandHandler("out_off", _cmd_outcomes_missing))
-        app.add_handler(CommandHandler("out_status", _cmd_outcomes_missing))
+    app.add_handler(CommandHandler("out", cmd_out))
+    app.add_handler(CommandHandler("out_on", cmd_out_on))
+    app.add_handler(CommandHandler("out_off", cmd_out_off))
+    app.add_handler(CommandHandler("out_status", cmd_out_status))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
