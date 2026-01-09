@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta, datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler
@@ -14,14 +14,16 @@ from services.outcomes.storage_pg import upsert_outcome
 # ✅ правильный источник: берем события, которым надо досчитать outcome
 try:
     from services.outcomes.storage_pg import fetch_events_needing_outcomes
-except Exception:
+except Exception as ex:
     fetch_events_needing_outcomes = None  # type: ignore
+    logging.getLogger(__name__).warning("fetch_events_needing_outcomes import failed: %r", ex)
 
 # (старый режим — оставим как запасной)
 try:
     from services.outcomes.storage_pg import fetch_events_missing_any_outcomes
-except Exception:
+except Exception as ex:
     fetch_events_missing_any_outcomes = None  # type: ignore
+    logging.getLogger(__name__).warning("fetch_events_missing_any_outcomes import failed: %r", ex)
 
 from services.outcomes.calc import calc_event_outcomes
 
@@ -41,7 +43,23 @@ def _ensure_out_state(app: Application) -> Dict[str, Any]:
     st.setdefault("last_run_ts", None)
     st.setdefault("processed_last", 0)
     st.setdefault("errors_last", 0)
+    st.setdefault("written_last", 0)  # ✅ сколько реально записали строк outcomes
     return st
+
+
+async def _select_events(batch: int):
+    """
+    Выбираем события для перерасчёта.
+    Предпочитаем новый режим, иначе fallback.
+    """
+    if fetch_events_needing_outcomes is not None:
+        return await fetch_events_needing_outcomes(limit=batch)
+
+    if fetch_events_missing_any_outcomes is not None:
+        log.warning("Using fallback fetch_events_missing_any_outcomes (new selector not available)")
+        return await fetch_events_missing_any_outcomes(limit=batch)
+
+    raise RuntimeError("Neither fetch_events_needing_outcomes nor fetch_events_missing_any_outcomes is available")
 
 
 async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,33 +73,28 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     processed = 0
     errors = 0
+    written = 0
 
     try:
-        # ✅ новый правильный режим
-        if fetch_events_needing_outcomes is not None:
-            events = await fetch_events_needing_outcomes(limit=batch)
-        else:
-            # fallback (на случай если не задеплоено)
-            if fetch_events_missing_any_outcomes is None:
-                raise RuntimeError("Neither fetch_events_needing_outcomes nor fetch_events_missing_any_outcomes is available")
-            events = await fetch_events_missing_any_outcomes(limit=batch)
+        events = await _select_events(batch)
 
         if not events:
             st["processed_last"] = 0
             st["errors_last"] = 0
+            st["written_last"] = 0
             st["last_run_ts"] = datetime.now(timezone.utc).isoformat()
             return
 
         for e in events:
             try:
-                # tf_for_calc можно оставить "1h" как базовый (потом улучшим)
                 res = await calc_event_outcomes(
                     symbol=e.symbol,
                     event_ts_utc=e.ts_utc,
                     tf_for_calc="1h",
                 )
 
-                # res: dict[horizon] -> (max_up_pct, max_down_pct, close_pct, outcome_type)
+                # пишем outcomes по горизонтам
+                wrote_for_event = 0
                 for horizon, (mu, md, cp, ot) in res.items():
                     await upsert_outcome(
                         event_id=e.id,
@@ -92,11 +105,15 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                         outcome_type=ot,
                         event_ts_utc=e.ts_utc,
                     )
+                    wrote_for_event += 1
 
+                # ✅ processed считаем только если реально что-то попытались записать
                 processed += 1
+                written += wrote_for_event
+
             except Exception:
                 errors += 1
-                log.exception("Outcomes calc failed for event_id=%s", getattr(e, "id", "?"))
+                log.exception("Outcomes calc/write failed for event_id=%s", getattr(e, "id", "?"))
 
     except Exception:
         errors += 1
@@ -104,6 +121,7 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     st["processed_last"] = processed
     st["errors_last"] = errors
+    st["written_last"] = written
     st["last_run_ts"] = datetime.now(timezone.utc).isoformat()
 
 
@@ -194,7 +212,8 @@ async def cmd_out_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Интервал: {st.get('interval_sec')} сек.\n"
         f"Batch: {st.get('batch')}\n"
         f"Последний прогон: {st.get('last_run_ts') or '—'}\n"
-        f"Обработано в последний раз: {st.get('processed_last')}\n"
+        f"Обработано в последний раз (events): {st.get('processed_last')}\n"
+        f"Записано строк outcomes: {st.get('written_last')}\n"
         f"Ошибок в последний раз: {st.get('errors_last')}\n"
         f"Jobs: {', '.join([j.name for j in jobs]) if jobs else '—'}"
     )
@@ -214,8 +233,9 @@ async def cmd_out(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _out_tick(context)
         await update.effective_message.reply_text(
             "🧮 Outcomes: ручной прогон выполнен.\n"
-            f"Обработано: {st.get('processed_last')}\n"
-            f"Ошибок: {st.get('errors_last')}\n"
+            f"Events: {st.get('processed_last')}\n"
+            f"Written rows: {st.get('written_last')}\n"
+            f"Errors: {st.get('errors_last')}\n"
             f"ts: {st.get('last_run_ts')}",
         )
     finally:
