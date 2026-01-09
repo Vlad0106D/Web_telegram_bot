@@ -21,11 +21,21 @@ from services.market_data import search_symbols
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 
-# === добавили импорт True Trading ===
+# === True Trading ===
 from services.true_trading import get_tt
 
 # === MM mode commands ===
 from bot.mm_watcher import cmd_mm_on, cmd_mm_off, cmd_mm_status, cmd_mm
+
+# === Outcomes commands (SAFE IMPORT) ===
+# Ожидаем файл: bot/outcomes_watcher.py
+# с функциями: cmd_out, cmd_out_on, cmd_out_off, cmd_out_status
+try:
+    from bot.outcomes_watcher import cmd_out_on, cmd_out_off, cmd_out_status, cmd_out  # type: ignore
+    _OUTCOMES_AVAILABLE = True
+except Exception:
+    cmd_out_on = cmd_out_off = cmd_out_status = cmd_out = None  # type: ignore
+    _OUTCOMES_AVAILABLE = False
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +51,9 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         # --- MM mode ---
         [KeyboardButton("/mm"), KeyboardButton("/mm_status")],
         [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
+        # --- Outcomes ---
+        [KeyboardButton("/out"), KeyboardButton("/out_status")],
+        [KeyboardButton("/out_on"), KeyboardButton("/out_off")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -84,13 +97,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /mm_on — MM mode: включить авто-отчёты\n"
         "• /mm_off — MM mode: выключить\n"
         "• /mm_status — MM mode: статус\n"
+        "• /out — Outcomes: ручной расчёт (батч)\n"
+        "• /out_on — Outcomes: включить авто-расчёт\n"
+        "• /out_off — Outcomes: выключить\n"
+        "• /out_status — Outcomes: статус\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, /tt_on, /tt_off, /tt_status, /mm, /mm_on, /mm_off, /mm_status, /menu"
+        "Команды: /start, /help, /list, /find, /check, /watch_on, /watch_off, /watch_status, "
+        "/tt_on, /tt_off, /tt_status, "
+        "/mm, /mm_on, /mm_off, /mm_status, "
+        "/out, /out_on, /out_off, /out_status, "
+        "/menu"
     )
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -265,13 +286,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         add_favorite(sym)
         await q.message.reply_text(f"{sym} добавлена в избранное ✅")
 
+# ------------ Заглушка, если outcomes-модуля нет ------------
+async def _cmd_outcomes_missing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "⚠️ Outcomes модуль ещё не подключён в проект (нет bot/outcomes_watcher.py).\n"
+        "Добавь файл — и команды /out, /out_on, /out_off, /out_status заработают."
+    )
+
 # ------------ Регистрация ------------
 def register_handlers(app: Application) -> None:
     log.info(
         "Handlers зарегистрированы: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm, /mm_on, /mm_off, /mm_status, /menu"
+        "/mm, /mm_on, /mm_off, /mm_status, "
+        "/out, /out_on, /out_off, /out_status, "
+        "/menu"
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -296,6 +326,18 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("mm_on", cmd_mm_on))
     app.add_handler(CommandHandler("mm_off", cmd_mm_off))
     app.add_handler(CommandHandler("mm_status", cmd_mm_status))
+
+    # Outcomes
+    if _OUTCOMES_AVAILABLE:
+        app.add_handler(CommandHandler("out", cmd_out))
+        app.add_handler(CommandHandler("out_on", cmd_out_on))
+        app.add_handler(CommandHandler("out_off", cmd_out_off))
+        app.add_handler(CommandHandler("out_status", cmd_out_status))
+    else:
+        app.add_handler(CommandHandler("out", _cmd_outcomes_missing))
+        app.add_handler(CommandHandler("out_on", _cmd_outcomes_missing))
+        app.add_handler(CommandHandler("out_off", _cmd_outcomes_missing))
+        app.add_handler(CommandHandler("out_status", _cmd_outcomes_missing))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
