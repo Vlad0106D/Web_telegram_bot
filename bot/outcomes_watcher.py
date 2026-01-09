@@ -9,11 +9,8 @@ from telegram.ext import Application, ContextTypes, CommandHandler
 
 from config import ALERT_CHAT_ID
 
-# ВАЖНО:
-# Эти импорты должны существовать у тебя (мы их делали на шаге Outcomes):
-# - store_pg: выборка "кто без outcomes" + upsert
-# - calc: расчёт outcomes по OHLC
-from services.outcomes.store_pg import fetch_events_missing_any_outcomes, upsert_outcome
+# ✅ FIX: у тебя файл называется storage_pg.py (а не store_pg.py)
+from services.outcomes.storage_pg import fetch_events_missing_any_outcomes, upsert_outcome
 from services.outcomes.calc import calc_event_outcomes
 
 log = logging.getLogger(__name__)
