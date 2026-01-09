@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional, List, Dict
+from typing import Optional, List
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -14,11 +14,18 @@ log = logging.getLogger(__name__)
 _POOL: Optional[AsyncConnectionPool] = None
 _LOCK = asyncio.Lock()
 
+
 def _dsn() -> str:
     dsn = (os.getenv("DATABASE_URL") or "").strip().strip("'").strip('"')
     if not dsn:
         raise RuntimeError("DATABASE_URL is not set")
+
+    # защита от "psql '...'"
+    if dsn.lower().startswith("psql "):
+        raise RuntimeError("DATABASE_URL looks like a psql command. Put only the postgresql://... URL")
+
     return dsn
+
 
 async def _pool() -> AsyncConnectionPool:
     global _POOL
@@ -35,8 +42,20 @@ async def _pool() -> AsyncConnectionPool:
         await _POOL.open()
         return _POOL
 
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _safe_float(x) -> Optional[float]:
+    """None -> NULL в PG; иначе пытаемся привести к float."""
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
 
 @dataclass
 class MMEventRow:
@@ -48,9 +67,10 @@ class MMEventRow:
     direction: Optional[str]
     meta: Optional[dict]
 
+
 async def fetch_events_missing_any_outcomes(limit: int = 200) -> List[MMEventRow]:
     """
-    Берём события, по которым нет НИ ОДНОГО outcome (как твой запрос давал 265).
+    Берём события, по которым нет НИ ОДНОГО outcome.
     """
     p = await _pool()
     sql = """
@@ -67,29 +87,33 @@ async def fetch_events_missing_any_outcomes(limit: int = 200) -> List[MMEventRow
 
     out: List[MMEventRow] = []
     for r in rows:
-        out.append(MMEventRow(
-            id=int(r[0]),
-            ts_utc=r[1],
-            symbol=str(r[2]),
-            tf=str(r[3]),
-            event_type=str(r[4]),
-            direction=(str(r[5]) if r[5] is not None else None),
-            meta=(r[6] if r[6] is not None else None),
-        ))
+        out.append(
+            MMEventRow(
+                id=int(r[0]),
+                ts_utc=r[1],
+                symbol=str(r[2]),
+                tf=str(r[3]),
+                event_type=str(r[4]),
+                direction=(str(r[5]) if r[5] is not None else None),
+                meta=(r[6] if r[6] is not None else None),
+            )
+        )
     return out
+
 
 async def upsert_outcome(
     *,
     event_id: int,
     horizon: str,
-    max_up_pct: float,
-    max_down_pct: float,
-    close_pct: float,
+    max_up_pct: Optional[float],
+    max_down_pct: Optional[float],
+    close_pct: Optional[float],
     outcome_type: str,
     event_ts_utc: datetime,
 ) -> None:
     """
     Пишем outcome. Требует уникального индекса (event_id, horizon).
+    Важно: метрики могут быть None -> пишем NULL, чтобы не падать.
     """
     p = await _pool()
     sql = """
@@ -106,12 +130,15 @@ async def upsert_outcome(
         event_ts_utc = EXCLUDED.event_ts_utc
     """
     async with p.connection() as conn:
-        await conn.execute(sql, (
-            int(event_id),
-            str(horizon),
-            float(max_up_pct),
-            float(max_down_pct),
-            float(close_pct),
-            str(outcome_type),
-            event_ts_utc,
-        ))
+        await conn.execute(
+            sql,
+            (
+                int(event_id),
+                str(horizon),
+                _safe_float(max_up_pct),
+                _safe_float(max_down_pct),
+                _safe_float(close_pct),
+                str(outcome_type),
+                event_ts_utc,
+            ),
+        )
