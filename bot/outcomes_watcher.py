@@ -9,8 +9,20 @@ from telegram.ext import Application, ContextTypes, CommandHandler
 
 from config import ALERT_CHAT_ID
 
-# ✅ FIX: у тебя файл называется storage_pg.py (а не store_pg.py)
-from services.outcomes.storage_pg import fetch_events_missing_any_outcomes, upsert_outcome
+from services.outcomes.storage_pg import upsert_outcome
+
+# ✅ правильный источник: берем события, которым надо досчитать outcome
+try:
+    from services.outcomes.storage_pg import fetch_events_needing_outcomes
+except Exception:
+    fetch_events_needing_outcomes = None  # type: ignore
+
+# (старый режим — оставим как запасной)
+try:
+    from services.outcomes.storage_pg import fetch_events_missing_any_outcomes
+except Exception:
+    fetch_events_missing_any_outcomes = None  # type: ignore
+
 from services.outcomes.calc import calc_event_outcomes
 
 log = logging.getLogger(__name__)
@@ -45,7 +57,15 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     errors = 0
 
     try:
-        events = await fetch_events_missing_any_outcomes(limit=batch)
+        # ✅ новый правильный режим
+        if fetch_events_needing_outcomes is not None:
+            events = await fetch_events_needing_outcomes(limit=batch)
+        else:
+            # fallback (на случай если не задеплоено)
+            if fetch_events_missing_any_outcomes is None:
+                raise RuntimeError("Neither fetch_events_needing_outcomes nor fetch_events_missing_any_outcomes is available")
+            events = await fetch_events_missing_any_outcomes(limit=batch)
+
         if not events:
             st["processed_last"] = 0
             st["errors_last"] = 0
@@ -188,7 +208,6 @@ async def cmd_out(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     st = _ensure_out_state(app)
 
-    # Временно разрешим тик даже если enabled=False, но НЕ включаем авто-режим
     old_enabled = bool(st.get("enabled"))
     st["enabled"] = True
     try:
