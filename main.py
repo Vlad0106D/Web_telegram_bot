@@ -33,15 +33,12 @@ def _normalize_tfs(value) -> List[str]:
         s = value.strip()
         if not s:
             return []
-        # поддержка "1h,4h" и "1h 4h"
         parts = [p.strip() for p in s.replace(",", " ").split()]
         return [p for p in parts if p]
 
-    # нормальные коллекции
     if isinstance(value, (list, tuple, set)):
         return [str(x).strip() for x in value if str(x).strip()]
 
-    # какой-то другой iterable (на всякий) — но не строка
     if isinstance(value, Iterable):
         out = []
         for x in value:
@@ -75,21 +72,13 @@ async def _post_init(app: Application) -> None:
         BotCommand("mm_on", "MM mode: включить авто-отчёты"),
         BotCommand("mm_off", "MM mode: выключить"),
         BotCommand("mm_status", "MM mode: статус"),
+
+        # --- Outcomes ---
+        BotCommand("out", "Outcomes: ручной прогон (1 батч)"),
+        BotCommand("out_on", "Outcomes: включить авто-расчёт"),
+        BotCommand("out_off", "Outcomes: выключить"),
+        BotCommand("out_status", "Outcomes: статус"),
     ]
-
-    # --- Outcomes (добавляем только если модуль реально есть, чтобы не ломать UX) ---
-    try:
-        import bot.outcomes_watcher  # noqa: F401
-
-        commands += [
-            BotCommand("out", "Outcomes: ручной расчёт (батч)"),
-            BotCommand("out_on", "Outcomes: включить авто-расчёт"),
-            BotCommand("out_off", "Outcomes: выключить"),
-            BotCommand("out_status", "Outcomes: статус"),
-        ]
-        log.info("Outcomes commands added to Telegram menu")
-    except Exception:
-        log.warning("Outcomes module not found yet — /out* commands not added to Telegram menu")
 
     await app.bot.set_my_commands(commands)
     log.info(
@@ -109,7 +98,7 @@ def main() -> None:
         .build()
     )
 
-    # Базовые хендлеры (включая MM mode + Outcomes в handlers.py)
+    # Базовые хендлеры (включая MM mode + Outcomes)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
