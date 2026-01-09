@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ async def _pool() -> AsyncConnectionPool:
     async with _LOCK:
         if _POOL is not None:
             return _POOL
+
         _POOL = AsyncConnectionPool(
             conninfo=_dsn(),
             min_size=1,
@@ -51,11 +53,17 @@ def _now_utc() -> datetime:
 
 
 def _safe_float(x) -> Optional[float]:
-    """None -> NULL в PG; иначе пытаемся привести к float."""
+    """
+    None -> NULL в PG
+    NaN/inf -> NULL в PG (важно, иначе будут странные значения в БД)
+    """
     if x is None:
         return None
     try:
-        return float(x)
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
     except Exception:
         return None
 
@@ -113,7 +121,7 @@ async def fetch_events_needing_outcomes(
     НОВОЕ (правильное):
     Берём события, которые нужно досчитать/починить:
       - нет outcome по одному из horizons (1h/4h/1d)
-      - ИЛИ outcome есть, но outcome_type='ok' и метрики NULL (это уже ошибка данных)
+      - ИЛИ outcome есть, но outcome_type='ok' и метрики NULL (битые данные)
 
     Важно:
     - outcome_type='error_*' с NULL метриками НЕ возвращаем (иначе будет вечная догонялка).
@@ -186,7 +194,7 @@ async def upsert_outcome(
     Пишем outcome. Требует уникального индекса (event_id, horizon).
 
     Правило:
-    - если метрики None -> пишем NULL, а outcome_type ставим error_no_data,
+    - если метрики None/NaN -> пишем NULL, а outcome_type делаем error_no_data,
       чтобы событие НЕ попадало в перерасчёт бесконечно.
     """
     mu = _safe_float(max_up_pct)
@@ -194,11 +202,16 @@ async def upsert_outcome(
     cp = _safe_float(close_pct)
 
     if mu is None or md is None or cp is None:
+        # НЕ сохраняем "ok" с пустыми метриками — это и создавало твою проблему.
         outcome_type = "error_no_data"
         log.warning(
             "Outcome has NULL metrics -> store as %s (event_id=%s horizon=%s mu=%s md=%s cp=%s)",
             outcome_type, event_id, horizon, mu, md, cp
         )
+
+    # нормализуем tz
+    if event_ts_utc.tzinfo is None:
+        event_ts_utc = event_ts_utc.replace(tzinfo=timezone.utc)
 
     p = await _pool()
     sql = """
