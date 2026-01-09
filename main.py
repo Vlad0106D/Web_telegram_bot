@@ -77,6 +77,20 @@ async def _post_init(app: Application) -> None:
         BotCommand("mm_status", "MM mode: статус"),
     ]
 
+    # --- Outcomes (добавляем только если модуль реально есть, чтобы не ломать UX) ---
+    try:
+        import bot.outcomes_watcher  # noqa: F401
+
+        commands += [
+            BotCommand("out", "Outcomes: ручной расчёт (батч)"),
+            BotCommand("out_on", "Outcomes: включить авто-расчёт"),
+            BotCommand("out_off", "Outcomes: выключить"),
+            BotCommand("out_status", "Outcomes: статус"),
+        ]
+        log.info("Outcomes commands added to Telegram menu")
+    except Exception:
+        log.warning("Outcomes module not found yet — /out* commands not added to Telegram menu")
+
     await app.bot.set_my_commands(commands)
     log.info(
         "Bot commands set globally: %s",
@@ -95,7 +109,7 @@ def main() -> None:
         .build()
     )
 
-    # Базовые хендлеры (включая MM mode)
+    # Базовые хендлеры (включая MM mode + Outcomes в handlers.py)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
