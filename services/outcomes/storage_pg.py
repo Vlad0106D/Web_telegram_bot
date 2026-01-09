@@ -14,7 +14,6 @@ log = logging.getLogger(__name__)
 _POOL: Optional[AsyncConnectionPool] = None
 _LOCK = asyncio.Lock()
 
-
 # какие горизонты мы ожидаем иметь на каждый event
 DEFAULT_HORIZONS: Sequence[str] = ("1h", "4h", "1d")
 
@@ -114,14 +113,12 @@ async def fetch_events_needing_outcomes(
     НОВОЕ (правильное):
     Берём события, которые нужно досчитать/починить:
       - нет outcome по одному из horizons (1h/4h/1d)
-      - ИЛИ outcome есть, но метрики NULL (max_up_pct/max_down_pct/close_pct)
+      - ИЛИ outcome есть, но outcome_type='ok' и метрики NULL (это уже ошибка данных)
 
-    Это решает твою ситуацию, когда outcomes "много", но 95% пустые.
+    Важно:
+    - outcome_type='error_*' с NULL метриками НЕ возвращаем (иначе будет вечная догонялка).
     """
-    # защищаемся: строго ожидаем только эти горизонты
     hz = tuple(horizons) if horizons else tuple(DEFAULT_HORIZONS)
-    # под 3 горизонта делаем агрегаты
-    # (если ты потом добавишь горизонты, скажешь — расширим SQL динамически)
     if set(hz) != {"1h", "4h", "1d"}:
         log.warning("fetch_events_needing_outcomes: horizons=%s not стандартные; использую DEFAULT_HORIZONS", hz)
         hz = tuple(DEFAULT_HORIZONS)
@@ -137,8 +134,9 @@ async def fetch_events_needing_outcomes(
         COUNT(*) FILTER (WHERE horizon='1d') AS c_1d,
         COUNT(*) FILTER (
           WHERE horizon IN ('1h','4h','1d')
+            AND outcome_type = 'ok'
             AND (max_up_pct IS NULL OR max_down_pct IS NULL OR close_pct IS NULL)
-        ) AS null_rows
+        ) AS null_ok_rows
       FROM public.mm_outcomes
       GROUP BY event_id
     )
@@ -149,7 +147,7 @@ async def fetch_events_needing_outcomes(
       COALESCE(a.c_1h, 0) = 0
       OR COALESCE(a.c_4h, 0) = 0
       OR COALESCE(a.c_1d, 0) = 0
-      OR COALESCE(a.null_rows, 0) > 0
+      OR COALESCE(a.null_ok_rows, 0) > 0
     ORDER BY e.ts_utc ASC
     LIMIT %s
     """
@@ -187,20 +185,20 @@ async def upsert_outcome(
     """
     Пишем outcome. Требует уникального индекса (event_id, horizon).
 
-    ВАЖНОЕ ИЗМЕНЕНИЕ:
-    Если хоть одна метрика None -> НЕ пишем строку в БД.
-    Иначе ты получаешь тонны "пустых outcomes" (как сейчас 1350/1407).
+    Правило:
+    - если метрики None -> пишем NULL, а outcome_type ставим error_no_data,
+      чтобы событие НЕ попадало в перерасчёт бесконечно.
     """
     mu = _safe_float(max_up_pct)
     md = _safe_float(max_down_pct)
     cp = _safe_float(close_pct)
 
     if mu is None or md is None or cp is None:
+        outcome_type = "error_no_data"
         log.warning(
-            "Skip upsert_outcome: metrics None (event_id=%s horizon=%s mu=%s md=%s cp=%s outcome_type=%s)",
-            event_id, horizon, mu, md, cp, outcome_type
+            "Outcome has NULL metrics -> store as %s (event_id=%s horizon=%s mu=%s md=%s cp=%s)",
+            outcome_type, event_id, horizon, mu, md, cp
         )
-        return
 
     p = await _pool()
     sql = """
@@ -222,9 +220,9 @@ async def upsert_outcome(
             (
                 int(event_id),
                 str(horizon),
-                float(mu),
-                float(md),
-                float(cp),
+                mu,  # может быть NULL
+                md,  # может быть NULL
+                cp,  # может быть NULL
                 str(outcome_type),
                 event_ts_utc,
             ),
