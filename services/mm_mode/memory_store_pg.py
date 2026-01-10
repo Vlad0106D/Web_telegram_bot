@@ -108,6 +108,22 @@ def _as_text(v: Any) -> Optional[str]:
         return None
 
 
+def _tf_from_source_mode(source_mode: str) -> Optional[str]:
+    """
+    Маппинг source_mode -> tf, чтобы всегда иметь tf в mm_snapshots.payload.
+    """
+    sm = (source_mode or "").lower()
+    if sm.startswith("h1_"):
+        return "1h"
+    if sm.startswith("h4_"):
+        return "4h"
+    if sm.startswith("daily_"):
+        return "1d"
+    if sm.startswith("weekly_"):
+        return "1w"
+    return None
+
+
 def _is_transient_db_error(e: Exception) -> bool:
     """
     Ловим сетевые/SSL/обрыв соединения.
@@ -288,6 +304,13 @@ async def append_snapshot(
     ts_utc = ts_utc or _now_utc()
 
     payload_obj = _to_jsonable(snap)
+
+    # ✅ FIX: добавляем tf в payload, иначе payload->>'tf' будет NULL (ломает 1D/4H проверки)
+    if isinstance(payload_obj, dict):
+        tf = payload_obj.get("tf") or _tf_from_source_mode(source_mode)
+        if tf is not None:
+            payload_obj["tf"] = tf
+
     payload_json = json.dumps(payload_obj, ensure_ascii=False)
 
     last_err: Optional[Exception] = None
