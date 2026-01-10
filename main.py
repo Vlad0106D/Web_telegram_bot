@@ -86,8 +86,8 @@ async def _post_init(app: Application) -> None:
         BotCommand("out_off", "Outcomes: выключить"),
         BotCommand("out_status", "Outcomes: статус"),
 
-        # ⚠️ Outcomes Score команды добавим позже, когда ты точно скажешь названия команд в outcomes_score.py
-        # (чтобы не засорять меню неправильными /командами)
+        # --- Outcomes Score ---
+        BotCommand("out_score", "Outcomes Score: статистика по событиям"),
     ]
 
     await app.bot.set_my_commands(commands)
