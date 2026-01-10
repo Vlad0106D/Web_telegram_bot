@@ -12,6 +12,16 @@ log = logging.getLogger(__name__)
 
 # Минимум кейсов, чтобы показывать строку (защита от шума)
 MIN_CASES_DEFAULT = 5
+SUPPORTED_HORIZONS = {"1h", "4h", "1d"}
+
+
+def _escape_html(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
 
 
 def _bias_ru(bias: str) -> str:
@@ -31,30 +41,30 @@ def _fmt_pct(x: float) -> str:
 def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) -> str:
     rows = [r for r in rows if r.cases >= min_cases]
 
-    if not rows:
-        return (
-            "📊 *Outcomes Score*\n"
-            f"Горизонт: *{horizon}*\n\n"
-            "Нет данных (или слишком мало кейсов)."
-        )
+    header = (
+        "📊 <b>Outcomes Score</b>\n"
+        f"⏱ Горизонт: <code>{_escape_html(horizon)}</code>\n"
+        f"🧪 Фильтр: кейсы ≥ <b>{min_cases}</b>\n"
+    )
 
-    lines = []
-    lines.append("📊 *Outcomes Score*")
-    lines.append(f"Горизонт: *{horizon}*")
-    lines.append(f"Фильтр: cases ≥ *{min_cases}*")
-    lines.append("")
-    lines.append("Топ-события по силе движения (avg_up/avg_down):")
-    lines.append("")
+    if not rows:
+        return header + "\n<i>Нет данных (или слишком мало кейсов).</i>"
+
+    lines: List[str] = [header, "\n<b>Топ событий по “силе движения”</b> (средние движения):\n"]
 
     for i, r in enumerate(rows, start=1):
+        ev = _escape_html(r.event_type)
+        tf = _escape_html(r.tf)
+
         lines.append(
-            f"*{i}.* `{r.event_type}` | TF=`{r.tf}` | cases=*{r.cases}* | {r.confidence}\n"
-            f"  • avg_up: *{_fmt_pct(r.avg_up_pct)}*\n"
-            f"  • avg_down: *{_fmt_pct(r.avg_down_pct)}*\n"
-            f"  • winrate: *{_fmt_pct(r.winrate_pct)}*\n"
-            f"  • bias: {_bias_ru(r.bias)}"
+            f"#{i} • <code>{ev}</code>  <i>(TF: <code>{tf}</code>)</i>\n"
+            f"Кейсов: <b>{r.cases}</b> • Достоверность: <b>{_escape_html(r.confidence)}</b>\n"
+            f"— Средний ход вверх (MFE): <b>{_fmt_pct(r.avg_up_pct)}</b>\n"
+            f"— Средний ход вниз (MAE): <b>{_fmt_pct(r.avg_down_pct)}</b>\n"
+            f"— Winrate (close&gt;0): <b>{_fmt_pct(r.winrate_pct)}</b>\n"
+            f"— Смещение: <b>{_escape_html(_bias_ru(r.bias))}</b>\n"
+            "────────────"
         )
-        lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -62,30 +72,32 @@ def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) 
 def _render_detail(rows: List[OutcomeScoreRow], horizon: str, event_type: str, min_cases: int) -> str:
     rows = [r for r in rows if r.cases >= min_cases]
 
-    if not rows:
-        return (
-            "📌 *Outcomes Detail*\n"
-            f"Событие: `{event_type}`\n"
-            f"Горизонт: *{horizon}*\n\n"
-            "Нет данных (или слишком мало кейсов)."
-        )
+    ev = _escape_html(event_type)
+    hz = _escape_html(horizon)
 
-    lines = []
-    lines.append("📌 *Outcomes Detail*")
-    lines.append(f"Событие: `{event_type}`")
-    lines.append(f"Горизонт: *{horizon}*")
-    lines.append(f"Фильтр: cases ≥ *{min_cases}*")
-    lines.append("")
+    header = (
+        "📌 <b>Outcomes Detail</b>\n"
+        f"Событие: <code>{ev}</code>\n"
+        f"⏱ Горизонт: <code>{hz}</code>\n"
+        f"🧪 Фильтр: кейсы ≥ <b>{min_cases}</b>\n"
+    )
+
+    if not rows:
+        return header + "\n<i>Нет данных (или слишком мало кейсов).</i>"
+
+    lines: List[str] = [header, "\n<b>Разбивка по TF:</b>\n"]
 
     for r in rows:
+        tf = _escape_html(r.tf)
         lines.append(
-            f"TF=`{r.tf}` | cases=*{r.cases}* | {r.confidence}\n"
-            f"• avg_up: *{_fmt_pct(r.avg_up_pct)}*\n"
-            f"• avg_down: *{_fmt_pct(r.avg_down_pct)}*\n"
-            f"• winrate: *{_fmt_pct(r.winrate_pct)}*\n"
-            f"• bias: {_bias_ru(r.bias)}"
+            f"TF: <code>{tf}</code>\n"
+            f"Кейсов: <b>{r.cases}</b> • Достоверность: <b>{_escape_html(r.confidence)}</b>\n"
+            f"— Средний ход вверх (MFE): <b>{_fmt_pct(r.avg_up_pct)}</b>\n"
+            f"— Средний ход вниз (MAE): <b>{_fmt_pct(r.avg_down_pct)}</b>\n"
+            f"— Winrate (close&gt;0): <b>{_fmt_pct(r.winrate_pct)}</b>\n"
+            f"— Смещение: <b>{_escape_html(_bias_ru(r.bias))}</b>\n"
+            "────────────"
         )
-        lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -105,7 +117,10 @@ async def cmd_out_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     event_type: Optional[str] = None
 
     if len(args) >= 1:
-        horizon = str(args[0]).lower()
+        horizon = str(args[0]).lower().strip()
+
+    if horizon not in SUPPORTED_HORIZONS:
+        horizon = "1h"
 
     if len(args) >= 2:
         try:
@@ -127,13 +142,13 @@ async def cmd_out_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         await update.effective_message.reply_text(
             text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             disable_web_page_preview=True,
         )
 
     except Exception:
         log.exception("cmd_out_score failed")
-        await update.effective_message.reply_text("❌ Ошибка при расчёте Outcomes Score. Смотри логи.")
+        await update.effective_message.reply_text("❌ Ошибка при расчёте Outcomes Score. Смотри логи.", parse_mode="HTML")
 
 
 def register_outcomes_score_handlers(app: Application) -> None:
