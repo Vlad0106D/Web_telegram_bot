@@ -11,6 +11,13 @@ from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
 from bot.watcher import schedule_watcher_jobs
 
+# ✅ Outcomes Score (новый модуль) — подключаем безопасно, чтобы бот не падал если файла нет
+try:
+    from bot.outcomes_score import register_outcomes_score_handlers
+except Exception as ex:
+    register_outcomes_score_handlers = None  # type: ignore
+    logging.getLogger("main").warning("outcomes_score not available: %r", ex)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -78,6 +85,9 @@ async def _post_init(app: Application) -> None:
         BotCommand("out_on", "Outcomes: включить авто-расчёт"),
         BotCommand("out_off", "Outcomes: выключить"),
         BotCommand("out_status", "Outcomes: статус"),
+
+        # ⚠️ Outcomes Score команды добавим позже, когда ты точно скажешь названия команд в outcomes_score.py
+        # (чтобы не засорять меню неправильными /командами)
     ]
 
     await app.bot.set_my_commands(commands)
@@ -102,10 +112,25 @@ def main() -> None:
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
+    # ✅ Outcomes Score handlers
+    if register_outcomes_score_handlers is not None:
+        try:
+            register_outcomes_score_handlers(app)
+            log.info("Outcomes score handlers registered via bot.outcomes_score.register_outcomes_score_handlers()")
+        except Exception:
+            log.exception("Failed to register outcomes_score handlers")
+    else:
+        log.warning("Outcomes score handlers not registered (module not available)")
+
     # Планирование вотчера (основного, не MM)
     tfs = _normalize_tfs(WATCHER_TFS)
-    log.info("WATCHER_ENABLED=%s | WATCHER_INTERVAL_SEC=%s | WATCHER_TFS=%r -> %s",
-             WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS, tfs)
+    log.info(
+        "WATCHER_ENABLED=%s | WATCHER_INTERVAL_SEC=%s | WATCHER_TFS=%r -> %s",
+        WATCHER_ENABLED,
+        WATCHER_INTERVAL_SEC,
+        WATCHER_TFS,
+        tfs,
+    )
 
     if WATCHER_ENABLED:
         try:
