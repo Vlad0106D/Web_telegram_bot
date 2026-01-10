@@ -34,6 +34,64 @@ OUT_INTERVAL_SEC_DEFAULT = 60
 OUT_BATCH_DEFAULT = 25
 
 
+# -------------------- TF helpers --------------------
+
+_ALLOWED_TF = {"1h", "4h", "1d", "1w"}
+
+
+def _normalize_tf(tf: Any) -> Optional[str]:
+    if tf is None:
+        return None
+    try:
+        s = str(tf).strip().lower()
+    except Exception:
+        return None
+
+    # нормализации на всякий
+    s = s.replace(" ", "")
+    if s in _ALLOWED_TF:
+        return s
+
+    # варианты типа "H1", "4H", "D1"
+    if s in {"h1", "1hour", "1hr"}:
+        return "1h"
+    if s in {"h4", "4hour", "4hr"}:
+        return "4h"
+    if s in {"d1", "1day"}:
+        return "1d"
+    if s in {"w1", "1week"}:
+        return "1w"
+
+    return None
+
+
+def _tf_for_event(e: Any) -> str:
+    """
+    Главная логика: outcomes должны считаться в TF события (e.tf).
+    Если tf нет — пытаемся вывести из source_mode (если он есть).
+    Иначе fallback 1h (но логируем, чтобы не пропустить).
+    """
+    tf = _normalize_tf(getattr(e, "tf", None))
+    if tf:
+        return tf
+
+    # на случай если в модели событий есть source_mode
+    sm = getattr(e, "source_mode", None)
+    if sm:
+        s = str(sm).lower()
+        if s.startswith("h1_"):
+            return "1h"
+        if s.startswith("h4_"):
+            return "4h"
+        if s.startswith("daily_"):
+            return "1d"
+        if s.startswith("weekly_"):
+            return "1w"
+
+    log.warning("Event has no tf (fallback to 1h). event_id=%s", getattr(e, "id", "?"))
+    return "1h"
+
+
 def _ensure_out_state(app: Application) -> Dict[str, Any]:
     st = app.bot_data.setdefault("outcomes", {})
     st.setdefault("enabled", False)
@@ -87,10 +145,12 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         for e in events:
             try:
+                tf_for_calc = _tf_for_event(e)
+
                 res = await calc_event_outcomes(
                     symbol=e.symbol,
                     event_ts_utc=e.ts_utc,
-                    tf_for_calc="1h",
+                    tf_for_calc=tf_for_calc,  # ✅ ВАЖНО: больше не хардкодим 1h
                 )
 
                 # пишем outcomes по горизонтам
@@ -107,7 +167,6 @@ async def _out_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     wrote_for_event += 1
 
-                # ✅ processed считаем только если реально что-то попытались записать
                 processed += 1
                 written += wrote_for_event
 
