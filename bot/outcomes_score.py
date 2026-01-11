@@ -41,9 +41,9 @@ def _fmt_pct(x: float) -> str:
 def _get_market_regime(row: Any) -> Optional[str]:
     """
     Достаём режим рынка из результата score_pg, если он там есть.
-    Поддерживаем разные возможные имена поля, чтобы не ломать совместимость.
+    Поддерживаем разные имена поля, чтобы не ломать совместимость.
     """
-    for key in ("market_regime", "regime", "trend_regime", "mode"):
+    for key in ("dominant_regime", "market_regime", "regime", "trend_regime", "mode"):
         try:
             v = getattr(row, key, None)
             if v:
@@ -53,14 +53,41 @@ def _get_market_regime(row: Any) -> Optional[str]:
     return None
 
 
+def _get_regime_conf(row: Any) -> Optional[float]:
+    for key in ("regime_conf", "market_regime_conf", "confidence_regime"):
+        try:
+            v = getattr(row, key, None)
+            if v is None:
+                continue
+            return float(v)
+        except Exception:
+            pass
+    return None
+
+
+def _get_regime_share_pct(row: Any) -> Optional[float]:
+    for key in ("regime_share_pct", "market_regime_share_pct", "regime_share"):
+        try:
+            v = getattr(row, key, None)
+            if v is None:
+                continue
+            return float(v)
+        except Exception:
+            pass
+    return None
+
+
 def _regime_ru(reg: str) -> str:
-    r = (reg or "").lower().strip()
-    if r in ("up", "bull", "trend_up"):
+    r = (reg or "").upper().strip()
+
+    if r in ("TREND_UP", "UP", "BULL"):
         return "📈 Тренд вверх"
-    if r in ("down", "bear", "trend_down"):
+    if r in ("TREND_DOWN", "DOWN", "BEAR"):
         return "📉 Тренд вниз"
-    if r in ("range", "flat", "sideways"):
+    if r in ("RANGE", "FLAT", "SIDEWAYS"):
         return "↔️ Рейндж"
+
+    # на случай новых режимов в будущем
     return f"🧭 {reg}"
 
 
@@ -68,7 +95,18 @@ def _render_regime_line(row: Any) -> str:
     reg = _get_market_regime(row)
     if not reg:
         return ""  # режима нет — ничего не показываем
-    return f"🧭 Режим рынка: <b>{_escape_html(_regime_ru(reg))}</b>\n"
+
+    conf = _get_regime_conf(row)          # 0..1
+    share = _get_regime_share_pct(row)    # 0..100
+
+    extra = []
+    if conf is not None:
+        extra.append(f"conf={conf:.2f}")
+    if share is not None:
+        extra.append(f"share={share:.0f}%")
+
+    suffix = f" <i>({', '.join(extra)})</i>" if extra else ""
+    return f"🧭 Режим рынка: <b>{_escape_html(_regime_ru(reg))}</b>{suffix}\n"
 
 
 def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) -> str:
@@ -88,7 +126,6 @@ def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) 
     for i, r in enumerate(rows, start=1):
         ev = _escape_html(r.event_type)
         tf = _escape_html(r.tf)
-
         regime_line = _render_regime_line(r)
 
         lines.append(
@@ -142,13 +179,6 @@ def _render_detail(rows: List[OutcomeScoreRow], horizon: str, event_type: str, m
 
 
 async def cmd_out_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /out_score
-    /out_score 1h
-    /out_score 1h 10
-    /out_score 1h 10 SWEEP
-    /out_score 1h 5 "stage_change"
-    """
     args = context.args or []
 
     horizon = "1h"
@@ -168,7 +198,6 @@ async def cmd_out_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             min_cases = MIN_CASES_DEFAULT
 
     if len(args) >= 3:
-        # всё остальное склеиваем как event_type (может быть с пробелами)
         event_type = " ".join(args[2:]).strip().strip('"').strip("'")
 
     try:
