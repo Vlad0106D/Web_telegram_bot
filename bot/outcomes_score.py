@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, CommandHandler
@@ -38,6 +38,39 @@ def _fmt_pct(x: float) -> str:
     return f"{x:.2f}%"
 
 
+def _get_market_regime(row: Any) -> Optional[str]:
+    """
+    Достаём режим рынка из результата score_pg, если он там есть.
+    Поддерживаем разные возможные имена поля, чтобы не ломать совместимость.
+    """
+    for key in ("market_regime", "regime", "trend_regime", "mode"):
+        try:
+            v = getattr(row, key, None)
+            if v:
+                return str(v)
+        except Exception:
+            pass
+    return None
+
+
+def _regime_ru(reg: str) -> str:
+    r = (reg or "").lower().strip()
+    if r in ("up", "bull", "trend_up"):
+        return "📈 Тренд вверх"
+    if r in ("down", "bear", "trend_down"):
+        return "📉 Тренд вниз"
+    if r in ("range", "flat", "sideways"):
+        return "↔️ Рейндж"
+    return f"🧭 {reg}"
+
+
+def _render_regime_line(row: Any) -> str:
+    reg = _get_market_regime(row)
+    if not reg:
+        return ""  # режима нет — ничего не показываем
+    return f"🧭 Режим рынка: <b>{_escape_html(_regime_ru(reg))}</b>\n"
+
+
 def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) -> str:
     rows = [r for r in rows if r.cases >= min_cases]
 
@@ -56,8 +89,11 @@ def _render_overview(rows: List[OutcomeScoreRow], horizon: str, min_cases: int) 
         ev = _escape_html(r.event_type)
         tf = _escape_html(r.tf)
 
+        regime_line = _render_regime_line(r)
+
         lines.append(
             f"#{i} • <code>{ev}</code>  <i>(TF: <code>{tf}</code>)</i>\n"
+            f"{regime_line}"
             f"Кейсов: <b>{r.cases}</b> • Достоверность: <b>{_escape_html(r.confidence)}</b>\n"
             f"— Средний ход вверх (MFE): <b>{_fmt_pct(r.avg_up_pct)}</b>\n"
             f"— Средний ход вниз (MAE): <b>{_fmt_pct(r.avg_down_pct)}</b>\n"
@@ -89,8 +125,11 @@ def _render_detail(rows: List[OutcomeScoreRow], horizon: str, event_type: str, m
 
     for r in rows:
         tf = _escape_html(r.tf)
+        regime_line = _render_regime_line(r)
+
         lines.append(
             f"TF: <code>{tf}</code>\n"
+            f"{regime_line}"
             f"Кейсов: <b>{r.cases}</b> • Достоверность: <b>{_escape_html(r.confidence)}</b>\n"
             f"— Средний ход вверх (MFE): <b>{_fmt_pct(r.avg_up_pct)}</b>\n"
             f"— Средний ход вниз (MAE): <b>{_fmt_pct(r.avg_down_pct)}</b>\n"
@@ -148,7 +187,10 @@ async def cmd_out_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     except Exception:
         log.exception("cmd_out_score failed")
-        await update.effective_message.reply_text("❌ Ошибка при расчёте Outcomes Score. Смотри логи.", parse_mode="HTML")
+        await update.effective_message.reply_text(
+            "❌ Ошибка при расчёте Outcomes Score. Смотри логи.",
+            parse_mode="HTML",
+        )
 
 
 def register_outcomes_score_handlers(app: Application) -> None:
