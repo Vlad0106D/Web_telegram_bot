@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, List, Sequence
 
 from psycopg_pool import AsyncConnectionPool
@@ -61,6 +62,105 @@ class OutcomeScoreRow:
     bias: str
     confidence: str
 
+
+# ====== Market Regime (NEW) ======
+
+@dataclass
+class MarketRegimeRow:
+    symbol: str
+    tf: str
+    ts_utc: datetime
+    regime: str
+    confidence: float
+    source: Optional[str] = None
+    version: Optional[str] = None
+
+
+async def get_regime_at(
+    *,
+    symbol: str,
+    tf: str,
+    ts_utc: datetime,
+) -> Optional[MarketRegimeRow]:
+    """
+    Возвращает режим рынка на момент ts_utc:
+    берём последнюю запись из public.mm_market_regimes с ts_utc <= заданного времени.
+    """
+    p = await _pool()
+
+    sql = """
+    SELECT
+      symbol,
+      tf,
+      ts_utc,
+      regime,
+      confidence,
+      source,
+      version
+    FROM public.mm_market_regimes
+    WHERE
+      symbol = %s
+      AND tf = %s
+      AND ts_utc <= %s
+    ORDER BY ts_utc DESC
+    LIMIT 1
+    """
+
+    async with p.connection() as conn:
+        cur = await conn.execute(sql, (str(symbol).upper(), str(tf), ts_utc))
+        row = await cur.fetchone()
+
+    if not row:
+        return None
+
+    return MarketRegimeRow(
+        symbol=str(row[0]),
+        tf=str(row[1]),
+        ts_utc=row[2],
+        regime=str(row[3]),
+        confidence=float(row[4] or 0.0),
+        source=(str(row[5]) if row[5] is not None else None),
+        version=(str(row[6]) if row[6] is not None else None),
+    )
+
+
+async def get_regime_for_event(
+    *,
+    event_id: int,
+) -> Optional[MarketRegimeRow]:
+    """
+    Находит режим рынка для конкретного event_id:
+    1) берём (symbol, tf, ts_utc) из mm_events
+    2) ищем режим в mm_market_regimes на момент события (последний <= ts_utc)
+    """
+    p = await _pool()
+
+    sql = """
+    SELECT e.symbol, e.tf, e.ts_utc
+    FROM public.mm_events e
+    WHERE e.id = %s
+    LIMIT 1
+    """
+
+    async with p.connection() as conn:
+        cur = await conn.execute(sql, (int(event_id),))
+        row = await cur.fetchone()
+
+    if not row:
+        return None
+
+    symbol = str(row[0])
+    tf = str(row[1])
+    ts_utc = row[2]  # timestamp with time zone
+
+    try:
+        return await get_regime_at(symbol=symbol, tf=tf, ts_utc=ts_utc)
+    except Exception:
+        log.exception("get_regime_for_event failed for event_id=%s", event_id)
+        return None
+
+
+# ====== Outcomes score ======
 
 async def score_overview(
     *,
