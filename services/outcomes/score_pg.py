@@ -218,7 +218,7 @@ async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[Outcom
         COUNT(*) AS cases,
         SUM(w)   AS cases_eff,
 
-        -- weighted averages (%)
+        -- weighted averages (percent)
         (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
         (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
         (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
