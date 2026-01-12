@@ -16,6 +16,14 @@ _LOCK = asyncio.Lock()
 
 DEFAULT_HORIZONS: Sequence[str] = ("1h", "4h", "1d")
 
+# Time-decay (апгрейд #2)
+# tau = “период полураспада” (в днях) — чем больше, тем мягче забывание.
+DECAY_TAU_DAYS = {
+    "1h": 14,
+    "4h": 30,
+    "1d": 90,
+}
+
 
 def _dsn() -> str:
     dsn = (os.getenv("DATABASE_URL") or "").strip().strip("'").strip('"')
@@ -43,6 +51,7 @@ async def _pool() -> AsyncConnectionPool:
 
 
 def _confidence(cases: int) -> str:
+    # ВАЖНО: confidence по raw cases — не меняем чувствительность “как раньше”.
     if cases >= 50:
         return "ВЫСОКАЯ 🟢"
     if cases >= 20:
@@ -50,25 +59,41 @@ def _confidence(cases: int) -> str:
     return "НИЗКАЯ 🟡"
 
 
+def _tau_seconds_for(horizon: str) -> int:
+    hz = (horizon or "").lower().strip()
+    days = DECAY_TAU_DAYS.get(hz, 14)
+    return int(days * 24 * 3600)
+
+
 @dataclass
 class OutcomeScoreRow:
     event_type: str
     tf: str
     horizon: str
+
+    # raw cases
     cases: int
-    avg_up_pct: float
-    avg_down_pct: float
-    winrate_pct: float
-    bias: str
-    confidence: str
 
-    # NEW: режим рынка (доминирующий) для данной выборки
-    dominant_regime: Optional[str] = None          # TREND_UP / TREND_DOWN / RANGE
-    regime_conf: Optional[float] = None            # 0..1 (avg confidence)
-    regime_share_pct: Optional[float] = None       # 0..100 (% кейсов в доминирующем режиме)
+    # NEW: эффективное число кейсов (взвешенное time-decay)
+    cases_eff: Optional[float] = None
+
+    # метрики (в процентах)
+    avg_up_pct: float = 0.0
+    avg_down_pct: float = 0.0
+    winrate_pct: float = 0.0
+
+    bias: str = "neutral"
+    confidence: str = "НИЗКАЯ 🟡"
+
+    # NEW: режим рынка (доминирующий) + его conf + доля (share)
+    # Чтобы не ломать рендеры, даём оба имени: market_regime и dominant_regime.
+    market_regime: Optional[str] = None          # TREND_UP / TREND_DOWN / RANGE
+    dominant_regime: Optional[str] = None        # alias
+    regime_conf: Optional[float] = None          # 0..1 (weighted avg)
+    regime_share_pct: Optional[float] = None     # 0..100 (% по весам)
 
 
-# ====== Market Regime helpers (optional, may be useful elsewhere) ======
+# ====== Market Regime helpers (optional) ======
 
 @dataclass
 class MarketRegimeRow:
@@ -81,36 +106,16 @@ class MarketRegimeRow:
     version: Optional[str] = None
 
 
-async def get_regime_at(
-    *,
-    symbol: str,
-    tf: str,
-    ts_utc: datetime,
-) -> Optional[MarketRegimeRow]:
-    """
-    Возвращает режим рынка на момент ts_utc:
-    берём последнюю запись из public.mm_market_regimes с ts_utc <= заданного времени.
-    """
+async def get_regime_at(*, symbol: str, tf: str, ts_utc: datetime) -> Optional[MarketRegimeRow]:
     p = await _pool()
-
     sql = """
     SELECT
-      symbol,
-      tf,
-      ts_utc,
-      regime,
-      confidence,
-      source,
-      version
+      symbol, tf, ts_utc, regime, confidence, source, version
     FROM public.mm_market_regimes
-    WHERE
-      symbol = %s
-      AND tf = %s
-      AND ts_utc <= %s
+    WHERE symbol = %s AND tf = %s AND ts_utc <= %s
     ORDER BY ts_utc DESC
     LIMIT 1
     """
-
     async with p.connection() as conn:
         cur = await conn.execute(sql, (str(symbol).upper(), str(tf), ts_utc))
         row = await cur.fetchone()
@@ -130,20 +135,13 @@ async def get_regime_at(
 
 
 async def get_regime_for_event(*, event_id: int) -> Optional[MarketRegimeRow]:
-    """
-    Находит режим рынка для конкретного event_id:
-    1) берём (symbol, tf, ts_utc) из mm_events
-    2) ищем режим в mm_market_regimes на момент события (последний <= ts_utc)
-    """
     p = await _pool()
-
     sql = """
     SELECT e.symbol, e.tf, e.ts_utc
     FROM public.mm_events e
     WHERE e.id = %s
     LIMIT 1
     """
-
     async with p.connection() as conn:
         cur = await conn.execute(sql, (int(event_id),))
         row = await cur.fetchone()
@@ -162,19 +160,18 @@ async def get_regime_for_event(*, event_id: int) -> Optional[MarketRegimeRow]:
         return None
 
 
-# ====== Outcomes score (with market regime annotation) ======
+# ====== Outcomes score (market regime + time-decay) ======
 
-async def score_overview(
-    *,
-    horizon: str = "1h",
-    limit: int = 20,
-) -> List[OutcomeScoreRow]:
+async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[OutcomeScoreRow]:
     """
     Рейтинг типов событий: группируем по (event_type, tf, horizon).
     Берём только outcome_type='ok' и не-NULL метрики.
-    Дополнительно: подтягиваем режим рынка из public.mm_market_regimes (last <= event ts).
+
+    Апгрейд #1: доминирующий режим рынка (mm_market_regimes: last <= event ts) + conf + share.
+    Апгрейд #2: time-decay (w=exp(-age/tau)) -> cases_eff + weighted avg метрик.
     """
     p = await _pool()
+    tau_s = _tau_seconds_for(horizon)
 
     sql = """
     WITH base AS (
@@ -185,20 +182,26 @@ async def score_overview(
         o.max_up_pct,
         o.max_down_pct,
         o.close_pct,
+
+        -- time-decay weight
+        exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
+
         mr.regime AS market_regime,
         mr.confidence AS market_regime_conf
       FROM public.mm_outcomes o
       JOIN public.mm_events e ON e.id = o.event_id
+
+      -- режим на момент события (last <= ts_utc)
       LEFT JOIN LATERAL (
         SELECT r.regime, r.confidence
         FROM public.mm_market_regimes r
-        WHERE
-          r.symbol = e.symbol
+        WHERE r.symbol = e.symbol
           AND r.tf = e.tf
           AND r.ts_utc <= e.ts_utc
         ORDER BY r.ts_utc DESC
         LIMIT 1
       ) mr ON TRUE
+
       WHERE
         o.horizon = %s
         AND o.outcome_type = 'ok'
@@ -206,54 +209,64 @@ async def score_overview(
         AND o.max_down_pct IS NOT NULL
         AND o.close_pct IS NOT NULL
     ),
+
     agg AS (
       SELECT
         event_type,
         tf,
         horizon,
         COUNT(*) AS cases,
-        AVG(max_up_pct) * 100.0 AS avg_up_pct,
-        AVG(max_down_pct) * 100.0 AS avg_down_pct,
-        AVG(CASE WHEN close_pct > 0 THEN 1 ELSE 0 END) * 100.0 AS winrate_pct
+        SUM(w)   AS cases_eff,
+
+        -- weighted averages (%)
+        (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+        (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+        (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
       FROM base
       GROUP BY event_type, tf, horizon
     ),
+
     reg_counts AS (
       SELECT
         event_type,
         tf,
         horizon,
         market_regime,
-        COUNT(*) AS reg_cases,
-        AVG(COALESCE(market_regime_conf, 0.0)) AS reg_conf
+        SUM(w) AS reg_eff,
+        -- weighted avg conf по режиму
+        (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
       FROM base
       WHERE market_regime IS NOT NULL
       GROUP BY event_type, tf, horizon, market_regime
     ),
+
     reg_top AS (
       SELECT DISTINCT ON (event_type, tf, horizon)
         event_type,
         tf,
         horizon,
         market_regime AS dominant_regime,
-        reg_cases,
+        reg_eff,
         reg_conf
       FROM reg_counts
-      ORDER BY event_type, tf, horizon, reg_cases DESC
+      ORDER BY event_type, tf, horizon, reg_eff DESC
     )
+
     SELECT
       a.event_type,
       a.tf,
       a.horizon,
       a.cases,
+      a.cases_eff,
       a.avg_up_pct,
       a.avg_down_pct,
       a.winrate_pct,
+
       t.dominant_regime,
       t.reg_conf AS regime_conf,
       CASE
-        WHEN t.reg_cases IS NULL OR a.cases = 0 THEN NULL
-        ELSE (t.reg_cases * 100.0 / a.cases)
+        WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
+        ELSE (t.reg_eff * 100.0 / a.cases_eff)
       END AS regime_share_pct
     FROM agg a
     LEFT JOIN reg_top t
@@ -263,7 +276,7 @@ async def score_overview(
     """
 
     async with p.connection() as conn:
-        cur = await conn.execute(sql, (str(horizon), int(limit)))
+        cur = await conn.execute(sql, (float(tau_s), str(horizon), int(limit)))
         rows = await cur.fetchall()
 
     out: List[OutcomeScoreRow] = []
@@ -272,13 +285,15 @@ async def score_overview(
         tf = str(r[1])
         hz = str(r[2])
         cases = int(r[3])
-        avg_up = float(r[4] or 0.0)
-        avg_down = float(r[5] or 0.0)
-        winrate = float(r[6] or 0.0)
+        cases_eff = float(r[4]) if r[4] is not None else None
 
-        dominant_regime = (str(r[7]) if r[7] is not None else None)
-        regime_conf = (float(r[8]) if r[8] is not None else None)
-        regime_share_pct = (float(r[9]) if r[9] is not None else None)
+        avg_up = float(r[5] or 0.0)
+        avg_down = float(r[6] or 0.0)
+        winrate = float(r[7] or 0.0)
+
+        dom_reg = (str(r[8]) if r[8] is not None else None)
+        reg_conf = (float(r[9]) if r[9] is not None else None)
+        reg_share = (float(r[10]) if r[10] is not None else None)
 
         bias = "neutral"
         if abs(avg_up) > abs(avg_down):
@@ -292,29 +307,30 @@ async def score_overview(
                 tf=tf,
                 horizon=hz,
                 cases=cases,
+                cases_eff=cases_eff,
                 avg_up_pct=avg_up,
                 avg_down_pct=avg_down,
                 winrate_pct=winrate,
                 bias=bias,
                 confidence=_confidence(cases),
-                dominant_regime=dominant_regime,
-                regime_conf=regime_conf,
-                regime_share_pct=regime_share_pct,
+
+                # оба имени для совместимости с рендерами
+                market_regime=dom_reg,
+                dominant_regime=dom_reg,
+                regime_conf=reg_conf,
+                regime_share_pct=reg_share,
             )
         )
     return out
 
 
-async def score_detail(
-    *,
-    event_type: str,
-    horizon: str = "1h",
-) -> List[OutcomeScoreRow]:
+async def score_detail(*, event_type: str, horizon: str = "1h") -> List[OutcomeScoreRow]:
     """
     Детально по одному event_type: разбиваем по TF внутри указанного horizon.
-    Дополнительно: доминирующий режим рынка для каждой (event_type, tf, horizon).
+    Апгрейды #1/#2 аналогично score_overview.
     """
     p = await _pool()
+    tau_s = _tau_seconds_for(horizon)
 
     sql = """
     WITH base AS (
@@ -325,6 +341,9 @@ async def score_detail(
         o.max_up_pct,
         o.max_down_pct,
         o.close_pct,
+
+        exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
+
         mr.regime AS market_regime,
         mr.confidence AS market_regime_conf
       FROM public.mm_outcomes o
@@ -332,8 +351,7 @@ async def score_detail(
       LEFT JOIN LATERAL (
         SELECT r.regime, r.confidence
         FROM public.mm_market_regimes r
-        WHERE
-          r.symbol = e.symbol
+        WHERE r.symbol = e.symbol
           AND r.tf = e.tf
           AND r.ts_utc <= e.ts_utc
         ORDER BY r.ts_utc DESC
@@ -347,54 +365,61 @@ async def score_detail(
         AND o.max_down_pct IS NOT NULL
         AND o.close_pct IS NOT NULL
     ),
+
     agg AS (
       SELECT
         event_type,
         tf,
         horizon,
         COUNT(*) AS cases,
-        AVG(max_up_pct) * 100.0 AS avg_up_pct,
-        AVG(max_down_pct) * 100.0 AS avg_down_pct,
-        AVG(CASE WHEN close_pct > 0 THEN 1 ELSE 0 END) * 100.0 AS winrate_pct
+        SUM(w)   AS cases_eff,
+        (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+        (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+        (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
       FROM base
       GROUP BY event_type, tf, horizon
     ),
+
     reg_counts AS (
       SELECT
         event_type,
         tf,
         horizon,
         market_regime,
-        COUNT(*) AS reg_cases,
-        AVG(COALESCE(market_regime_conf, 0.0)) AS reg_conf
+        SUM(w) AS reg_eff,
+        (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
       FROM base
       WHERE market_regime IS NOT NULL
       GROUP BY event_type, tf, horizon, market_regime
     ),
+
     reg_top AS (
       SELECT DISTINCT ON (event_type, tf, horizon)
         event_type,
         tf,
         horizon,
         market_regime AS dominant_regime,
-        reg_cases,
+        reg_eff,
         reg_conf
       FROM reg_counts
-      ORDER BY event_type, tf, horizon, reg_cases DESC
+      ORDER BY event_type, tf, horizon, reg_eff DESC
     )
+
     SELECT
       a.event_type,
       a.tf,
       a.horizon,
       a.cases,
+      a.cases_eff,
       a.avg_up_pct,
       a.avg_down_pct,
       a.winrate_pct,
+
       t.dominant_regime,
       t.reg_conf AS regime_conf,
       CASE
-        WHEN t.reg_cases IS NULL OR a.cases = 0 THEN NULL
-        ELSE (t.reg_cases * 100.0 / a.cases)
+        WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
+        ELSE (t.reg_eff * 100.0 / a.cases_eff)
       END AS regime_share_pct
     FROM agg a
     LEFT JOIN reg_top t
@@ -403,7 +428,7 @@ async def score_detail(
     """
 
     async with p.connection() as conn:
-        cur = await conn.execute(sql, (str(horizon), str(event_type)))
+        cur = await conn.execute(sql, (float(tau_s), str(horizon), str(event_type)))
         rows = await cur.fetchall()
 
     out: List[OutcomeScoreRow] = []
@@ -412,13 +437,15 @@ async def score_detail(
         tf = str(r[1])
         hz = str(r[2])
         cases = int(r[3])
-        avg_up = float(r[4] or 0.0)
-        avg_down = float(r[5] or 0.0)
-        winrate = float(r[6] or 0.0)
+        cases_eff = float(r[4]) if r[4] is not None else None
 
-        dominant_regime = (str(r[7]) if r[7] is not None else None)
-        regime_conf = (float(r[8]) if r[8] is not None else None)
-        regime_share_pct = (float(r[9]) if r[9] is not None else None)
+        avg_up = float(r[5] or 0.0)
+        avg_down = float(r[6] or 0.0)
+        winrate = float(r[7] or 0.0)
+
+        dom_reg = (str(r[8]) if r[8] is not None else None)
+        reg_conf = (float(r[9]) if r[9] is not None else None)
+        reg_share = (float(r[10]) if r[10] is not None else None)
 
         bias = "neutral"
         if abs(avg_up) > abs(avg_down):
@@ -432,14 +459,17 @@ async def score_detail(
                 tf=tf,
                 horizon=hz,
                 cases=cases,
+                cases_eff=cases_eff,
                 avg_up_pct=avg_up,
                 avg_down_pct=avg_down,
                 winrate_pct=winrate,
                 bias=bias,
                 confidence=_confidence(cases),
-                dominant_regime=dominant_regime,
-                regime_conf=regime_conf,
-                regime_share_pct=regime_share_pct,
+
+                market_regime=dom_reg,
+                dominant_regime=dom_reg,
+                regime_conf=reg_conf,
+                regime_share_pct=reg_share,
             )
         )
     return out
