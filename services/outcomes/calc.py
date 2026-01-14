@@ -5,7 +5,7 @@ import asyncio
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Tuple, Optional
 
 from psycopg_pool import AsyncConnectionPool
@@ -93,15 +93,18 @@ async def _fetch_price0_from_db(
     """
     price0 = close свечи, которая начинается в t0 (если есть),
     иначе close последней свечи ДО t0.
+
+    ВАЖНО: используем только mm_snapshots и только exchange='okx'.
     """
     p = await _pool()
     sql = """
     SELECT close
     FROM public.mm_snapshots
     WHERE symbol = %s
+      AND exchange = 'okx'
       AND timeframe = %s
-      AND ts_utc <= %s
-    ORDER BY ts_utc DESC
+      AND ts <= %s
+    ORDER BY ts DESC
     LIMIT 1
     """
     async with p.connection() as conn:
@@ -128,6 +131,8 @@ async def _fetch_window_stats_from_db(
       - max_high
       - min_low
       - close_end: close последней свечи <= end_dt
+
+    ВАЖНО: только exchange='okx'
     """
     p = await _pool()
 
@@ -137,18 +142,20 @@ async def _fetch_window_stats_from_db(
       MIN(low)  AS min_low
     FROM public.mm_snapshots
     WHERE symbol = %s
+      AND exchange = 'okx'
       AND timeframe = %s
-      AND ts_utc > %s
-      AND ts_utc <= %s
+      AND ts > %s
+      AND ts <= %s
     """
 
     sql_close = """
     SELECT close
     FROM public.mm_snapshots
     WHERE symbol = %s
+      AND exchange = 'okx'
       AND timeframe = %s
-      AND ts_utc <= %s
-    ORDER BY ts_utc DESC
+      AND ts <= %s
+    ORDER BY ts DESC
     LIMIT 1
     """
 
@@ -207,7 +214,6 @@ async def calc_event_outcomes(
                 out[h] = (None, None, None, "error_no_price0")
             return out
 
-        # Для каждого горизонта берём окно (event_ts; event_ts + horizon]
         for h, sec in _HORIZONS_SEC.items():
             end_dt = event_ts_utc + timedelta(seconds=int(sec))
 
@@ -241,7 +247,3 @@ async def calc_event_outcomes(
     except Exception:
         log.exception("calc_event_outcomes failed (DB-only): %s %s", symbol, event_ts_utc.isoformat())
         return {h: (None, None, None, "error_exception") for h in _HORIZONS_SEC.keys()}
-
-
-# timedelta import (держу внизу, чтобы не мешало чтению)
-from datetime import timedelta
