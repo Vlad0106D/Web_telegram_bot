@@ -6,7 +6,7 @@ import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Dict, Any, Tuple
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -17,6 +17,13 @@ _LOCK = asyncio.Lock()
 
 # какие горизонты мы ожидаем иметь на каждый event
 DEFAULT_HORIZONS: Sequence[str] = ("1h", "4h", "1d")
+
+# ---- schema introspection cache ----
+_SCHEMA_CACHE: Dict[str, Any] = {
+    "cols": {},  # (schema, table) -> set(columns)
+    "hz_col": None,  # detected horizon column name in mm_outcomes
+    "has_created_at_outcomes": None,
+}
 
 
 def _dsn() -> str:
@@ -81,6 +88,88 @@ class MMEventRow:
     meta: Optional[dict]
 
 
+# =====================================================================
+# Schema helpers (auto-adapt to real DB schema)
+# =====================================================================
+
+async def _get_table_columns(schema: str, table: str) -> set:
+    key = (schema, table)
+    cached = _SCHEMA_CACHE["cols"].get(key)
+    if cached is not None:
+        return cached
+
+    p = await _pool()
+    sql = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = %s AND table_name = %s
+    """
+    cols: set = set()
+    try:
+        async with p.connection() as conn:
+            cur = await conn.execute(sql, (schema, table))
+            rows = await cur.fetchall()
+        cols = {str(r[0]) for r in rows if r and r[0] is not None}
+    except Exception:
+        cols = set()
+
+    _SCHEMA_CACHE["cols"][key] = cols
+    return cols
+
+
+async def _detect_outcomes_horizon_column() -> Optional[str]:
+    """
+    В разных версиях схемы колонка "horizon" могла называться иначе.
+    Мы подхватываем правильное имя автоматически.
+    """
+    if _SCHEMA_CACHE.get("hz_col", None) is not None:
+        return _SCHEMA_CACHE["hz_col"]
+
+    cols = await _get_table_columns("public", "mm_outcomes")
+
+    # самые вероятные варианты
+    candidates = [
+        "horizon",
+        "hz",
+        "h",
+        "horizon_tf",
+        "horizon_key",
+        "horizon_code",
+        "horizon_label",
+    ]
+    hz_col = None
+    for c in candidates:
+        if c in cols:
+            hz_col = c
+            break
+
+    if hz_col is None:
+        # если вообще нет — возвращаем None
+        log.error(
+            "mm_outcomes: cannot detect horizon column. "
+            "Expected one of %s. Actual cols=%s",
+            candidates, sorted(cols)[:50],
+        )
+
+    _SCHEMA_CACHE["hz_col"] = hz_col
+    return hz_col
+
+
+async def _outcomes_has_created_at() -> bool:
+    cached = _SCHEMA_CACHE.get("has_created_at_outcomes")
+    if cached is not None:
+        return bool(cached)
+
+    cols = await _get_table_columns("public", "mm_outcomes")
+    has = "created_at" in cols
+    _SCHEMA_CACHE["has_created_at_outcomes"] = has
+    return has
+
+
+# =====================================================================
+# Fetch events
+# =====================================================================
+
 async def fetch_events_missing_any_outcomes(limit: int = 200) -> List[MMEventRow]:
     """
     (совместимость) Берём события, по которым нет НИ ОДНОГО outcome.
@@ -127,30 +216,40 @@ async def fetch_events_needing_outcomes(
     horizons: Sequence[str] = DEFAULT_HORIZONS,
 ) -> List[MMEventRow]:
     """
-    НОВОЕ (правильное):
     Берём события, которые нужно досчитать/починить:
       - нет outcome по одному из horizons (1h/4h/1d)
       - ИЛИ outcome есть, но outcome_type='ok' и метрики NULL (битые данные)
 
     Важно:
     - outcome_type='error_*' с NULL метриками НЕ возвращаем (иначе будет вечная догонялка).
+
+    ✅ AUTO-ADAPT:
+    - имя колонки горизонта в mm_outcomes определяется автоматически.
     """
     hz = tuple(horizons) if horizons else tuple(DEFAULT_HORIZONS)
     if set(hz) != {"1h", "4h", "1d"}:
         log.warning("fetch_events_needing_outcomes: horizons=%s not стандартные; использую DEFAULT_HORIZONS", hz)
         hz = tuple(DEFAULT_HORIZONS)
 
+    hz_col = await _detect_outcomes_horizon_column()
+    if not hz_col:
+        # если не можем понять колонку горизонта — делаем самый безопасный fallback
+        log.warning("fetch_events_needing_outcomes: fallback -> fetch_events_missing_any_outcomes (no horizon column)")
+        return await fetch_events_missing_any_outcomes(limit=limit)
+
     p = await _pool()
 
-    sql = """
+    # динамически подставляем имя колонки горизонта
+    # ВНИМАНИЕ: hz_col берётся только из information_schema -> безопасно как identifier.
+    sql = f"""
     WITH agg AS (
       SELECT
         event_id,
-        COUNT(*) FILTER (WHERE horizon='1h') AS c_1h,
-        COUNT(*) FILTER (WHERE horizon='4h') AS c_4h,
-        COUNT(*) FILTER (WHERE horizon='1d') AS c_1d,
+        COUNT(*) FILTER (WHERE {hz_col}='1h') AS c_1h,
+        COUNT(*) FILTER (WHERE {hz_col}='4h') AS c_4h,
+        COUNT(*) FILTER (WHERE {hz_col}='1d') AS c_1d,
         COUNT(*) FILTER (
-          WHERE horizon IN ('1h','4h','1d')
+          WHERE {hz_col} IN ('1h','4h','1d')
             AND outcome_type = 'ok'
             AND (max_up_pct IS NULL OR max_down_pct IS NULL OR close_pct IS NULL)
         ) AS null_ok_rows
@@ -194,6 +293,10 @@ async def fetch_events_needing_outcomes(
     return out
 
 
+# =====================================================================
+# Upsert outcomes
+# =====================================================================
+
 async def upsert_outcome(
     *,
     event_id: str,
@@ -205,11 +308,15 @@ async def upsert_outcome(
     event_ts_utc: datetime,
 ) -> None:
     """
-    Пишем outcome. Требует уникального индекса (event_id, horizon).
+    Пишем outcome. Требует уникального индекса (event_id, horizon_col).
 
     Правило:
     - если метрики None/NaN -> пишем NULL, а outcome_type делаем error_no_data,
       чтобы событие НЕ попадало в перерасчёт бесконечно.
+
+    ✅ AUTO-ADAPT:
+    - имя колонки горизонта в mm_outcomes определяется автоматически
+    - created_at добавляем только если колонка есть
     """
     mu = _safe_float(max_up_pct)
     md = _safe_float(max_down_pct)
@@ -226,21 +333,44 @@ async def upsert_outcome(
     if event_ts_utc.tzinfo is None:
         event_ts_utc = event_ts_utc.replace(tzinfo=timezone.utc)
 
+    hz_col = await _detect_outcomes_horizon_column()
+    if not hz_col:
+        # без колонки горизонта записывать нельзя корректно
+        log.error("upsert_outcome skipped: cannot detect horizon column in mm_outcomes (event_id=%s)", event_id)
+        return
+
+    has_created_at = await _outcomes_has_created_at()
+
     p = await _pool()
 
-    sql = """
-    INSERT INTO public.mm_outcomes (
-        event_id, horizon, max_up_pct, max_down_pct, close_pct, outcome_type, event_ts_utc, created_at
-    )
-    VALUES (%s::uuid,%s,%s,%s,%s,%s,%s, now())
-    ON CONFLICT (event_id, horizon)
-    DO UPDATE SET
-        max_up_pct = EXCLUDED.max_up_pct,
-        max_down_pct = EXCLUDED.max_down_pct,
-        close_pct = EXCLUDED.close_pct,
-        outcome_type = EXCLUDED.outcome_type,
-        event_ts_utc = EXCLUDED.event_ts_utc
-    """
+    if has_created_at:
+        sql = f"""
+        INSERT INTO public.mm_outcomes (
+            event_id, {hz_col}, max_up_pct, max_down_pct, close_pct, outcome_type, event_ts_utc, created_at
+        )
+        VALUES (%s::uuid,%s,%s,%s,%s,%s,%s, now())
+        ON CONFLICT (event_id, {hz_col})
+        DO UPDATE SET
+            max_up_pct = EXCLUDED.max_up_pct,
+            max_down_pct = EXCLUDED.max_down_pct,
+            close_pct = EXCLUDED.close_pct,
+            outcome_type = EXCLUDED.outcome_type,
+            event_ts_utc = EXCLUDED.event_ts_utc
+        """
+    else:
+        sql = f"""
+        INSERT INTO public.mm_outcomes (
+            event_id, {hz_col}, max_up_pct, max_down_pct, close_pct, outcome_type, event_ts_utc
+        )
+        VALUES (%s::uuid,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (event_id, {hz_col})
+        DO UPDATE SET
+            max_up_pct = EXCLUDED.max_up_pct,
+            max_down_pct = EXCLUDED.max_down_pct,
+            close_pct = EXCLUDED.close_pct,
+            outcome_type = EXCLUDED.outcome_type,
+            event_ts_utc = EXCLUDED.event_ts_utc
+        """
 
     async with p.connection() as conn:
         await conn.execute(
