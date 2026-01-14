@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, List
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -99,6 +99,15 @@ def _as_float(v: Any) -> Optional[float]:
         return None
 
 
+def _as_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
 def _as_text(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -110,27 +119,24 @@ def _as_text(v: Any) -> Optional[str]:
 
 def _tf_from_source_mode(source_mode: str) -> Optional[str]:
     """
-    Маппинг source_mode -> tf, чтобы всегда иметь tf в mm_snapshots.payload.
+    Маппинг source_mode -> tf (единый формат для БД: 1h/4h/1d/1w).
     """
     sm = (source_mode or "").lower()
-    if sm.startswith("h1_"):
+    if sm.startswith("h1_") or sm == "1h":
         return "1h"
-    if sm.startswith("h4_"):
+    if sm.startswith("h4_") or sm == "4h":
         return "4h"
-    if sm.startswith("daily_"):
+    if sm.startswith("daily_") or sm in ("1d", "d", "day"):
         return "1d"
-    if sm.startswith("weekly_"):
+    if sm.startswith("weekly_") or sm in ("1w", "w", "week"):
         return "1w"
     return None
 
 
 def _is_transient_db_error(e: Exception) -> bool:
-    """
-    Ловим сетевые/SSL/обрыв соединения.
-    Мы не импортим psycopg типы жёстко, чтобы не зависеть от версий.
-    """
+    """Ловим сетевые/SSL/обрыв соединения."""
     msg = (str(e) or "").lower()
-    if any(
+    return any(
         s in msg
         for s in [
             "ssl connection has been closed unexpectedly",
@@ -144,9 +150,7 @@ def _is_transient_db_error(e: Exception) -> bool:
             "eof detected",
             "consuming input failed",
         ]
-    ):
-        return True
-    return False
+    )
 
 
 async def _close_pool() -> None:
@@ -161,9 +165,7 @@ async def _close_pool() -> None:
 
 
 async def _get_pool() -> AsyncConnectionPool:
-    """
-    Ленивая инициализация пула. Если пул умер — пересоздаём.
-    """
+    """Ленивая инициализация пула. Если пул умер — пересоздаём."""
     global _POOL
 
     async with _POOL_LOCK:
@@ -172,7 +174,6 @@ async def _get_pool() -> AsyncConnectionPool:
 
         dsn = _get_dsn()
 
-        # Важно: маленький пул = меньше “полумёртвых” коннектов в проде.
         _POOL = AsyncConnectionPool(
             conninfo=dsn,
             min_size=1,
@@ -184,106 +185,120 @@ async def _get_pool() -> AsyncConnectionPool:
         return _POOL
 
 
-async def _insert_features(
-    conn: Any,
-    *,
-    snapshot_id: int,
-    snap: Any,
-    source_mode: str,
-    symbols: str,
-    ts_utc: datetime,
-) -> None:
+def _split_symbols(symbols: str) -> List[str]:
+    out: List[str] = []
+    for s in (symbols or "").split(","):
+        s = s.strip()
+        if s:
+            out.append(s)
+    return out or ["BTCUSDT"]
+
+
+def _pick_exchange_okx_only(snap: Any) -> str:
     """
-    Пишем фичи в mm_features.
+    Жёсткое правило проекта: все price/OI берём только с OKX.
+    exchange в БД фиксируем как 'okx'.
     """
-    try:
-        btc = _safe_get(snap, "btc")
-        eth = _safe_get(snap, "eth")
+    ex = _as_text(_safe_get(snap, "exchange"))
+    if ex:
+        ex = ex.strip().lower()
+        # мягкий режим: если кто-то передал не okx — всё равно пишем okx
+        # (если хочешь жёстко падать — скажи, сделаю raise)
+    return "okx"
 
-        pressure = _as_text(_safe_get(snap, "state"))
-        phase = _as_text(_safe_get(snap, "stage"))
-        prob_up = _as_float(_safe_get(snap, "p_up"))
-        prob_down = _as_float(_safe_get(snap, "p_down"))
 
-        price_btc = _as_float(_safe_get(btc, "price"))
-        range_low = _as_float(_safe_get(btc, "range_low"))
-        range_high = _as_float(_safe_get(btc, "range_high"))
-        swing_low = _as_float(_safe_get(btc, "swing_low"))
-        swing_high = _as_float(_safe_get(btc, "swing_high"))
+def _pick_oi_source_okx_only(snap: Any) -> str:
+    src = _as_text(_safe_get(snap, "oi_source"))
+    if src:
+        src = src.strip().lower()
+    return "okx"
 
-        targets_up = _safe_get(btc, "targets_up", [])
-        targets_down = _safe_get(btc, "targets_down", [])
 
-        oi_btc = _as_float(_safe_get(btc, "open_interest"))
-        funding_btc = _as_float(_safe_get(btc, "funding_rate"))
-        oi_eth = _as_float(_safe_get(eth, "open_interest"))
-        funding_eth = _as_float(_safe_get(eth, "funding_rate"))
+def _extract_ohlcv(obj: Any) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Пытаемся извлечь OHLCV из разных возможных форматов.
+    Допускаем варианты ключей: open/high/low/close/volume или o/h/l/c/v.
+    Если есть только price -> кладём её в open/high/low/close (но лучше, чтобы реальный OHLC приходил из market_data).
+    """
+    if obj is None:
+        return None, None, None, None, None
 
-        eth_confirm = _as_text(_safe_get(snap, "eth_relation"))
+    if isinstance(obj, dict):
+        o = _as_float(obj.get("open", obj.get("o")))
+        h = _as_float(obj.get("high", obj.get("h")))
+        l = _as_float(obj.get("low", obj.get("l")))
+        c = _as_float(obj.get("close", obj.get("c")))
+        v = _as_float(obj.get("volume", obj.get("v")))
 
-        await conn.execute(
-            """
-            INSERT INTO mm_features (
-                snapshot_id,
-                ts_utc,
-                source_mode,
-                symbols,
+        if o is None and c is None:
+            p = _as_float(obj.get("price"))
+            if p is not None:
+                o = h = l = c = p
 
-                pressure,
-                phase,
-                prob_up,
-                prob_down,
+        return o, h, l, c, v
 
-                price_btc,
-                range_low,
-                range_high,
-                swing_low,
-                swing_high,
+    o = _as_float(_safe_get(obj, "open", _safe_get(obj, "o")))
+    h = _as_float(_safe_get(obj, "high", _safe_get(obj, "h")))
+    l = _as_float(_safe_get(obj, "low", _safe_get(obj, "l")))
+    c = _as_float(_safe_get(obj, "close", _safe_get(obj, "c")))
+    v = _as_float(_safe_get(obj, "volume", _safe_get(obj, "v")))
 
-                targets_up,
-                targets_down,
+    if o is None and c is None:
+        p = _as_float(_safe_get(obj, "price"))
+        if p is not None:
+            o = h = l = c = p
 
-                oi_btc,
-                funding_btc,
-                oi_eth,
-                funding_eth,
+    return o, h, l, c, v
 
-                eth_confirm
-            )
-            VALUES (
-                %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s::jsonb, %s::jsonb,
-                %s, %s, %s, %s,
-                %s
-            )
-            """,
-            (
-                snapshot_id,
-                ts_utc,
-                source_mode,
-                symbols,
-                pressure,
-                phase,
-                prob_up,
-                prob_down,
-                price_btc,
-                range_low,
-                range_high,
-                swing_low,
-                swing_high,
-                json.dumps(_to_jsonable(targets_up), ensure_ascii=False),
-                json.dumps(_to_jsonable(targets_down), ensure_ascii=False),
-                oi_btc,
-                funding_btc,
-                oi_eth,
-                funding_eth,
-                eth_confirm,
-            ),
-        )
-    except Exception:
-        log.exception("MM memory: insert into mm_features failed")
+
+def _extract_oi(obj: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Извлекаем open_interest / open_interest_usd, если есть."""
+    if obj is None:
+        return None, None
+
+    if isinstance(obj, dict):
+        oi = _as_float(obj.get("open_interest", obj.get("oi")))
+        oi_usd = _as_float(obj.get("open_interest_usd", obj.get("oi_usd")))
+        return oi, oi_usd
+
+    oi = _as_float(_safe_get(obj, "open_interest", _safe_get(obj, "oi")))
+    oi_usd = _as_float(_safe_get(obj, "open_interest_usd", _safe_get(obj, "oi_usd")))
+    return oi, oi_usd
+
+
+def _extract_regime(snap: Any) -> Tuple[Optional[str], Optional[int], Optional[float], Optional[str]]:
+    """
+    regime: market_regime ('trend_up'|'range'|'trend_down'),
+    trend_dir (-1|0|1),
+    trend_strength (float),
+    regime_source (text)
+    """
+    market_regime = _as_text(_safe_get(snap, "market_regime"))
+    trend_dir = _as_int(_safe_get(snap, "trend_dir"))
+    trend_strength = _as_float(_safe_get(snap, "trend_strength"))
+    regime_source = _as_text(_safe_get(snap, "regime_source"))
+
+    if market_regime is None:
+        market_regime = _as_text(_safe_get(_safe_get(snap, "regime"), "market_regime"))
+
+    return market_regime, trend_dir, trend_strength, regime_source
+
+
+def _subsnap_for_symbol(snap: Any, symbol: str) -> Any:
+    """
+    Пытаемся взять "подснап" по конкретному активу:
+    BTCUSDT -> snap['btc'] / snap.btc
+    ETHUSDT -> snap['eth'] / snap.eth
+    иначе возвращаем исходный snap.
+    """
+    s = (symbol or "").upper()
+    if s.startswith("BTC"):
+        sub = _safe_get(snap, "btc")
+        return sub if sub is not None else snap
+    if s.startswith("ETH"):
+        sub = _safe_get(snap, "eth")
+        return sub if sub is not None else snap
+    return snap
 
 
 async def append_snapshot(
@@ -294,24 +309,30 @@ async def append_snapshot(
     ts_utc: Optional[datetime] = None,
 ) -> None:
     """
-    Пишем снапшот в mm_snapshots + фичи в mm_features.
-    Retry + пересоздание пула при SSL/сетевых обрывах.
+    Outcomes 2.0:
+    Пишем снапшоты в public.mm_snapshots (НОВАЯ СХЕМА):
+      - 1 строка = 1 symbol/exchange/timeframe/ts
+      - OHLC обязателен
+      - OI/Regime/Features — как факты для будущих расчётов
+    ВАЖНО: outcomes/расчёты НЕ делают запросы к OKX — только по БД.
     """
-    # Если у снапшота есть now_dt — используем его как ts_utc
     snap_now = _safe_get(snap, "now_dt")
     if ts_utc is None and isinstance(snap_now, datetime):
         ts_utc = snap_now
     ts_utc = ts_utc or _now_utc()
 
-    payload_obj = _to_jsonable(snap)
+    timeframe = _as_text(_safe_get(snap, "tf")) or _tf_from_source_mode(source_mode) or "1h"
 
-    # ✅ FIX: добавляем tf в payload, иначе payload->>'tf' будет NULL (ломает 1D/4H проверки)
-    if isinstance(payload_obj, dict):
-        tf = payload_obj.get("tf") or _tf_from_source_mode(source_mode)
-        if tf is not None:
-            payload_obj["tf"] = tf
+    exchange = _pick_exchange_okx_only(snap)
+    oi_source = _pick_oi_source_okx_only(snap)
 
-    payload_json = json.dumps(payload_obj, ensure_ascii=False)
+    market_regime, trend_dir, trend_strength, regime_source = _extract_regime(snap)
+
+    # базовые features: кладём весь снап как jsonb (можно потом сузить)
+    base_features = _to_jsonable(snap)
+    if isinstance(base_features, dict):
+        base_features.setdefault("tf", timeframe)
+        base_features.setdefault("exchange", exchange)
 
     last_err: Optional[Exception] = None
 
@@ -321,34 +342,75 @@ async def append_snapshot(
 
             async with pool.connection() as conn:
                 async with conn.transaction():
-                    cur = await conn.execute(
-                        """
-                        INSERT INTO mm_snapshots (ts_utc, source_mode, symbols, payload)
-                        VALUES (%s, %s, %s, %s::jsonb)
-                        RETURNING id
-                        """,
-                        (ts_utc, source_mode, symbols, payload_json),
-                    )
-                    row = await cur.fetchone()
-                    snapshot_id = int(row[0]) if row and row[0] is not None else None
+                    for symbol in _split_symbols(symbols):
+                        sub = _subsnap_for_symbol(snap, symbol)
 
-                    if snapshot_id is not None:
-                        await _insert_features(
-                            conn,
-                            snapshot_id=snapshot_id,
-                            snap=snap,
-                            source_mode=source_mode,
-                            symbols=symbols,
-                            ts_utc=ts_utc,
+                        o, h, l, c, v = _extract_ohlcv(sub)
+                        if o is None or h is None or l is None or c is None:
+                            log.warning(
+                                "MM memory: skip snapshot (missing OHLC) symbol=%s tf=%s source_mode=%s",
+                                symbol, timeframe, source_mode,
+                            )
+                            continue
+
+                        oi, oi_usd = _extract_oi(sub)
+
+                        feat = base_features
+                        if isinstance(feat, dict):
+                            feat = dict(feat)
+                            feat["symbol"] = symbol
+                            feat["source_mode"] = source_mode
+                            if isinstance(sub, dict):
+                                feat["symbol_block"] = _to_jsonable(sub)
+
+                        features_json = json.dumps(_to_jsonable(feat), ensure_ascii=False)
+
+                        await conn.execute(
+                            """
+                            INSERT INTO public.mm_snapshots (
+                              ts, symbol, exchange, timeframe,
+                              open, high, low, close, volume,
+                              open_interest, open_interest_usd, oi_source,
+                              market_regime, trend_dir, trend_strength, regime_source,
+                              features
+                            )
+                            VALUES (
+                              %s, %s, %s, %s,
+                              %s, %s, %s, %s, %s,
+                              %s, %s, %s,
+                              %s, %s, %s, %s,
+                              %s::jsonb
+                            )
+                            ON CONFLICT (symbol, exchange, timeframe, ts)
+                            DO UPDATE SET
+                              open = EXCLUDED.open,
+                              high = EXCLUDED.high,
+                              low  = EXCLUDED.low,
+                              close = EXCLUDED.close,
+                              volume = EXCLUDED.volume,
+                              open_interest = EXCLUDED.open_interest,
+                              open_interest_usd = EXCLUDED.open_interest_usd,
+                              oi_source = EXCLUDED.oi_source,
+                              market_regime = EXCLUDED.market_regime,
+                              trend_dir = EXCLUDED.trend_dir,
+                              trend_strength = EXCLUDED.trend_strength,
+                              regime_source = EXCLUDED.regime_source,
+                              features = EXCLUDED.features
+                            """,
+                            (
+                                ts_utc, symbol, exchange, timeframe,
+                                o, h, l, c, v,
+                                oi, oi_usd, oi_source,
+                                market_regime, trend_dir, trend_strength, regime_source,
+                                features_json,
+                            ),
                         )
 
-            # успех
             return
 
         except Exception as e:
             last_err = e
 
-            # если ошибка похожа на сетевой/SSL обрыв — пересоздаём пул и пробуем ещё раз
             if _is_transient_db_error(e) and attempt < _MAX_RETRIES:
                 log.warning("MM memory: transient DB error, retry %s/%s: %s", attempt + 1, _MAX_RETRIES, e)
                 async with _POOL_LOCK:
@@ -356,7 +418,6 @@ async def append_snapshot(
                 await asyncio.sleep(0.6 * (attempt + 1))
                 continue
 
-            # иначе — выходим
             break
 
     log.exception("MM memory: append_snapshot failed (%s)", source_mode, exc_info=last_err)
