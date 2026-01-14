@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Optional, Dict
@@ -60,7 +61,6 @@ def _exchange_okx_only() -> str:
 
 
 # legacy -> new taxonomy mapping
-# Если у тебя есть другие старые типы — добавим сюда.
 _EVENT_TYPE_MAP = {
     "PRESSURE_CHANGE": "pressure_shift",
     "STAGE_CHANGE": "trend_shift",
@@ -109,19 +109,18 @@ async def _send_outcomes_autopush(
     try:
         from config import TOKEN, ALERT_CHAT_ID  # type: ignore
         from telegram import Bot  # type: ignore
-
         from services.outcomes.score_pg import score_detail  # type: ignore
 
         rows = await score_detail(event_type=str(event_type), horizon=_AUTOPUSH_HORIZON)
 
         row = None
+        tf_l = str(tf).lower()
         for r in rows:
-            if str(getattr(r, "tf", "")).lower() == str(tf).lower():
+            if str(getattr(r, "tf", "")).lower() == tf_l:
                 row = r
                 break
         if row is None and rows:
             row = rows[0]
-
         if row is None:
             return
 
@@ -184,9 +183,10 @@ async def append_event(
     timeframe = _normalize_tf(tf)
     ex = (exchange or _exchange_okx_only()).strip().lower()
     sym = (symbol or "").strip().upper()
-    payload_meta = meta or {}
+    payload_meta: Dict[str, Any] = meta or {}
 
-    tries = 2
+    # чуть больше устойчивости к коротким обрывам
+    tries = 3
     for attempt in range(tries):
         try:
             pool = await _get_pool()
@@ -195,7 +195,7 @@ async def append_event(
                     cur = await conn.execute(
                         """
                         INSERT INTO public.mm_events (
-                          ts, symbol, exchange, timeframe,
+                          ts_utc, symbol, exchange, timeframe,
                           snapshot_id,
                           event_type, event_state,
                           ref_price,
@@ -238,16 +238,20 @@ async def append_event(
             return event_id
 
         except OperationalError as e:
+            # сеть/SSL/обрыв — пробуем ещё раз
             log.warning(
                 "MM events: OperationalError on append (attempt %s/%s): %s",
                 attempt + 1,
                 tries,
                 e,
             )
-            continue
+            if attempt < tries - 1:
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
+            return None
 
         except PsycopgError:
-            # сюда попадут: неизвестный event_type, disabled event_type, meta_required missing, bad snapshot_id, etc.
+            # неизвестный event_type, disabled event_type, meta_required missing, bad snapshot_id, etc.
             log.exception(
                 "MM events: append_event failed (psycopg). "
                 "event_type=%s symbol=%s tf=%s snapshot_id=%s",
