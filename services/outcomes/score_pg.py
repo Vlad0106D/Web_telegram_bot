@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Any, Tuple
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -106,7 +106,48 @@ class MarketRegimeRow:
     version: Optional[str] = None
 
 
+# кэш наличия таблицы режимов, чтобы не дергать каждый раз
+_HAS_REGIMES_TABLE: Optional[bool] = None
+
+
+def _looks_like_missing_table(exc: BaseException, table: str) -> bool:
+    msg = str(exc).lower()
+    # psycopg обычно пишет "relation ... does not exist"
+    return ("does not exist" in msg or "undefined table" in msg or "relation" in msg) and table.lower() in msg
+
+
+async def _ensure_regimes_table_known() -> bool:
+    """
+    Проверка наличия public.mm_market_regimes.
+    Безопасно: если нет — вернём False и будем работать без режимов.
+    """
+    global _HAS_REGIMES_TABLE
+    if _HAS_REGIMES_TABLE is not None:
+        return _HAS_REGIMES_TABLE
+
+    p = await _pool()
+    sql = """
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'mm_market_regimes'
+    LIMIT 1
+    """
+    try:
+        async with p.connection() as conn:
+            cur = await conn.execute(sql)
+            row = await cur.fetchone()
+        _HAS_REGIMES_TABLE = bool(row)
+    except Exception:
+        # если даже info_schema недоступен — просто отключаем режимы
+        _HAS_REGIMES_TABLE = False
+
+    return _HAS_REGIMES_TABLE
+
+
 async def get_regime_at(*, symbol: str, tf: str, ts_utc: datetime) -> Optional[MarketRegimeRow]:
+    if not await _ensure_regimes_table_known():
+        return None
+
     p = await _pool()
     sql = """
     SELECT
@@ -135,6 +176,9 @@ async def get_regime_at(*, symbol: str, tf: str, ts_utc: datetime) -> Optional[M
 
 
 async def get_regime_for_event(*, event_id: int) -> Optional[MarketRegimeRow]:
+    if not await _ensure_regimes_table_known():
+        return None
+
     p = await _pool()
     sql = """
     SELECT e.symbol, e.tf, e.ts_utc
@@ -162,6 +206,23 @@ async def get_regime_for_event(*, event_id: int) -> Optional[MarketRegimeRow]:
 
 # ====== Outcomes score (market regime + time-decay) ======
 
+def _bias_from_avgs(avg_up: float, avg_down: float) -> str:
+    # avg_down обычно отрицательный (MAE). Сравниваем по модулю.
+    au = abs(float(avg_up or 0.0))
+    ad = abs(float(avg_down or 0.0))
+    if au > ad:
+        return "up"
+    if ad > au:
+        return "down"
+    return "neutral"
+
+
+async def _run_query(p: AsyncConnectionPool, sql: str, params: Tuple[Any, ...]) -> list:
+    async with p.connection() as conn:
+        cur = await conn.execute(sql, params)
+        return await cur.fetchall()
+
+
 async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[OutcomeScoreRow]:
     """
     Рейтинг типов событий: группируем по (event_type, tf, horizon).
@@ -169,115 +230,170 @@ async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[Outcom
 
     Апгрейд #1: доминирующий режим рынка (mm_market_regimes: last <= event ts) + conf + share.
     Апгрейд #2: time-decay (w=exp(-age/tau)) -> cases_eff + weighted avg метрик.
+
+    ✅ Важно: если mm_market_regimes отсутствует — работаем без неё (fallback).
     """
     p = await _pool()
     tau_s = _tau_seconds_for(horizon)
 
-    sql = """
-    WITH base AS (
-      SELECT
-        e.event_type,
-        e.tf,
-        o.horizon,
-        o.max_up_pct,
-        o.max_down_pct,
-        o.close_pct,
+    use_regimes = await _ensure_regimes_table_known()
 
-        -- time-decay weight
-        exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
+    if use_regimes:
+        sql = """
+        WITH base AS (
+          SELECT
+            e.event_type,
+            e.tf,
+            o.horizon,
+            o.max_up_pct,
+            o.max_down_pct,
+            o.close_pct,
 
-        mr.regime AS market_regime,
-        mr.confidence AS market_regime_conf
-      FROM public.mm_outcomes o
-      JOIN public.mm_events e ON e.id = o.event_id
+            exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
 
-      -- режим на момент события (last <= ts_utc)
-      LEFT JOIN LATERAL (
-        SELECT r.regime, r.confidence
-        FROM public.mm_market_regimes r
-        WHERE r.symbol = e.symbol
-          AND r.tf = e.tf
-          AND r.ts_utc <= e.ts_utc
-        ORDER BY r.ts_utc DESC
-        LIMIT 1
-      ) mr ON TRUE
+            mr.regime AS market_regime,
+            mr.confidence AS market_regime_conf
+          FROM public.mm_outcomes o
+          JOIN public.mm_events e ON e.id = o.event_id
 
-      WHERE
-        o.horizon = %s
-        AND o.outcome_type = 'ok'
-        AND o.max_up_pct IS NOT NULL
-        AND o.max_down_pct IS NOT NULL
-        AND o.close_pct IS NOT NULL
-    ),
+          LEFT JOIN LATERAL (
+            SELECT r.regime, r.confidence
+            FROM public.mm_market_regimes r
+            WHERE r.symbol = e.symbol
+              AND r.tf = e.tf
+              AND r.ts_utc <= e.ts_utc
+            ORDER BY r.ts_utc DESC
+            LIMIT 1
+          ) mr ON TRUE
 
-    agg AS (
-      SELECT
-        event_type,
-        tf,
-        horizon,
-        COUNT(*) AS cases,
-        SUM(w)   AS cases_eff,
+          WHERE
+            o.horizon = %s
+            AND o.outcome_type = 'ok'
+            AND o.max_up_pct IS NOT NULL
+            AND o.max_down_pct IS NOT NULL
+            AND o.close_pct IS NOT NULL
+        ),
 
-        -- weighted averages (percent)
-        (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
-        (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
-        (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
-      FROM base
-      GROUP BY event_type, tf, horizon
-    ),
+        agg AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            COUNT(*) AS cases,
+            SUM(w)   AS cases_eff,
 
-    reg_counts AS (
-      SELECT
-        event_type,
-        tf,
-        horizon,
-        market_regime,
-        SUM(w) AS reg_eff,
-        -- weighted avg conf по режиму
-        (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
-      FROM base
-      WHERE market_regime IS NOT NULL
-      GROUP BY event_type, tf, horizon, market_regime
-    ),
+            (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+            (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+            (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
+          FROM base
+          GROUP BY event_type, tf, horizon
+        ),
 
-    reg_top AS (
-      SELECT DISTINCT ON (event_type, tf, horizon)
-        event_type,
-        tf,
-        horizon,
-        market_regime AS dominant_regime,
-        reg_eff,
-        reg_conf
-      FROM reg_counts
-      ORDER BY event_type, tf, horizon, reg_eff DESC
-    )
+        reg_counts AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            market_regime,
+            SUM(w) AS reg_eff,
+            (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
+          FROM base
+          WHERE market_regime IS NOT NULL
+          GROUP BY event_type, tf, horizon, market_regime
+        ),
 
-    SELECT
-      a.event_type,
-      a.tf,
-      a.horizon,
-      a.cases,
-      a.cases_eff,
-      a.avg_up_pct,
-      a.avg_down_pct,
-      a.winrate_pct,
+        reg_top AS (
+          SELECT DISTINCT ON (event_type, tf, horizon)
+            event_type,
+            tf,
+            horizon,
+            market_regime AS dominant_regime,
+            reg_eff,
+            reg_conf
+          FROM reg_counts
+          ORDER BY event_type, tf, horizon, reg_eff DESC
+        )
 
-      t.dominant_regime,
-      t.reg_conf AS regime_conf,
-      CASE
-        WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
-        ELSE (t.reg_eff * 100.0 / a.cases_eff)
-      END AS regime_share_pct
-    FROM agg a
-    LEFT JOIN reg_top t
-      ON t.event_type = a.event_type AND t.tf = a.tf AND t.horizon = a.horizon
-    ORDER BY (ABS(a.avg_up_pct) + ABS(a.avg_down_pct)) DESC, a.cases DESC
-    LIMIT %s
-    """
+        SELECT
+          a.event_type,
+          a.tf,
+          a.horizon,
+          a.cases,
+          a.cases_eff,
+          a.avg_up_pct,
+          a.avg_down_pct,
+          a.winrate_pct,
 
-    async with p.connection() as conn:
-        cur = await conn.execute(sql, (float(tau_s), str(horizon), int(limit)))
-        rows = await cur.fetchall()
+          t.dominant_regime,
+          t.reg_conf AS regime_conf,
+          CASE
+            WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
+            ELSE (t.reg_eff * 100.0 / a.cases_eff)
+          END AS regime_share_pct
+        FROM agg a
+        LEFT JOIN reg_top t
+          ON t.event_type = a.event_type AND t.tf = a.tf AND t.horizon = a.horizon
+        ORDER BY (ABS(a.avg_up_pct) + ABS(a.avg_down_pct)) DESC, a.cases DESC
+        LIMIT %s
+        """
+        params = (float(tau_s), str(horizon), int(limit))
+        try:
+            rows = await _run_query(p, sql, params)
+        except Exception as e:
+            # если таблицы внезапно нет — падать не будем
+            if _looks_like_missing_table(e, "mm_market_regimes"):
+                log.warning("mm_market_regimes missing -> score_overview fallback without regimes")
+                use_regimes = False
+                rows = []
+            else:
+                raise
+    else:
+        rows = []
+
+    if not use_regimes:
+        # fallback без режимов рынка
+        sql2 = """
+        WITH base AS (
+          SELECT
+            e.event_type,
+            e.tf,
+            o.horizon,
+            o.max_up_pct,
+            o.max_down_pct,
+            o.close_pct,
+            exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w
+          FROM public.mm_outcomes o
+          JOIN public.mm_events e ON e.id = o.event_id
+          WHERE
+            o.horizon = %s
+            AND o.outcome_type = 'ok'
+            AND o.max_up_pct IS NOT NULL
+            AND o.max_down_pct IS NOT NULL
+            AND o.close_pct IS NOT NULL
+        ),
+        agg AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            COUNT(*) AS cases,
+            SUM(w)   AS cases_eff,
+            (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+            (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+            (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
+          FROM base
+          GROUP BY event_type, tf, horizon
+        )
+        SELECT
+          event_type, tf, horizon, cases, cases_eff, avg_up_pct, avg_down_pct, winrate_pct,
+          NULL::text AS dominant_regime,
+          NULL::double precision AS regime_conf,
+          NULL::double precision AS regime_share_pct
+        FROM agg
+        ORDER BY (ABS(avg_up_pct) + ABS(avg_down_pct)) DESC, cases DESC
+        LIMIT %s
+        """
+        rows = await _run_query(p, sql2, (float(tau_s), str(horizon), int(limit)))
 
     out: List[OutcomeScoreRow] = []
     for r in rows:
@@ -295,12 +411,6 @@ async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[Outcom
         reg_conf = (float(r[9]) if r[9] is not None else None)
         reg_share = (float(r[10]) if r[10] is not None else None)
 
-        bias = "neutral"
-        if abs(avg_up) > abs(avg_down):
-            bias = "up"
-        elif abs(avg_down) > abs(avg_up):
-            bias = "down"
-
         out.append(
             OutcomeScoreRow(
                 event_type=event_type,
@@ -311,10 +421,9 @@ async def score_overview(*, horizon: str = "1h", limit: int = 20) -> List[Outcom
                 avg_up_pct=avg_up,
                 avg_down_pct=avg_down,
                 winrate_pct=winrate,
-                bias=bias,
+                bias=_bias_from_avgs(avg_up, avg_down),
                 confidence=_confidence(cases),
 
-                # оба имени для совместимости с рендерами
                 market_regime=dom_reg,
                 dominant_regime=dom_reg,
                 regime_conf=reg_conf,
@@ -328,108 +437,165 @@ async def score_detail(*, event_type: str, horizon: str = "1h") -> List[OutcomeS
     """
     Детально по одному event_type: разбиваем по TF внутри указанного horizon.
     Апгрейды #1/#2 аналогично score_overview.
+
+    ✅ Если mm_market_regimes отсутствует — работаем без неё (fallback).
     """
     p = await _pool()
     tau_s = _tau_seconds_for(horizon)
 
-    sql = """
-    WITH base AS (
-      SELECT
-        e.event_type,
-        e.tf,
-        o.horizon,
-        o.max_up_pct,
-        o.max_down_pct,
-        o.close_pct,
+    use_regimes = await _ensure_regimes_table_known()
 
-        exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
+    if use_regimes:
+        sql = """
+        WITH base AS (
+          SELECT
+            e.event_type,
+            e.tf,
+            o.horizon,
+            o.max_up_pct,
+            o.max_down_pct,
+            o.close_pct,
 
-        mr.regime AS market_regime,
-        mr.confidence AS market_regime_conf
-      FROM public.mm_outcomes o
-      JOIN public.mm_events e ON e.id = o.event_id
-      LEFT JOIN LATERAL (
-        SELECT r.regime, r.confidence
-        FROM public.mm_market_regimes r
-        WHERE r.symbol = e.symbol
-          AND r.tf = e.tf
-          AND r.ts_utc <= e.ts_utc
-        ORDER BY r.ts_utc DESC
-        LIMIT 1
-      ) mr ON TRUE
-      WHERE
-        o.horizon = %s
-        AND e.event_type = %s
-        AND o.outcome_type = 'ok'
-        AND o.max_up_pct IS NOT NULL
-        AND o.max_down_pct IS NOT NULL
-        AND o.close_pct IS NOT NULL
-    ),
+            exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w,
 
-    agg AS (
-      SELECT
-        event_type,
-        tf,
-        horizon,
-        COUNT(*) AS cases,
-        SUM(w)   AS cases_eff,
-        (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
-        (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
-        (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
-      FROM base
-      GROUP BY event_type, tf, horizon
-    ),
+            mr.regime AS market_regime,
+            mr.confidence AS market_regime_conf
+          FROM public.mm_outcomes o
+          JOIN public.mm_events e ON e.id = o.event_id
+          LEFT JOIN LATERAL (
+            SELECT r.regime, r.confidence
+            FROM public.mm_market_regimes r
+            WHERE r.symbol = e.symbol
+              AND r.tf = e.tf
+              AND r.ts_utc <= e.ts_utc
+            ORDER BY r.ts_utc DESC
+            LIMIT 1
+          ) mr ON TRUE
+          WHERE
+            o.horizon = %s
+            AND e.event_type = %s
+            AND o.outcome_type = 'ok'
+            AND o.max_up_pct IS NOT NULL
+            AND o.max_down_pct IS NOT NULL
+            AND o.close_pct IS NOT NULL
+        ),
 
-    reg_counts AS (
-      SELECT
-        event_type,
-        tf,
-        horizon,
-        market_regime,
-        SUM(w) AS reg_eff,
-        (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
-      FROM base
-      WHERE market_regime IS NOT NULL
-      GROUP BY event_type, tf, horizon, market_regime
-    ),
+        agg AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            COUNT(*) AS cases,
+            SUM(w)   AS cases_eff,
+            (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+            (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+            (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
+          FROM base
+          GROUP BY event_type, tf, horizon
+        ),
 
-    reg_top AS (
-      SELECT DISTINCT ON (event_type, tf, horizon)
-        event_type,
-        tf,
-        horizon,
-        market_regime AS dominant_regime,
-        reg_eff,
-        reg_conf
-      FROM reg_counts
-      ORDER BY event_type, tf, horizon, reg_eff DESC
-    )
+        reg_counts AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            market_regime,
+            SUM(w) AS reg_eff,
+            (SUM(COALESCE(market_regime_conf, 0.0) * w) / NULLIF(SUM(w), 0)) AS reg_conf
+          FROM base
+          WHERE market_regime IS NOT NULL
+          GROUP BY event_type, tf, horizon, market_regime
+        ),
 
-    SELECT
-      a.event_type,
-      a.tf,
-      a.horizon,
-      a.cases,
-      a.cases_eff,
-      a.avg_up_pct,
-      a.avg_down_pct,
-      a.winrate_pct,
+        reg_top AS (
+          SELECT DISTINCT ON (event_type, tf, horizon)
+            event_type,
+            tf,
+            horizon,
+            market_regime AS dominant_regime,
+            reg_eff,
+            reg_conf
+          FROM reg_counts
+          ORDER BY event_type, tf, horizon, reg_eff DESC
+        )
 
-      t.dominant_regime,
-      t.reg_conf AS regime_conf,
-      CASE
-        WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
-        ELSE (t.reg_eff * 100.0 / a.cases_eff)
-      END AS regime_share_pct
-    FROM agg a
-    LEFT JOIN reg_top t
-      ON t.event_type = a.event_type AND t.tf = a.tf AND t.horizon = a.horizon
-    ORDER BY a.cases DESC
-    """
+        SELECT
+          a.event_type,
+          a.tf,
+          a.horizon,
+          a.cases,
+          a.cases_eff,
+          a.avg_up_pct,
+          a.avg_down_pct,
+          a.winrate_pct,
 
-    async with p.connection() as conn:
-        cur = await conn.execute(sql, (float(tau_s), str(horizon), str(event_type)))
-        rows = await cur.fetchall()
+          t.dominant_regime,
+          t.reg_conf AS regime_conf,
+          CASE
+            WHEN t.reg_eff IS NULL OR a.cases_eff IS NULL OR a.cases_eff = 0 THEN NULL
+            ELSE (t.reg_eff * 100.0 / a.cases_eff)
+          END AS regime_share_pct
+        FROM agg a
+        LEFT JOIN reg_top t
+          ON t.event_type = a.event_type AND t.tf = a.tf AND t.horizon = a.horizon
+        ORDER BY a.cases DESC
+        """
+        params = (float(tau_s), str(horizon), str(event_type))
+        try:
+            rows = await _run_query(p, sql, params)
+        except Exception as e:
+            if _looks_like_missing_table(e, "mm_market_regimes"):
+                log.warning("mm_market_regimes missing -> score_detail fallback without regimes")
+                use_regimes = False
+                rows = []
+            else:
+                raise
+    else:
+        rows = []
+
+    if not use_regimes:
+        sql2 = """
+        WITH base AS (
+          SELECT
+            e.event_type,
+            e.tf,
+            o.horizon,
+            o.max_up_pct,
+            o.max_down_pct,
+            o.close_pct,
+            exp(- GREATEST(extract(epoch from (now() - e.ts_utc)), 0) / %s::double precision) AS w
+          FROM public.mm_outcomes o
+          JOIN public.mm_events e ON e.id = o.event_id
+          WHERE
+            o.horizon = %s
+            AND e.event_type = %s
+            AND o.outcome_type = 'ok'
+            AND o.max_up_pct IS NOT NULL
+            AND o.max_down_pct IS NOT NULL
+            AND o.close_pct IS NOT NULL
+        ),
+        agg AS (
+          SELECT
+            event_type,
+            tf,
+            horizon,
+            COUNT(*) AS cases,
+            SUM(w)   AS cases_eff,
+            (SUM(max_up_pct   * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_up_pct,
+            (SUM(max_down_pct * w) / NULLIF(SUM(w), 0)) * 100.0 AS avg_down_pct,
+            (SUM((CASE WHEN close_pct > 0 THEN 1 ELSE 0 END)::double precision * w) / NULLIF(SUM(w), 0)) * 100.0 AS winrate_pct
+          FROM base
+          GROUP BY event_type, tf, horizon
+        )
+        SELECT
+          event_type, tf, horizon, cases, cases_eff, avg_up_pct, avg_down_pct, winrate_pct,
+          NULL::text AS dominant_regime,
+          NULL::double precision AS regime_conf,
+          NULL::double precision AS regime_share_pct
+        FROM agg
+        ORDER BY cases DESC
+        """
+        rows = await _run_query(p, sql2, (float(tau_s), str(horizon), str(event_type)))
 
     out: List[OutcomeScoreRow] = []
     for r in rows:
@@ -447,12 +613,6 @@ async def score_detail(*, event_type: str, horizon: str = "1h") -> List[OutcomeS
         reg_conf = (float(r[9]) if r[9] is not None else None)
         reg_share = (float(r[10]) if r[10] is not None else None)
 
-        bias = "neutral"
-        if abs(avg_up) > abs(avg_down):
-            bias = "up"
-        elif abs(avg_down) > abs(avg_up):
-            bias = "down"
-
         out.append(
             OutcomeScoreRow(
                 event_type=ev,
@@ -463,7 +623,7 @@ async def score_detail(*, event_type: str, horizon: str = "1h") -> List[OutcomeS
                 avg_up_pct=avg_up,
                 avg_down_pct=avg_down,
                 winrate_pct=winrate,
-                bias=bias,
+                bias=_bias_from_avgs(avg_up, avg_down),
                 confidence=_confidence(cases),
 
                 market_regime=dom_reg,
