@@ -272,8 +272,9 @@ def _mode_to_tf(mode: str) -> str:
         return "1d"
     if m in ("weekly_open", "weekly_close"):
         return "1w"
+    # ✅ FIX: manual не должен ломать market_data.get_candles
     if m in ("manual",):
-        return "manual"
+        return "1h"
     return "1h"
 
 
@@ -287,16 +288,16 @@ def _dir_from_state(state: str) -> Optional[str]:
 
 def _compute_regime_simple(df: pd.DataFrame) -> Tuple[Optional[str], Optional[int], Optional[float]]:
     """
-    Минимальный устойчивый regime (для записи в mm_market_regimes):
+    Минимальный устойчивый regime ДЛЯ mm_snapshots.market_regime (под CHECK constraint):
 
       - EMA20 vs EMA50
-      - если расхождение маленькое -> RANGE
-      - иначе TREND_UP / TREND_DOWN
+      - если расхождение маленькое -> 'range'
+      - иначе 'trend_up' / 'trend_down'
 
     Возвращаем:
-      market_regime: 'TREND_UP'|'TREND_DOWN'|'RANGE'
+      market_regime: 'trend_up'|'trend_down'|'range'   (lowercase!)
       trend_dir: 1|-1|0
-      trend_strength: 0..1 (можно трактовать как confidence)
+      trend_strength: 0..1
     """
     try:
         x = df.tail(260).copy()
@@ -312,21 +313,18 @@ def _compute_regime_simple(df: pd.DataFrame) -> Tuple[Optional[str], Optional[in
 
         diff_pct = abs(ema20 - ema50) / max(c, 1e-9)
 
-        # порог диапазона: 0.25%
-        thr = 0.0025
+        thr = 0.0025  # 0.25%
 
         if diff_pct < thr:
-            # чем меньше diff, тем выше уверенность в RANGE
             conf = 1.0 - min(1.0, max(0.0, diff_pct / thr))
-            return "RANGE", 0, float(conf)
+            return "range", 0, float(conf)
 
-        # тренд: нормируем силу: 0..1 при diff_pct thr..(thr+0.75%)
         strength = min(1.0, max(0.0, (diff_pct - thr) / 0.0075))
 
         if ema20 > ema50:
-            return "TREND_UP", 1, float(strength)
+            return "trend_up", 1, float(strength)
 
-        return "TREND_DOWN", -1, float(strength)
+        return "trend_down", -1, float(strength)
 
     except Exception:
         return None, None, None
@@ -344,12 +342,37 @@ async def _upsert_market_regime(
 ) -> None:
     """
     Пишем режим рынка в public.mm_market_regimes.
-    Upsert по (symbol, tf, ts_utc). Ошибки наружу не бросаем.
+    ⚠️ ВАЖНО: без created_at (у тебя его нет).
+    Ошибки наружу не бросаем.
     """
     if not regime:
         return
     if ts_utc.tzinfo is None:
         ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+
+    # приводим к формату таблицы режимов (обычно UPPER)
+    reg = str(regime).strip().upper()
+    if reg == "TREND_UP" or reg == "TRENDUP":
+        reg = "TREND_UP"
+    elif reg == "TREND_DOWN" or reg == "TRENDDOWN":
+        reg = "TREND_DOWN"
+    elif reg == "RANGE":
+        reg = "RANGE"
+    else:
+        # если пришло 'trend_up' и т.п.
+        if reg == "TREND_UP" or reg == "TRENDUP" or reg == "TREND-UP":
+            reg = "TREND_UP"
+        if reg == "TREND_DOWN" or reg == "TRENDDOWN" or reg == "TREND-DOWN":
+            reg = "TREND_DOWN"
+        if reg == "RANGE":
+            reg = "RANGE"
+        # snake-case
+        if reg.lower() == "trend_up":
+            reg = "TREND_UP"
+        if reg.lower() == "trend_down":
+            reg = "TREND_DOWN"
+        if reg.lower() == "range":
+            reg = "RANGE"
 
     try:
         pool = await _get_pool()
@@ -357,9 +380,9 @@ async def _upsert_market_regime(
             await conn.execute(
                 """
                 INSERT INTO public.mm_market_regimes (
-                    symbol, tf, ts_utc, regime, confidence, source, version, created_at
+                    symbol, tf, ts_utc, regime, confidence, source, version
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (symbol, tf, ts_utc)
                 DO UPDATE SET
                     regime = EXCLUDED.regime,
@@ -371,7 +394,7 @@ async def _upsert_market_regime(
                     str(symbol).upper(),
                     str(tf),
                     ts_utc,
-                    str(regime).upper(),
+                    reg,
                     (float(confidence) if confidence is not None else None),
                     str(source),
                     str(version),
@@ -648,7 +671,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         tf=tf_mode,
         exchange="okx",
         oi_source="okx",
-        market_regime=market_regime,
+        market_regime=market_regime,   # ✅ 'trend_up'/'trend_down'/'range'
         trend_dir=trend_dir,
         trend_strength=trend_strength,
         regime_source="ta",
@@ -666,9 +689,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         ts_utc=ts_snap,
     )
 
-    # ==================================================================
-    # 1.1) Пишем режим рынка в mm_market_regimes (НОВОЕ)
-    # ==================================================================
+    # (опционально) дублируем режим в отдельную таблицу — уже без created_at
     await _upsert_market_regime(
         symbol="BTCUSDT",
         tf=tf_mode,
@@ -701,7 +722,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     )
 
     # ----------------------------
-    # 2) pressure_shift (бывший PRESSURE_CHANGE)
+    # 2) pressure_shift
     # meta_required: from,to,score
     # ----------------------------
     try:
@@ -735,8 +756,6 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
     # ----------------------------
     # 3) sweep / reclaim (H1)
-    # sweep meta_required: side,level,strength
-    # reclaim meta_required: side,level
     # ----------------------------
     try:
         df1_btc, _ = await get_candles("BTCUSDT", "1h", limit=120)
@@ -802,8 +821,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         log.exception("MM sweep/reclaim block failed (non-fatal)")
 
     # ----------------------------
-    # 4) trend_shift (бывший STAGE_CHANGE)
-    # meta_required: from,to
+    # 4) trend_shift
     # ----------------------------
     try:
         mem = _mm_get("BTCUSDT")
@@ -828,7 +846,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         log.exception("MM events: failed to write trend_shift (non-fatal)")
 
     # ----------------------------
-    # 5) ETH relation influence (как было)
+    # 5) ETH relation influence
     # ----------------------------
     if relation == "confirms":
         p_down = min(90, p_down + 5)
