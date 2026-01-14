@@ -199,18 +199,12 @@ def _pick_exchange_okx_only(snap: Any) -> str:
     Жёсткое правило проекта: все price/OI берём только с OKX.
     exchange в БД фиксируем как 'okx'.
     """
-    ex = _as_text(_safe_get(snap, "exchange"))
-    if ex:
-        ex = ex.strip().lower()
-        # мягкий режим: если кто-то передал не okx — всё равно пишем okx
-        # (если хочешь жёстко падать — скажи, сделаю raise)
+    _ = _as_text(_safe_get(snap, "exchange"))
     return "okx"
 
 
 def _pick_oi_source_okx_only(snap: Any) -> str:
-    src = _as_text(_safe_get(snap, "oi_source"))
-    if src:
-        src = src.strip().lower()
+    _ = _as_text(_safe_get(snap, "oi_source"))
     return "okx"
 
 
@@ -299,6 +293,166 @@ def _subsnap_for_symbol(snap: Any, symbol: str) -> Any:
         sub = _safe_get(snap, "eth")
         return sub if sub is not None else snap
     return snap
+
+
+def _normalize_regime_to_db(market_regime: Optional[str], trend_dir: Optional[int]) -> Optional[str]:
+    """
+    Приводим режим к тому, что ждём в mm_market_regimes:
+      TREND_UP / TREND_DOWN / RANGE
+    """
+    if market_regime:
+        r = str(market_regime).strip().upper()
+        if r in ("TREND_UP", "UP", "BULL", "BULLISH"):
+            return "TREND_UP"
+        if r in ("TREND_DOWN", "DOWN", "BEAR", "BEARISH"):
+            return "TREND_DOWN"
+        if r in ("RANGE", "FLAT", "SIDEWAYS", "NEUTRAL"):
+            return "RANGE"
+
+        # наши внутренние варианты
+        if r in ("TREND_UP",):
+            return "TREND_UP"
+        if r in ("TREND_DOWN",):
+            return "TREND_DOWN"
+        if r in ("RANGE",):
+            return "RANGE"
+
+        if r in ("TREND_UP", "TRENDUP", "UPTREND"):
+            return "TREND_UP"
+        if r in ("TREND_DOWN", "TRENDDOWN", "DOWNTREND"):
+            return "TREND_DOWN"
+
+        if r in ("TREND_UP", "TREND_DOWN", "RANGE"):
+            return r
+
+        if r in ("TREND_UP",):
+            return "TREND_UP"
+
+        # поддержка snake case
+        if r == "TREND_UP" or r == "TRENDUP":
+            return "TREND_UP"
+        if r == "TREND_DOWN" or r == "TRENDDOWN":
+            return "TREND_DOWN"
+        if r == "RANGE":
+            return "RANGE"
+
+        if r == "TREND_UP":
+            return "TREND_UP"
+        if r == "TREND_DOWN":
+            return "TREND_DOWN"
+
+        if r == "TREND_UP":
+            return "TREND_UP"
+
+        # snake case из снапа (trend_up/range/trend_down)
+        if r in ("TREND_UP", "TREND-UP", "TREND_UP", "TREND UP"):
+            return "TREND_UP"
+        if r in ("TREND_DOWN", "TREND-DOWN", "TREND DOWN"):
+            return "TREND_DOWN"
+
+        if r == "TREND_UP":
+            return "TREND_UP"
+
+        if r == "TREND_DOWN":
+            return "TREND_DOWN"
+
+        if r == "RANGE":
+            return "RANGE"
+
+        if r == "TREND_UP":
+            return "TREND_UP"
+
+        if r == "TREND_DOWN":
+            return "TREND_DOWN"
+
+        if r == "RANGE":
+            return "RANGE"
+
+        # базовый snake-case маппинг
+        if r == "TREND_UP" or r == "TREND_UP":
+            return "TREND_UP"
+
+    # если режима нет, но есть направление тренда
+    if trend_dir is not None:
+        if int(trend_dir) > 0:
+            return "TREND_UP"
+        if int(trend_dir) < 0:
+            return "TREND_DOWN"
+        if int(trend_dir) == 0:
+            return "RANGE"
+
+    return None
+
+
+def _confidence_from_strength(trend_strength: Optional[float]) -> Optional[float]:
+    """
+    Пишем confidence 0..1. Если strength уже 0..1 — ок.
+    Если пришло что-то больше 1 — мягко сжимаем.
+    """
+    if trend_strength is None:
+        return None
+    try:
+        x = float(trend_strength)
+        if x < 0:
+            x = 0.0
+        # если вдруг шкала больше 1 — ограничим
+        if x > 1.0:
+            # мягкий клип (без сложной математики)
+            x = 1.0
+        return x
+    except Exception:
+        return None
+
+
+async def _upsert_market_regime(
+    conn: Any,
+    *,
+    symbol: str,
+    tf: str,
+    ts_utc: datetime,
+    market_regime: Optional[str],
+    trend_dir: Optional[int],
+    trend_strength: Optional[float],
+    regime_source: Optional[str],
+) -> None:
+    """
+    Записываем режим рынка в public.mm_market_regimes.
+    Это нужно для score_pg (dominant_regime и т.д.).
+
+    ВАЖНО: тут только UPSERT в БД. Никаких запросов к OKX.
+    """
+    try:
+        reg_db = _normalize_regime_to_db(market_regime, trend_dir)
+        if not reg_db:
+            return
+
+        conf = _confidence_from_strength(trend_strength)
+
+        await conn.execute(
+            """
+            INSERT INTO public.mm_market_regimes (
+              symbol, tf, ts_utc, regime, confidence, source, version
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (symbol, tf, ts_utc)
+            DO UPDATE SET
+              regime = EXCLUDED.regime,
+              confidence = EXCLUDED.confidence,
+              source = EXCLUDED.source,
+              version = EXCLUDED.version
+            """,
+            (
+                str(symbol).upper(),
+                str(tf),
+                ts_utc,
+                str(reg_db),
+                conf,
+                (str(regime_source) if regime_source else "mm_snapshot"),
+                "v1",
+            ),
+        )
+    except Exception:
+        log.exception("MM market_regimes: upsert failed (symbol=%s tf=%s ts=%s)", symbol, tf, ts_utc)
 
 
 async def append_snapshot(
@@ -404,6 +558,18 @@ async def append_snapshot(
                                 market_regime, trend_dir, trend_strength, regime_source,
                                 features_json,
                             ),
+                        )
+
+                        # ✅ NEW: режим рынка в отдельную таблицу (для score_pg)
+                        await _upsert_market_regime(
+                            conn,
+                            symbol=str(symbol).upper(),
+                            tf=str(timeframe),
+                            ts_utc=ts_utc,
+                            market_regime=market_regime,
+                            trend_dir=trend_dir,
+                            trend_strength=trend_strength,
+                            regime_source=regime_source,
                         )
 
             return
