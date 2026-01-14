@@ -1,185 +1,137 @@
 # services/market_data.py
-import os
-import asyncio
 import logging
-from typing import Tuple
+import re
+from typing import Tuple, List
+
 import httpx
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# --- helpers -------------------------------------------------------------
+OKX_BASE = "https://www.okx.com"
+
+# OKX candle bars mapping
 _TF_OKX = {
-    "5m": "5m", "10m": "10m", "15m": "15m", "30m": "30m",
-    "1h": "1H", "4h": "4H", "1d": "1D"
+    "5m": "5m",
+    "10m": "10m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1H",
+    "4h": "4H",
+    "1d": "1D",
+    "1w": "1W",
 }
-_TF_KUCOIN = {
-    "5m": "5min", "10m": "10min", "15m": "15min", "30m": "30min",
-    "1h": "1hour", "4h": "4hour", "1d": "1day"
-}
 
-def _sym_okx(symbol: str) -> str:
-    # BTCUSDT -> BTC-USDT
-    symbol = symbol.upper().replace("_", "")
-    if symbol.endswith("USDT"):
-        return symbol[:-4] + "-USDT"
-    return symbol
 
-def _sym_kucoin(symbol: str) -> str:
-    # KuCoin тоже любит дефис
-    return _sym_okx(symbol)
-
-def _df_ohlc_from_array(arr, schema="okx") -> pd.DataFrame:
+def _sym_okx_spot(symbol: str) -> str:
     """
-    Преобразует массив свечей в DataFrame с колонками [time, open, high, low, close, volume]
-    OKX: [ts, o, h, l, c, vol, volCcy]
-    KuCoin: [ts, o, c, h, l, vol, turnover]
+    BTCUSDT -> BTC-USDT (OKX spot instId)
+    """
+    s = symbol.upper().replace("_", "").replace("-", "")
+    if s.endswith("USDT"):
+        return s[:-4] + "-USDT"
+    return s
+
+
+def _df_ohlc_from_okx(arr) -> pd.DataFrame:
+    """
+    OKX candles schema:
+      [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    Возвращаем DataFrame с колонками:
+      [time, open, high, low, close, volume]
+    time в UTC ms, сортировка asc
     """
     rows = []
-    if schema == "okx":
-        for it in arr:
-            ts, o, h, l, c, vol, *_ = it
-            rows.append([int(ts), float(o), float(h), float(l), float(c), float(vol)])
-    else:  # kucoin
-        for it in arr:
-            ts, o, c, h, l, vol, *_ = it
-            rows.append([int(float(ts) * 1000), float(o), float(h), float(l), float(c), float(vol)])
+    for it in arr:
+        ts, o, h, l, c, vol, *_ = it
+        rows.append([int(ts), float(o), float(h), float(l), float(c), float(vol)])
 
     df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
     df.sort_values("time", inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
-# --- public API ----------------------------------------------------------
+
 async def get_candles(symbol: str, tf: str = "1h", limit: int = 300) -> Tuple[pd.DataFrame, str]:
     """
+    OKX-only.
     Возвращает (df, exchange), где df: columns [time, open, high, low, close, volume] UTC ms asc
-    Порядок попыток: OKX -> KuCoin. Берём первую успешную.
     """
-    symbol_okx = _sym_okx(symbol)
-    symbol_ku = _sym_kucoin(symbol)
+    if tf not in _TF_OKX:
+        raise ValueError(f"Unsupported tf for OKX: {tf}")
 
-    # --- OKX
-    if tf in _TF_OKX:
-        okx_url = "https://www.okx.com/api/v5/market/candles"
-        params = {"instId": symbol_okx, "bar": _TF_OKX[tf], "limit": str(limit)}
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(okx_url, params=params)
-                r.raise_for_status()
-                data = r.json()
-                arr = data.get("data") or []
-                if len(arr) > 0:
-                    df = _df_ohlc_from_array(arr, schema="okx")
-                    return df, "OKX"
-        except Exception as e:
-            log.warning("OKX candles error for %s %s: %s", symbol, tf, e)
+    okx_url = f"{OKX_BASE}/api/v5/market/candles"
+    params = {"instId": _sym_okx_spot(symbol), "bar": _TF_OKX[tf], "limit": str(limit)}
 
-    # --- KuCoin
-    if tf in _TF_KUCOIN:
-        ku_url = "https://api.kucoin.com/api/v1/market/candles"
-        params = {"symbol": symbol_ku, "type": _TF_KUCOIN[tf]}
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(ku_url, params=params)
-                r.raise_for_status()
-                data = r.json()
-                arr = data.get("data") or []
-                if len(arr) > 0:
-                    df = _df_ohlc_from_array(arr, schema="kucoin")
-                    return df, "KuCoin"
-        except Exception as e:
-            log.warning("KuCoin candles error for %s %s: %s", symbol, tf, e)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(okx_url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("data") or []
+        if not arr:
+            raise ValueError(f"No candles for {symbol} {tf} on OKX")
 
-    raise ValueError(f"No candles for {symbol} {tf}")
+        df = _df_ohlc_from_okx(arr)
+        return df, "OKX"
 
 
 async def get_price(symbol: str) -> Tuple[float, str]:
     """
-    Текущая цена: сначала OKX, затем KuCoin.
+    OKX-only ticker price.
     Возвращает (price, exchange)
     """
-    # OKX
-    try:
-        okx_ticker = "https://www.okx.com/api/v5/market/ticker"
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(okx_ticker, params={"instId": _sym_okx(symbol)})
-            r.raise_for_status()
-            j = r.json()
-            data = (j.get("data") or [{}])[0]
-            last = float(data.get("last"))
-            return last, "OKX"
-    except Exception as e:
-        log.warning("OKX price fail %s: %s", symbol, e)
+    okx_ticker = f"{OKX_BASE}/api/v5/market/ticker"
+    params = {"instId": _sym_okx_spot(symbol)}
 
-    # KuCoin
-    try:
-        ku_ticker = "https://api.kucoin.com/api/v1/market/orderbook/level1"
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(ku_ticker, params={"symbol": _sym_kucoin(symbol)})
-            r.raise_for_status()
-            j = r.json()
-            data = j.get("data") or {}
-            last = float(data.get("price"))
-            return last, "KuCoin"
-    except Exception as e:
-        log.warning("KuCoin price fail %s: %s", symbol, e)
+    async with httpx.AsyncClient(timeout=8) as client:
+        r = await client.get(okx_ticker, params=params)
+        r.raise_for_status()
+        j = r.json()
+        data = (j.get("data") or [{}])[0]
+        last = data.get("last")
+        if last is None:
+            raise ValueError(f"No last price for {symbol} on OKX")
+        return float(last), "OKX"
 
-    raise ValueError(f"No price for {symbol}")
-    # --- ДОБАВЬ НИЖЕ В services/market_data.py ---
 
-import re
-import httpx
-
-# Утилита нормализации "BTC-USDT" -> "BTCUSDT"
 def _norm(sym: str) -> str:
+    """
+    "BTC-USDT" -> "BTCUSDT"
+    """
     s = sym.replace("-", "").replace("_", "").upper()
-    # допускаем только буквы/цифры
     return re.sub(r"[^A-Z0-9]", "", s)
 
-async def search_symbols(query: str, limit: int = 50) -> list[str]:
+
+async def search_symbols(query: str, limit: int = 50) -> List[str]:
     """
-    Ищем пары по подстроке (безрегистр.) среди спотов OKX и KuCoin.
-    Возвращаем уплощённые тикеры вида BTCUSDT, без дублей, только USDT.
+    OKX-only.
+    Ищем пары по подстроке среди SPOT-инструментов OKX.
+    Возвращаем тикеры вида BTCUSDT (только USDT), без дублей.
     """
-    q = query.strip().lower()
+    q = (query or "").strip().lower()
     if not q:
         return []
 
-    out: list[str] = []
+    out: List[str] = []
+    seen = set()
 
     async with httpx.AsyncClient(timeout=10) as client:
-        # OKX instruments (SPOT)
-        try:
-            r_okx = await client.get("https://www.okx.com/api/v5/public/instruments", params={"instType": "SPOT"})
-            data = r_okx.json()
-            for inst in data.get("data", []):
-                inst_id = inst.get("instId", "")  # BTC-USDT
-                n = _norm(inst_id)
-                if n.endswith("USDT") and q in n.lower():
-                    out.append(n)
-        except Exception:
-            pass
+        r_okx = await client.get(
+            f"{OKX_BASE}/api/v5/public/instruments",
+            params={"instType": "SPOT"},
+        )
+        r_okx.raise_for_status()
+        data = r_okx.json()
 
-        # KuCoin symbols
-        try:
-            r_ku = await client.get("https://api.kucoin.com/api/v1/symbols")
-            data = r_ku.json()
-            for inst in data.get("data", []):
-                sym = inst.get("symbol", "")  # BTC-USDT
-                n = _norm(sym)
-                if n.endswith("USDT") and q in n.lower():
-                    out.append(n)
-        except Exception:
-            pass
+        for inst in data.get("data", []):
+            inst_id = inst.get("instId", "")  # BTC-USDT
+            n = _norm(inst_id)
+            if not n.endswith("USDT"):
+                continue
+            if q in n.lower() and n not in seen:
+                seen.add(n)
+                out.append(n)
+                if len(out) >= limit:
+                    break
 
-    # дедуп и ограничение
-    dedup = []
-    seen = set()
-    for s in out:
-        if s not in seen:
-            seen.add(s)
-            dedup.append(s)
-        if len(dedup) >= limit:
-            break
-    return dedup
+    return out
