@@ -24,7 +24,6 @@ def _dsn() -> str:
     if not dsn:
         raise RuntimeError("DATABASE_URL is not set")
 
-    # защита от "psql '...'"
     if dsn.lower().startswith("psql "):
         raise RuntimeError("DATABASE_URL looks like a psql command. Put only the postgresql://... URL")
 
@@ -55,7 +54,7 @@ def _now_utc() -> datetime:
 def _safe_float(x) -> Optional[float]:
     """
     None -> NULL в PG
-    NaN/inf -> NULL в PG (важно, иначе будут странные значения в БД)
+    NaN/inf -> NULL в PG
     """
     if x is None:
         return None
@@ -70,29 +69,36 @@ def _safe_float(x) -> Optional[float]:
 
 @dataclass
 class MMEventRow:
-    id: int
-    ts_utc: datetime
+    event_id: str
+    ts: datetime
     symbol: str
-    tf: str
+    exchange: str
+    timeframe: str
+    snapshot_id: str
     event_type: str
-    direction: Optional[str]
+    event_state: Optional[str]
+    ref_price: float
     meta: Optional[dict]
 
 
 async def fetch_events_missing_any_outcomes(limit: int = 200) -> List[MMEventRow]:
     """
-    (старый режим) Берём события, по которым нет НИ ОДНОГО outcome.
-    Оставляем для совместимости.
+    (совместимость) Берём события, по которым нет НИ ОДНОГО outcome.
+    В Outcomes 2.0 event_id = UUID.
     """
     p = await _pool()
+
     sql = """
-    SELECT e.id, e.ts_utc, e.symbol, e.tf, e.event_type, e.direction, e.meta
+    SELECT
+      e.event_id, e.ts, e.symbol, e.exchange, e.timeframe,
+      e.snapshot_id, e.event_type, e.event_state, e.ref_price, e.meta
     FROM public.mm_events e
-    LEFT JOIN public.mm_outcomes o ON o.event_id = e.id
-    WHERE o.id IS NULL
-    ORDER BY e.ts_utc ASC
+    LEFT JOIN public.mm_outcomes o ON o.event_id = e.event_id
+    WHERE o.event_id IS NULL
+    ORDER BY e.ts ASC
     LIMIT %s
     """
+
     async with p.connection() as conn:
         cur = await conn.execute(sql, (int(limit),))
         rows = await cur.fetchall()
@@ -101,13 +107,16 @@ async def fetch_events_missing_any_outcomes(limit: int = 200) -> List[MMEventRow
     for r in rows:
         out.append(
             MMEventRow(
-                id=int(r[0]),
-                ts_utc=r[1],
+                event_id=str(r[0]),
+                ts=r[1],
                 symbol=str(r[2]),
-                tf=str(r[3]),
-                event_type=str(r[4]),
-                direction=(str(r[5]) if r[5] is not None else None),
-                meta=(r[6] if r[6] is not None else None),
+                exchange=str(r[3]),
+                timeframe=str(r[4]),
+                snapshot_id=str(r[5]),
+                event_type=str(r[6]),
+                event_state=(str(r[7]) if r[7] is not None else None),
+                ref_price=float(r[8]),
+                meta=(r[9] if r[9] is not None else None),
             )
         )
     return out
@@ -148,15 +157,17 @@ async def fetch_events_needing_outcomes(
       FROM public.mm_outcomes
       GROUP BY event_id
     )
-    SELECT e.id, e.ts_utc, e.symbol, e.tf, e.event_type, e.direction, e.meta
+    SELECT
+      e.event_id, e.ts, e.symbol, e.exchange, e.timeframe,
+      e.snapshot_id, e.event_type, e.event_state, e.ref_price, e.meta
     FROM public.mm_events e
-    LEFT JOIN agg a ON a.event_id = e.id
+    LEFT JOIN agg a ON a.event_id = e.event_id
     WHERE
       COALESCE(a.c_1h, 0) = 0
       OR COALESCE(a.c_4h, 0) = 0
       OR COALESCE(a.c_1d, 0) = 0
       OR COALESCE(a.null_ok_rows, 0) > 0
-    ORDER BY e.ts_utc ASC
+    ORDER BY e.ts ASC
     LIMIT %s
     """
 
@@ -168,13 +179,16 @@ async def fetch_events_needing_outcomes(
     for r in rows:
         out.append(
             MMEventRow(
-                id=int(r[0]),
-                ts_utc=r[1],
+                event_id=str(r[0]),
+                ts=r[1],
                 symbol=str(r[2]),
-                tf=str(r[3]),
-                event_type=str(r[4]),
-                direction=(str(r[5]) if r[5] is not None else None),
-                meta=(r[6] if r[6] is not None else None),
+                exchange=str(r[3]),
+                timeframe=str(r[4]),
+                snapshot_id=str(r[5]),
+                event_type=str(r[6]),
+                event_state=(str(r[7]) if r[7] is not None else None),
+                ref_price=float(r[8]),
+                meta=(r[9] if r[9] is not None else None),
             )
         )
     return out
@@ -182,7 +196,7 @@ async def fetch_events_needing_outcomes(
 
 async def upsert_outcome(
     *,
-    event_id: int,
+    event_id: str,
     horizon: str,
     max_up_pct: Optional[float],
     max_down_pct: Optional[float],
@@ -202,7 +216,6 @@ async def upsert_outcome(
     cp = _safe_float(close_pct)
 
     if mu is None or md is None or cp is None:
-        # НЕ сохраняем "ok" с пустыми метриками — это и создавало твою проблему.
         outcome_type = "error_no_data"
         log.warning(
             "Outcome has NULL metrics -> store as %s (event_id=%s horizon=%s mu=%s md=%s cp=%s)",
@@ -214,11 +227,12 @@ async def upsert_outcome(
         event_ts_utc = event_ts_utc.replace(tzinfo=timezone.utc)
 
     p = await _pool()
+
     sql = """
     INSERT INTO public.mm_outcomes (
         event_id, horizon, max_up_pct, max_down_pct, close_pct, outcome_type, event_ts_utc, created_at
     )
-    VALUES (%s,%s,%s,%s,%s,%s,%s, now())
+    VALUES (%s::uuid,%s,%s,%s,%s,%s,%s, now())
     ON CONFLICT (event_id, horizon)
     DO UPDATE SET
         max_up_pct = EXCLUDED.max_up_pct,
@@ -227,15 +241,16 @@ async def upsert_outcome(
         outcome_type = EXCLUDED.outcome_type,
         event_ts_utc = EXCLUDED.event_ts_utc
     """
+
     async with p.connection() as conn:
         await conn.execute(
             sql,
             (
-                int(event_id),
+                str(event_id),
                 str(horizon),
-                mu,  # может быть NULL
-                md,  # может быть NULL
-                cp,  # может быть NULL
+                mu,
+                md,
+                cp,
                 str(outcome_type),
                 event_ts_utc,
             ),
