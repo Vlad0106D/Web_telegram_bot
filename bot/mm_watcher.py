@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -65,36 +64,10 @@ def _ensure_mm_state(app: Application) -> Dict[str, Any]:
     return mm
 
 
-async def _try_save_snapshot(
-    *,
-    snap: Any,  # MMSnapshot или dict
-    source_mode: str,
-    ts_utc: datetime,
-    symbols: str = "BTCUSDT,ETHUSDT",
-) -> None:
-    """
-    Безопасная запись snapshot в внешнюю память.
-    Если модуль памяти/БД ещё не подключены — ничего не ломаем.
-    """
-    try:
-        # локальный импорт, чтобы файл работал даже если memory_store_pg ещё не создан
-        from services.mm_mode.memory_store_pg import append_snapshot  # type: ignore
-
-        await append_snapshot(
-            snap=snap,
-            source_mode=source_mode,
-            symbols=symbols,
-            ts_utc=ts_utc,
-        )
-    except Exception:
-        # Память не должна ломать MM MODE
-        log.exception("MM memory: failed to save snapshot (%s)", source_mode)
-
-
 async def _get_last_open_ms(symbol: str, tf: str) -> Optional[int]:
     """
     Берём последнюю свечу (по времени открытия).
-    get_candles() уже сортирует по time asc, поэтому iloc[-1] корректен.
+    get_candles() возвращает df отсортированный по time asc, поэтому iloc[-1] корректен.
     """
     df, _ = await get_candles(symbol, tf=tf, limit=3)
     if df is None or df.empty:
@@ -131,27 +104,29 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         mm["last_h1_open"] = last_h1_open
         dt_new = _utc_dt(last_h1_open)  # время открытия нового часа (значит прошлый час закрылся)
 
+        # ВАЖНО:
+        # build_mm_snapshot() теперь САМ:
+        #  - пишет snapshot в public.mm_snapshots
+        #  - пишет события в public.mm_events (snapshot_id/ref_price строго из БД)
+        # watcher больше НЕ пишет snapshot вручную, чтобы не было дублей и разных ts.
+
         # ---------------------------------------------
         # 1) DAILY CLOSE / WEEKLY CLOSE (граница дня)
         # ---------------------------------------------
-        # Если новый час = 00:00 UTC => закрылись сутки (вчера)
         if dt_new.hour == 0:
-            yday_dt = _utc_dt(last_h1_open - 1)          # любая точка "вчера"
+            yday_dt = _utc_dt(last_h1_open - 1)
             yday_id = _iso_day(yday_dt)
 
             if mm.get("sent_day_close_id") != yday_id:
                 snap = await build_mm_snapshot(now_dt=dt_new, mode="daily_close")
-                await _try_save_snapshot(snap=snap, source_mode="daily_close", ts_utc=dt_new)
                 text = format_mm_report_ru(snap, report_type="DAILY_CLOSE")
                 await context.bot.send_message(chat_id=chat_id, text=text)
                 mm["sent_day_close_id"] = yday_id
 
-            # Если это понедельник 00:00 UTC => закрылась неделя (предыдущая ISO-неделя)
             if dt_new.weekday() == 0:
                 prev_week_id = _iso_week(_utc_dt(last_h1_open - 1))
                 if mm.get("sent_week_close_id") != prev_week_id:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="weekly_close")
-                    await _try_save_snapshot(snap=snap, source_mode="weekly_close", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="WEEKLY_CLOSE")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_week_close_id"] = prev_week_id
@@ -159,22 +134,18 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         # ---------------------------------------------
         # 2) DAILY OPEN / WEEKLY OPEN (после закрытия 1-го часа)
         # ---------------------------------------------
-        # "Открытие дня": когда мы видим бар 01:00, значит час 00:00–01:00 закрылся.
         if dt_new.hour == 1:
             day_id = _iso_day(dt_new)
             if mm.get("sent_day_open_id") != day_id:
                 snap = await build_mm_snapshot(now_dt=dt_new, mode="daily_open")
-                await _try_save_snapshot(snap=snap, source_mode="daily_open", ts_utc=dt_new)
                 text = format_mm_report_ru(snap, report_type="DAILY_OPEN")
                 await context.bot.send_message(chat_id=chat_id, text=text)
                 mm["sent_day_open_id"] = day_id
 
-            # "Открытие недели": понедельник, после закрытия 1-го часа недели
             if dt_new.weekday() == 0:
                 week_id = _iso_week(dt_new)
                 if mm.get("sent_week_open_id") != week_id:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="weekly_open")
-                    await _try_save_snapshot(snap=snap, source_mode="weekly_open", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="WEEKLY_OPEN")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_week_open_id"] = week_id
@@ -192,7 +163,6 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 mm["last_h4_open"] = last_h4_open
                 if mm.get("sent_h4_open") != last_h4_open:
                     snap = await build_mm_snapshot(now_dt=dt_new, mode="h4_close")
-                    await _try_save_snapshot(snap=snap, source_mode="h4_close", ts_utc=dt_new)
                     text = format_mm_report_ru(snap, report_type="H4")
                     await context.bot.send_message(chat_id=chat_id, text=text)
                     mm["sent_h4_open"] = last_h4_open
@@ -203,13 +173,11 @@ async def _mm_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         # ---------------------------------------------
         if mm.get("sent_h1_open") != last_h1_open:
             snap = await build_mm_snapshot(now_dt=dt_new, mode="h1_close")
-            await _try_save_snapshot(snap=snap, source_mode="h1_close", ts_utc=dt_new)
             text = format_mm_report_ru(snap, report_type="H1")
             await context.bot.send_message(chat_id=chat_id, text=text)
             mm["sent_h1_open"] = last_h1_open
 
     except Exception:
-        # чтобы джоба не умирала
         log.exception("MM tick failed")
 
 
@@ -257,7 +225,8 @@ async def cmd_mm_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Чат: <code>{chat_id}</code>\n"
         f"Job: <code>{name}</code>\n"
         f"Проверка закрытий: каждые {mm.get('interval_sec')} сек.\n"
-        "Отчёты: H1/H4 + Daily/Weekly",
+        "Отчёты: H1/H4 + Daily/Weekly\n"
+        "База: snapshots/events пишутся внутри core.py",
         parse_mode="HTML",
     )
 
@@ -306,9 +275,6 @@ async def cmd_mm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ручной снимок
     now_dt = datetime.now(timezone.utc)
     snap = await build_mm_snapshot(now_dt=now_dt, mode="manual")
-
-    # Пишем в память (безопасно).
-    await _try_save_snapshot(snap=snap, source_mode="manual", ts_utc=now_dt)
 
     text = format_mm_report_ru(snap, report_type="MANUAL")
     await update.effective_message.reply_text(text)
