@@ -13,7 +13,10 @@ from services.indicators import true_range as true_range_series
 # деривативные метрики OKX (public, без ключей)
 from services.mm_mode.okx_derivatives import get_derivatives_snapshot
 
-# запись событий в Postgres
+# запись снапшота в Postgres (Outcomes 2.0)
+from services.mm_mode.memory_store_pg import append_snapshot, _get_pool
+
+# запись событий в Postgres (Outcomes 2.0)
 from services.mm_mode.memory_events_pg import append_event
 
 log = logging.getLogger(__name__)
@@ -37,19 +40,16 @@ def _mm_get(symbol: str) -> Dict[str, Any]:
             # signature of structure -> reset sweep memory
             "sig": None,
 
-            # event dedupe / state tracking (for BTC)
+            # state tracking
             "last_state": None,
             "last_stage": None,
 
-            # to prevent duplicate PRESSURE_CHANGE/STAGE_CHANGE on same computed value
+            # dedupe
             "last_pressure_event": None,  # tuple(tf, state)
             "last_stage_event": None,     # tuple(tf, stage)
-
-            # to prevent duplicate SWEEP/RECLAIM spam
             "last_sweep_event": None,     # tuple(tf, dir, level)
             "last_reclaim_event": None,   # tuple(tf, dir)
 
-            # optional: last seen mode (debug)
             "last_mode": None,
         }
     return _MM_CACHE[s]
@@ -78,7 +78,7 @@ def _floor_tf_open_ms(dt: datetime, tf: str) -> int:
 def _last_closed_bar(df: pd.DataFrame, now_dt: datetime, tf: str) -> pd.Series:
     """
     Возвращаем последнюю ЗАКРЫТУЮ свечу.
-    Если последняя свеча в df — это "текущая" (ее open ~ текущему tf open) => берём предпоследнюю.
+    Если последняя свеча в df — это "текущая" => берём предпоследнюю.
     """
     if df is None or df.empty:
         raise ValueError("empty df")
@@ -86,44 +86,19 @@ def _last_closed_bar(df: pd.DataFrame, now_dt: datetime, tf: str) -> pd.Series:
     cur_open_ms = _floor_tf_open_ms(now_dt, tf=tf)
     last_open_ms = int(df["time"].iloc[-1])
 
-    # если последняя свеча — это текущая (ещё не закрыта)
     if abs(last_open_ms - cur_open_ms) <= 60_000:
         if len(df) >= 2:
             return df.iloc[-2]
     return df.iloc[-1]
 
 
-@dataclass
-class DriverView:
-    symbol: str
-    price: float
-    h1_atr: float
-    range_high: float
-    range_low: float
-    swing_high: float
-    swing_low: float
-    targets_up: List[float]
-    targets_down: List[float]
-
-    swap_inst_id: Optional[str] = None
-    open_interest: Optional[float] = None
-    funding_rate: Optional[float] = None
-    next_funding_time_ms: Optional[int] = None
-
-
-@dataclass
-class MMSnapshot:
-    now_dt: datetime
-    state: str
-    stage: str
-    p_down: int
-    p_up: int
-    key_zone: Optional[str]
-    next_steps: List[str]
-    invalidation: str
-    btc: DriverView
-    eth: DriverView
-    eth_relation: str
+def _bar_open_ts_utc(bar: pd.Series) -> datetime:
+    """
+    В БД mm_snapshots.ts пишем строго по open-time закрытой свечи (UTC).
+    df['time'] ожидаем в ms.
+    """
+    t_ms = int(bar["time"])
+    return datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc)
 
 
 def _last_close(df: pd.DataFrame) -> float:
@@ -151,9 +126,7 @@ def _pivot_swings(df: pd.DataFrame, w: int = 3) -> Tuple[float, float]:
     return sh, sl
 
 
-def _targets(
-    px: float, range_high: float, range_low: float, swing_high: float, swing_low: float
-) -> Tuple[List[float], List[float]]:
+def _targets(px: float, range_high: float, range_low: float, swing_high: float, swing_low: float) -> Tuple[List[float], List[float]]:
     up = sorted(set([range_high, swing_high]))
     dn = sorted(set([range_low, swing_low]), reverse=True)
 
@@ -206,7 +179,6 @@ def _apply_sweep_memory(
     mem = _mm_get(symbol)
     sig_now = _sig(rh, rl, sh, sl)
 
-    # если структура диапазона изменилась — сбрасываем sweep/reclaim память
     if mem.get("sig") != sig_now:
         mem["sig"] = sig_now
         mem["last_swept_down"] = None
@@ -235,12 +207,12 @@ def _detect_sweep_or_reclaim(
     atr_h1: float,
     targets_up: List[float],
     targets_down: List[float],
-) -> Tuple[str, Optional[float], Optional[float]]:
+) -> Tuple[str, Optional[float], Optional[float], Optional[float]]:
     """
     Возвращает:
-      ("SWEEP_DONE", swept_down_level, swept_up_level)
-      ("RECLAIM_DONE", None, None)
-      ("NONE", None, None)
+      ("SWEEP_DONE", swept_down_level, swept_up_level, None)
+      ("RECLAIM_DONE", None, None, reclaimed_level)
+      ("NONE", None, None, None)
     """
     try:
         bar = _last_closed_bar(df_h1, now_dt, tf="1h")
@@ -248,7 +220,7 @@ def _detect_sweep_or_reclaim(
         hi = float(bar["high"])
         cl = float(bar["close"])
     except Exception:
-        return "NONE", None, None
+        return "NONE", None, None, None
 
     mem = _mm_get(symbol)
 
@@ -263,31 +235,31 @@ def _detect_sweep_or_reclaim(
         if lo <= (lvl + tol):
             swept_down = lvl
             mem["last_swept_down"] = lvl
-            mem["last_reclaim_down"] = None  # новый sweep => reclaim ещё не был
+            mem["last_reclaim_down"] = None
 
     if state == "ACTIVE_UP" and targets_up:
         lvl = float(targets_up[0])
         if hi >= (lvl - tol):
             swept_up = lvl
             mem["last_swept_up"] = lvl
-            mem["last_reclaim_up"] = None  # новый sweep => reclaim ещё не был
+            mem["last_reclaim_up"] = None
 
     if swept_down is not None or swept_up is not None:
-        return "SWEEP_DONE", swept_down, swept_up
+        return "SWEEP_DONE", swept_down, swept_up, None
 
-    # reclaim после sweep вниз: закрытие выше уровня + tol
+    # reclaim после sweep вниз
     sd = mem.get("last_swept_down")
     if sd is not None and mem.get("last_reclaim_down") is None and cl > float(sd) + tol:
         mem["last_reclaim_down"] = float(sd)
-        return "RECLAIM_DONE", None, None
+        return "RECLAIM_DONE", None, None, float(sd)
 
-    # reclaim после sweep вверх: закрытие ниже уровня - tol
+    # reclaim после sweep вверх
     su = mem.get("last_swept_up")
     if su is not None and mem.get("last_reclaim_up") is None and cl < float(su) - tol:
         mem["last_reclaim_up"] = float(su)
-        return "RECLAIM_DONE", None, None
+        return "RECLAIM_DONE", None, None, float(su)
 
-    return "NONE", None, None
+    return "NONE", None, None, None
 
 
 def _mode_to_tf(mode: str) -> str:
@@ -313,6 +285,41 @@ def _dir_from_state(state: str) -> Optional[str]:
     return None
 
 
+def _compute_regime_simple(df: pd.DataFrame) -> Tuple[Optional[str], Optional[int], Optional[float]]:
+    """
+    Минимальный устойчивый regime:
+      - EMA20 vs EMA50: если расхождение маленькое -> range
+      - иначе trend_up / trend_down
+    """
+    try:
+        x = df.tail(200).copy()
+        if x.empty:
+            return None, None, None
+        x["ema20"] = x["close"].ewm(span=20).mean()
+        x["ema50"] = x["close"].ewm(span=50).mean()
+
+        c = float(x["close"].iloc[-1])
+        ema20 = float(x["ema20"].iloc[-1])
+        ema50 = float(x["ema50"].iloc[-1])
+
+        diff_pct = abs(ema20 - ema50) / max(c, 1e-9)
+
+        # порог диапазона (можно потом вынести в env)
+        if diff_pct < 0.0025:
+            return "range", 0, float(min(1.0, diff_pct / 0.0025))
+
+        if ema20 > ema50:
+            # strength нормируем: 0..1 при diff_pct 0.25%..1%
+            strength = min(1.0, max(0.0, (diff_pct - 0.0025) / 0.0075))
+            return "trend_up", 1, float(strength)
+
+        strength = min(1.0, max(0.0, (diff_pct - 0.0025) / 0.0075))
+        return "trend_down", -1, float(strength)
+
+    except Exception:
+        return None, None, None
+
+
 def _build_event_context(
     *,
     now_dt: datetime,
@@ -320,14 +327,10 @@ def _build_event_context(
     tf_mode: str,
     state: str,
     stage: str,
-    btc: DriverView,
-    eth: DriverView,
+    btc: "DriverView",
+    eth: "DriverView",
     eth_relation: str,
 ) -> Dict[str, Any]:
-    """
-    Контекст (meta) — НЕ влияет на логику, только “подпись” события.
-    Пишем аккуратно: допускаем None.
-    """
     return {
         "source": "okx_swap",
         "ts_context_utc": now_dt.astimezone(timezone.utc).isoformat(),
@@ -353,19 +356,42 @@ def _build_event_context(
     }
 
 
-async def _safe_append_event(
+async def _get_snapshot_id(symbol: str, tf: str, ts_utc: datetime) -> Optional[str]:
+    """
+    Берём snapshot_id из public.mm_snapshots по уникальному ключу.
+    """
+    try:
+        pool = await _get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT snapshot_id
+                FROM public.mm_snapshots
+                WHERE symbol=%s AND exchange='okx' AND timeframe=%s AND ts=%s
+                """,
+                (symbol.upper(), tf, ts_utc),
+            )
+            row = await cur.fetchone()
+            return str(row[0]) if row and row[0] is not None else None
+    except Exception:
+        log.exception("MM: failed to load snapshot_id from DB")
+        return None
+
+
+async def _safe_append_event_v2(
     *,
     event_type: str,
     symbol: str,
     tf: str,
-    direction: Optional[str],
-    level: Optional[float],
-    meta: Optional[Dict[str, Any]] = None,
+    snapshot_id: str,
+    ref_price: float,
+    event_state: Optional[str],
+    meta: Dict[str, Any],
     dedupe_key: Optional[Tuple[Any, ...]] = None,
     dedupe_slot: Optional[str] = None,
 ) -> None:
     """
-    Безопасная запись события в БД + простая дедупликация через in-memory cache.
+    Безопасная запись события в БД + дедуп.
     """
     try:
         mem = _mm_get(symbol)
@@ -380,17 +406,76 @@ async def _safe_append_event(
             event_type=event_type,
             symbol=symbol,
             tf=tf,
-            direction=direction,
-            level=level,
-            meta=meta or {},
+            snapshot_id=snapshot_id,
+            ref_price=ref_price,
+            event_state=event_state,
+            meta=meta,
+            exchange="okx",
         )
     except Exception:
         log.exception("MM events: append_event failed (%s %s %s)", event_type, symbol, tf)
 
 
-async def _driver(symbol: str, now_dt: datetime) -> DriverView:
+@dataclass
+class DriverView:
+    symbol: str
+    price: float
+    h1_atr: float
+    range_high: float
+    range_low: float
+    swing_high: float
+    swing_low: float
+    targets_up: List[float]
+    targets_down: List[float]
+
+    # candle of tf_mode (last closed)
+    o: float = 0.0
+    h: float = 0.0
+    l: float = 0.0
+    c: float = 0.0
+    v: Optional[float] = None
+    candle_ts_utc: Optional[datetime] = None
+
+    swap_inst_id: Optional[str] = None
+    open_interest: Optional[float] = None
+    open_interest_usd: Optional[float] = None
+    funding_rate: Optional[float] = None
+    next_funding_time_ms: Optional[int] = None
+
+
+@dataclass
+class MMSnapshot:
+    now_dt: datetime
+    state: str
+    stage: str
+    p_down: int
+    p_up: int
+    key_zone: Optional[str]
+    next_steps: List[str]
+    invalidation: str
+    btc: DriverView
+    eth: DriverView
+    eth_relation: str
+
+    # used by memory_store_pg.append_snapshot()
+    tf: Optional[str] = None
+    exchange: str = "okx"
+    oi_source: str = "okx"
+
+    # regime (optional; will be filled)
+    market_regime: Optional[str] = None
+    trend_dir: Optional[int] = None
+    trend_strength: Optional[float] = None
+    regime_source: str = "ta"
+
+
+async def _driver(symbol: str, now_dt: datetime, tf_mode: str) -> DriverView:
+    # candles for atr/structure
     df1, _ = await get_candles(symbol, "1h", limit=300)
     df4, _ = await get_candles(symbol, "4h", limit=200)
+
+    # candles for tf_mode OHLCV (last closed)
+    df_tf, _ = await get_candles(symbol, tf_mode, limit=120)
 
     px = _last_close(df1)
     atr = _atr_h1(df1)
@@ -399,6 +484,14 @@ async def _driver(symbol: str, now_dt: datetime) -> DriverView:
 
     up, dn = _targets(px, rh, rl, sh, sl)
     up, dn = _apply_sweep_memory(symbol, rh, rl, sh, sl, up, dn)
+
+    bar = _last_closed_bar(df_tf, now_dt, tf=tf_mode)
+    o = float(bar["open"])
+    h = float(bar["high"])
+    l = float(bar["low"])
+    c = float(bar["close"])
+    v = float(bar["volume"]) if "volume" in bar else None
+    ts_utc = _bar_open_ts_utc(bar)
 
     snap = None
     try:
@@ -416,8 +509,15 @@ async def _driver(symbol: str, now_dt: datetime) -> DriverView:
         swing_low=sl,
         targets_up=up,
         targets_down=dn,
+        o=o,
+        h=h,
+        l=l,
+        c=c,
+        v=v,
+        candle_ts_utc=ts_utc,
         swap_inst_id=getattr(snap, "inst_id", None) if snap else None,
         open_interest=getattr(snap, "open_interest", None) if snap else None,
+        open_interest_usd=getattr(snap, "open_interest_usd", None) if snap else None,
         funding_rate=getattr(snap, "funding_rate", None) if snap else None,
         next_funding_time_ms=getattr(snap, "next_funding_time_ms", None) if snap else None,
     )
@@ -429,8 +529,8 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
     tf_mode = _mode_to_tf(mode)
 
-    btc = await _driver("BTCUSDT", now_dt=now_dt)
-    eth = await _driver("ETHUSDT", now_dt=now_dt)
+    btc = await _driver("BTCUSDT", now_dt=now_dt, tf_mode=tf_mode)
+    eth = await _driver("ETHUSDT", now_dt=now_dt, tf_mode=tf_mode)
 
     btc_state, p_down, p_up = _bias_from_liquidity(btc.price, btc.targets_up, btc.targets_down)
     eth_state, _, _ = _bias_from_liquidity(eth.price, eth.targets_up, eth.targets_down)
@@ -468,7 +568,55 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             next_steps = ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"]
             invalidation = "—"
 
-    # общий контекст события (meta) — один раз на снапшот
+    # regime по TF_mode для BTC (простое TA)
+    df_tf_btc, _ = await get_candles("BTCUSDT", tf_mode, limit=250)
+    market_regime, trend_dir, trend_strength = _compute_regime_simple(df_tf_btc)
+
+    mm = MMSnapshot(
+        now_dt=now_dt,
+        state=state,
+        stage=stage,
+        p_down=int(p_down),
+        p_up=int(p_up),
+        key_zone=key_zone,
+        next_steps=next_steps,
+        invalidation=invalidation,
+        btc=btc,
+        eth=eth,
+        eth_relation=relation,
+        tf=tf_mode,
+        exchange="okx",
+        oi_source="okx",
+        market_regime=market_regime,
+        trend_dir=trend_dir,
+        trend_strength=trend_strength,
+        regime_source="ta",
+    )
+
+    # ==================================================================
+    # 1) Пишем snapshot в БД (Outcomes 2.0) по ts закрытой свечи TF_mode
+    # ==================================================================
+    # ts берём по BTC-бару (оба символа должны быть в одном TF режиме)
+    ts_snap = btc.candle_ts_utc or now_dt.astimezone(timezone.utc)
+
+    await append_snapshot(
+        snap=mm,
+        source_mode=mode,
+        symbols="BTCUSDT,ETHUSDT",
+        ts_utc=ts_snap,
+    )
+
+    # snapshot_id для BTC (для событий по BTC)
+    snapshot_id_btc = await _get_snapshot_id("BTCUSDT", tf_mode, ts_snap)
+    if not snapshot_id_btc:
+        # если не можем привязать событие к снапу — лучше молча не писать события (не ломаем данные)
+        log.warning("MM: snapshot_id not found, skip events (symbol=BTCUSDT tf=%s ts=%s)", tf_mode, ts_snap)
+        return mm
+
+    # ref_price строго из свечи TF_mode (close)
+    ref_price_btc = float(btc.c)
+
+    # общий контекст события (meta)
     event_ctx = _build_event_context(
         now_dt=now_dt,
         mode=mode,
@@ -481,22 +629,28 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     )
 
     # ----------------------------
-    # 0) PRESSURE_CHANGE (базовые события)
+    # 2) pressure_shift (бывший PRESSURE_CHANGE)
+    # meta_required: from,to,score
     # ----------------------------
     try:
         mem = _mm_get("BTCUSDT")
-
         prev_state = mem.get("last_state")
 
-        # pressure change
         if prev_state is None or prev_state != state:
-            await _safe_append_event(
-                event_type="PRESSURE_CHANGE",
+            meta = {
+                "from": (prev_state or "NONE"),
+                "to": state,
+                "score": int(p_up - p_down),  # простая шкала перекоса
+                "ctx": event_ctx,
+            }
+            await _safe_append_event_v2(
+                event_type="pressure_shift",
                 symbol="BTCUSDT",
                 tf=tf_mode,
-                direction=_dir_from_state(state),
-                level=None,
-                meta=event_ctx,
+                snapshot_id=snapshot_id_btc,
+                ref_price=ref_price_btc,
+                event_state=f"{prev_state or 'NONE'}->{state}",
+                meta=meta,
                 dedupe_key=(tf_mode, state),
                 dedupe_slot="last_pressure_event",
             )
@@ -505,14 +659,16 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         mem["last_mode"] = mode
 
     except Exception:
-        log.exception("MM events: failed to write PRESSURE_CHANGE (non-fatal)")
+        log.exception("MM events: failed to write pressure_shift (non-fatal)")
 
     # ----------------------------
-    # 1) SWEEP / RECLAIM (H1) + запись события
+    # 3) sweep / reclaim (H1) — как было, но taxonomy/meta обновлены
+    # sweep meta_required: side,level,strength
+    # reclaim meta_required: side,level
     # ----------------------------
     try:
         df1_btc, _ = await get_candles("BTCUSDT", "1h", limit=120)
-        stage_over, swept_dn, swept_up = _detect_sweep_or_reclaim(
+        stage_over, swept_dn, swept_up, reclaimed_lvl = _detect_sweep_or_reclaim(
             symbol="BTCUSDT",
             state=state,
             now_dt=now_dt,
@@ -525,93 +681,82 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         if stage_over == "SWEEP_DONE":
             stage = "SWEEP_DONE"
 
-            # DB EVENT (SWEEP) — с дедупом
             if swept_dn is not None:
-                await _safe_append_event(
-                    event_type="SWEEP",
+                meta = {"side": "down", "level": float(swept_dn), "strength": 0.7, "ctx": {**event_ctx, "stage": stage}}
+                await _safe_append_event_v2(
+                    event_type="sweep",
                     symbol="BTCUSDT",
                     tf="1h",
-                    direction="down",
-                    level=float(swept_dn),
-                    meta={**event_ctx, "stage": stage},
+                    snapshot_id=snapshot_id_btc,
+                    ref_price=ref_price_btc,
+                    event_state=None,
+                    meta=meta,
                     dedupe_key=("1h", "down", round(float(swept_dn), 2)),
                     dedupe_slot="last_sweep_event",
                 )
+
             if swept_up is not None:
-                await _safe_append_event(
-                    event_type="SWEEP",
+                meta = {"side": "up", "level": float(swept_up), "strength": 0.7, "ctx": {**event_ctx, "stage": stage}}
+                await _safe_append_event_v2(
+                    event_type="sweep",
                     symbol="BTCUSDT",
                     tf="1h",
-                    direction="up",
-                    level=float(swept_up),
-                    meta={**event_ctx, "stage": stage},
+                    snapshot_id=snapshot_id_btc,
+                    ref_price=ref_price_btc,
+                    event_state=None,
+                    meta=meta,
                     dedupe_key=("1h", "up", round(float(swept_up), 2)),
                     dedupe_slot="last_sweep_event",
                 )
 
-            btc.targets_up, btc.targets_down = _apply_sweep_memory(
-                "BTCUSDT",
-                btc.range_high,
-                btc.range_low,
-                btc.swing_high,
-                btc.swing_low,
-                btc.targets_up,
-                btc.targets_down,
-            )
-
-            if state == "ACTIVE_DOWN":
-                next_steps = ["Ликвидность по лоям снята", "Теперь ждём возврат (reclaim) над уровнем"]
-            elif state == "ACTIVE_UP":
-                next_steps = ["Ликвидность по хаям снята", "Теперь ждём возврат (reclaim) под уровнем"]
-
-        elif stage_over == "RECLAIM_DONE":
+        elif stage_over == "RECLAIM_DONE" and reclaimed_lvl is not None:
             stage = "RECLAIM_DONE"
+            side = "down" if state == "ACTIVE_DOWN" else "up" if state == "ACTIVE_UP" else "neutral"
 
-            # DB EVENT (RECLAIM) — направление как "сценарий давления"
-            dir_ = "down" if state == "ACTIVE_DOWN" else "up" if state == "ACTIVE_UP" else None
-            await _safe_append_event(
-                event_type="RECLAIM",
+            meta = {"side": side, "level": float(reclaimed_lvl), "ctx": {**event_ctx, "stage": stage}}
+            await _safe_append_event_v2(
+                event_type="reclaim",
                 symbol="BTCUSDT",
                 tf="1h",
-                direction=dir_,
-                level=None,
-                meta={**event_ctx, "stage": stage},
-                dedupe_key=("1h", dir_),
+                snapshot_id=snapshot_id_btc,
+                ref_price=ref_price_btc,
+                event_state=None,
+                meta=meta,
+                dedupe_key=("1h", side),
                 dedupe_slot="last_reclaim_event",
             )
 
-            if state == "ACTIVE_DOWN":
-                next_steps = ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления лоя"]
-            elif state == "ACTIVE_UP":
-                next_steps = ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления хая"]
-
     except Exception:
-        # не ломаем снапшот
         log.exception("MM sweep/reclaim block failed (non-fatal)")
 
     # ----------------------------
-    # 2) STAGE_CHANGE (после того как stage окончательно определён)
+    # 4) trend_shift (бывший STAGE_CHANGE)
+    # meta_required: from,to
     # ----------------------------
     try:
         mem = _mm_get("BTCUSDT")
         prev_stage = mem.get("last_stage")
+
         if prev_stage is None or prev_stage != stage:
-            await _safe_append_event(
-                event_type="STAGE_CHANGE",
+            meta = {"from": (prev_stage or "NONE"), "to": stage, "ctx": event_ctx}
+            await _safe_append_event_v2(
+                event_type="trend_shift",
                 symbol="BTCUSDT",
                 tf=tf_mode,
-                direction=_dir_from_state(state),
-                level=None,
-                meta={**event_ctx, "stage": stage},
+                snapshot_id=snapshot_id_btc,
+                ref_price=ref_price_btc,
+                event_state=f"{prev_stage or 'NONE'}->{stage}",
+                meta=meta,
                 dedupe_key=(tf_mode, stage),
                 dedupe_slot="last_stage_event",
             )
             mem["last_stage"] = stage
+
     except Exception:
-        log.exception("MM events: failed to write STAGE_CHANGE (non-fatal)")
+        log.exception("MM events: failed to write trend_shift (non-fatal)")
 
     # ----------------------------
-    # 3) ETH relation influence (как было)
+    # 5) ETH relation influence (как было)
     # ----------------------------
     if relation == "confirms":
         p_down = min(90, p_down + 5)
@@ -620,16 +765,9 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         p_down = int((p_down + 50) / 2)
         p_up = 100 - p_down
 
-    return MMSnapshot(
-        now_dt=now_dt,
-        state=state,
-        stage=stage,
-        p_down=int(p_down),
-        p_up=int(p_up),
-        key_zone=key_zone,
-        next_steps=next_steps,
-        invalidation=invalidation,
-        btc=btc,
-        eth=eth,
-        eth_relation=relation,
-    )
+    # обновим вероятности в mm-объекте
+    mm.p_down = int(p_down)
+    mm.p_up = int(p_up)
+    mm.stage = stage
+
+    return mm
