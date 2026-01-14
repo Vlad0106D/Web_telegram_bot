@@ -287,14 +287,22 @@ def _dir_from_state(state: str) -> Optional[str]:
 
 def _compute_regime_simple(df: pd.DataFrame) -> Tuple[Optional[str], Optional[int], Optional[float]]:
     """
-    Минимальный устойчивый regime:
-      - EMA20 vs EMA50: если расхождение маленькое -> range
-      - иначе trend_up / trend_down
+    Минимальный устойчивый regime (для записи в mm_market_regimes):
+
+      - EMA20 vs EMA50
+      - если расхождение маленькое -> RANGE
+      - иначе TREND_UP / TREND_DOWN
+
+    Возвращаем:
+      market_regime: 'TREND_UP'|'TREND_DOWN'|'RANGE'
+      trend_dir: 1|-1|0
+      trend_strength: 0..1 (можно трактовать как confidence)
     """
     try:
-        x = df.tail(200).copy()
+        x = df.tail(260).copy()
         if x.empty:
             return None, None, None
+
         x["ema20"] = x["close"].ewm(span=20).mean()
         x["ema50"] = x["close"].ewm(span=50).mean()
 
@@ -304,20 +312,73 @@ def _compute_regime_simple(df: pd.DataFrame) -> Tuple[Optional[str], Optional[in
 
         diff_pct = abs(ema20 - ema50) / max(c, 1e-9)
 
-        # порог диапазона (можно потом вынести в env)
-        if diff_pct < 0.0025:
-            return "range", 0, float(min(1.0, diff_pct / 0.0025))
+        # порог диапазона: 0.25%
+        thr = 0.0025
+
+        if diff_pct < thr:
+            # чем меньше diff, тем выше уверенность в RANGE
+            conf = 1.0 - min(1.0, max(0.0, diff_pct / thr))
+            return "RANGE", 0, float(conf)
+
+        # тренд: нормируем силу: 0..1 при diff_pct thr..(thr+0.75%)
+        strength = min(1.0, max(0.0, (diff_pct - thr) / 0.0075))
 
         if ema20 > ema50:
-            # strength нормируем: 0..1 при diff_pct 0.25%..1%
-            strength = min(1.0, max(0.0, (diff_pct - 0.0025) / 0.0075))
-            return "trend_up", 1, float(strength)
+            return "TREND_UP", 1, float(strength)
 
-        strength = min(1.0, max(0.0, (diff_pct - 0.0025) / 0.0075))
-        return "trend_down", -1, float(strength)
+        return "TREND_DOWN", -1, float(strength)
 
     except Exception:
         return None, None, None
+
+
+async def _upsert_market_regime(
+    *,
+    symbol: str,
+    tf: str,
+    ts_utc: datetime,
+    regime: Optional[str],
+    confidence: Optional[float],
+    source: str = "ta",
+    version: str = "ema20_50_v1",
+) -> None:
+    """
+    Пишем режим рынка в public.mm_market_regimes.
+    Upsert по (symbol, tf, ts_utc). Ошибки наружу не бросаем.
+    """
+    if not regime:
+        return
+    if ts_utc.tzinfo is None:
+        ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+
+    try:
+        pool = await _get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.mm_market_regimes (
+                    symbol, tf, ts_utc, regime, confidence, source, version, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (symbol, tf, ts_utc)
+                DO UPDATE SET
+                    regime = EXCLUDED.regime,
+                    confidence = EXCLUDED.confidence,
+                    source = EXCLUDED.source,
+                    version = EXCLUDED.version
+                """,
+                (
+                    str(symbol).upper(),
+                    str(tf),
+                    ts_utc,
+                    str(regime).upper(),
+                    (float(confidence) if confidence is not None else None),
+                    str(source),
+                    str(version),
+                ),
+            )
+    except Exception:
+        log.exception("MM regimes: upsert failed (symbol=%s tf=%s ts=%s)", symbol, tf, ts_utc)
 
 
 def _build_event_context(
@@ -569,7 +630,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             invalidation = "—"
 
     # regime по TF_mode для BTC (простое TA)
-    df_tf_btc, _ = await get_candles("BTCUSDT", tf_mode, limit=250)
+    df_tf_btc, _ = await get_candles("BTCUSDT", tf_mode, limit=260)
     market_regime, trend_dir, trend_strength = _compute_regime_simple(df_tf_btc)
 
     mm = MMSnapshot(
@@ -596,7 +657,6 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
     # ==================================================================
     # 1) Пишем snapshot в БД (Outcomes 2.0) по ts закрытой свечи TF_mode
     # ==================================================================
-    # ts берём по BTC-бару (оба символа должны быть в одном TF режиме)
     ts_snap = btc.candle_ts_utc or now_dt.astimezone(timezone.utc)
 
     await append_snapshot(
@@ -606,10 +666,22 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         ts_utc=ts_snap,
     )
 
+    # ==================================================================
+    # 1.1) Пишем режим рынка в mm_market_regimes (НОВОЕ)
+    # ==================================================================
+    await _upsert_market_regime(
+        symbol="BTCUSDT",
+        tf=tf_mode,
+        ts_utc=ts_snap,
+        regime=market_regime,
+        confidence=trend_strength,
+        source="ta",
+        version="ema20_50_v1",
+    )
+
     # snapshot_id для BTC (для событий по BTC)
     snapshot_id_btc = await _get_snapshot_id("BTCUSDT", tf_mode, ts_snap)
     if not snapshot_id_btc:
-        # если не можем привязать событие к снапу — лучше молча не писать события (не ломаем данные)
         log.warning("MM: snapshot_id not found, skip events (symbol=BTCUSDT tf=%s ts=%s)", tf_mode, ts_snap)
         return mm
 
@@ -640,7 +712,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             meta = {
                 "from": (prev_state or "NONE"),
                 "to": state,
-                "score": int(p_up - p_down),  # простая шкала перекоса
+                "score": int(p_up - p_down),
                 "ctx": event_ctx,
             }
             await _safe_append_event_v2(
@@ -662,7 +734,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         log.exception("MM events: failed to write pressure_shift (non-fatal)")
 
     # ----------------------------
-    # 3) sweep / reclaim (H1) — как было, но taxonomy/meta обновлены
+    # 3) sweep / reclaim (H1)
     # sweep meta_required: side,level,strength
     # reclaim meta_required: side,level
     # ----------------------------
@@ -765,7 +837,6 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         p_down = int((p_down + 50) / 2)
         p_up = 100 - p_down
 
-    # обновим вероятности в mm-объекте
     mm.p_down = int(p_down)
     mm.p_up = int(p_up)
     mm.stage = stage
