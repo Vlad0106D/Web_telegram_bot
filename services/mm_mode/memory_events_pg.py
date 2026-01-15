@@ -195,7 +195,7 @@ async def append_event(
                     cur = await conn.execute(
                         """
                         INSERT INTO public.mm_events (
-                          ts_utc, symbol, exchange, timeframe,
+                          ts, symbol, exchange, timeframe,
                           snapshot_id,
                           event_type, event_state,
                           ref_price,
