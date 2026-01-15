@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import Iterable, List
 
 from telegram.constants import ParseMode
@@ -75,8 +76,21 @@ async def _post_init(app: Application) -> None:
 
 
 async def _on_error(update, context) -> None:
-    # чтобы не было "No error handlers are registered" и чтобы любые ошибки логировались
-    log.exception("Unhandled error in handler/job", exc_info=context.error)
+    """
+    Глобальный error handler.
+    Важно: это НЕ inside-except, поэтому используем traceback.format_exception,
+    иначе log.exception() может не показать стек.
+    """
+    err = context.error
+    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    upd_txt = repr(update) if update is not None else "<job/None>"
+
+    log.error(
+        "Unhandled error in handler/job\nUpdate: %s\nError: %r\nTraceback:\n%s",
+        upd_txt,
+        err,
+        tb,
+    )
 
 
 def main() -> None:
@@ -93,7 +107,7 @@ def main() -> None:
     # глобальный error handler
     app.add_error_handler(_on_error)
 
-    # Базовые хендлеры (MM/Outcomes будут вычищены внутри bot.handlers)
+    # Базовые хендлеры (MM/Outcomes уже вычищены)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
