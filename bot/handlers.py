@@ -24,12 +24,6 @@ from services.signal_text import build_signal_message
 # === True Trading ===
 from services.true_trading import get_tt
 
-# === MM mode commands ===
-from bot.mm_watcher import cmd_mm_on, cmd_mm_off, cmd_mm_status, cmd_mm
-
-# === Outcomes commands ===
-from bot.outcomes_watcher import cmd_out_on, cmd_out_off, cmd_out_status, cmd_out
-
 log = logging.getLogger(__name__)
 
 
@@ -43,14 +37,6 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
 
         [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
         [KeyboardButton("/tt_status")],
-
-        # --- MM mode ---
-        [KeyboardButton("/mm"), KeyboardButton("/mm_status")],
-        [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
-
-        # --- Outcomes ---
-        [KeyboardButton("/out"), KeyboardButton("/out_status")],
-        [KeyboardButton("/out_on"), KeyboardButton("/out_off")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -93,14 +79,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /tt_on — включить True Trading\n"
         "• /tt_off — выключить True Trading\n"
         "• /tt_status — статус True Trading\n"
-        "• /mm — MM mode: ручной отчёт\n"
-        "• /mm_on — MM mode: включить авто-отчёты\n"
-        "• /mm_off — MM mode: выключить\n"
-        "• /mm_status — MM mode: статус\n"
-        "• /out — Outcomes: ручной прогон (1 батч)\n"
-        "• /out_on — Outcomes: включить авто-расчёт\n"
-        "• /out_off — Outcomes: выключить\n"
-        "• /out_status — Outcomes: статус\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -111,8 +89,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm, /mm_on, /mm_off, /mm_status, "
-        "/out, /out_on, /out_off, /out_status, "
         "/menu"
     )
 
@@ -307,8 +283,6 @@ def register_handlers(app: Application) -> None:
         "Handlers зарегистрированы: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm, /mm_on, /mm_off, /mm_status, "
-        "/out, /out_on, /out_off, /out_status, "
         "/menu"
     )
 
@@ -328,18 +302,6 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("tt_on", cmd_tt_on))
     app.add_handler(CommandHandler("tt_off", cmd_tt_off))
     app.add_handler(CommandHandler("tt_status", cmd_tt_status))
-
-    # MM mode
-    app.add_handler(CommandHandler("mm", cmd_mm))
-    app.add_handler(CommandHandler("mm_on", cmd_mm_on))
-    app.add_handler(CommandHandler("mm_off", cmd_mm_off))
-    app.add_handler(CommandHandler("mm_status", cmd_mm_status))
-
-    # Outcomes
-    app.add_handler(CommandHandler("out", cmd_out))
-    app.add_handler(CommandHandler("out_on", cmd_out_on))
-    app.add_handler(CommandHandler("out_off", cmd_out_off))
-    app.add_handler(CommandHandler("out_status", cmd_out_status))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
