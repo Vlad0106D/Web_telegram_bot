@@ -630,6 +630,12 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         version="ema20_50_v1",
     )
 
+    # ✅ DEBUG: фиксируем, доходим ли до места записи событий, и с какими ключами
+    log.warning(
+        "MM DEBUG: want events | ts_snap=%s | tf=%s | state=%s | stage=%s",
+        ts_snap, tf_mode, state, stage
+    )
+
     snapshot_id_btc = await _get_snapshot_id("BTCUSDT", tf_mode, ts_snap)
     if not snapshot_id_btc:
         log.warning("MM: snapshot_id not found, skip events (symbol=BTCUSDT tf=%s ts=%s)", tf_mode, ts_snap)
