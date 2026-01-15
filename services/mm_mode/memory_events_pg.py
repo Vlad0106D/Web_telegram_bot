@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from typing import Any, Optional, Dict
+from datetime import datetime, timezone
 
 from psycopg import OperationalError, Error as PsycopgError
 
@@ -143,6 +144,7 @@ async def _send_outcomes_autopush(
 
 async def append_event(
     *,
+    ts_utc: datetime,  # ✅ ВАЖНО: ts события = ts снапшота (mm_snapshots.ts)
     event_type: str,
     symbol: str,
     tf: str,
@@ -153,15 +155,21 @@ async def append_event(
     exchange: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Outcomes 2.0 append-only запись события в public.mm_events.
+    Append-only запись события в public.mm_events.
 
-    ВАЖНО: в твоей схеме колонка времени называется ts (НЕ ts_utc).
+    ВАЖНО:
+      - ts_utc сюда передаём равным ts снапшота (mm_snapshots.ts)
+      - в таблице mm_events поле называется ts (НЕ ts_utc)
     """
     et = _normalize_event_type(event_type)
     timeframe = _normalize_tf(tf)
     ex = (exchange or _exchange_okx_only()).strip().lower()
     sym = (symbol or "").strip().upper()
     payload_meta: Dict[str, Any] = meta or {}
+
+    if ts_utc.tzinfo is None:
+        ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+    ts_utc = ts_utc.astimezone(timezone.utc)
 
     tries = 3
     for attempt in range(tries):
@@ -179,7 +187,7 @@ async def append_event(
                           meta
                         )
                         VALUES (
-                          now(),
+                          %s,
                           %s, %s, %s,
                           %s::uuid,
                           %s, %s,
@@ -189,6 +197,7 @@ async def append_event(
                         RETURNING event_id
                         """,
                         (
+                            ts_utc,
                             sym,
                             ex,
                             timeframe,
