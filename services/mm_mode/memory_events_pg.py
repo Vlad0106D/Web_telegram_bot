@@ -16,8 +16,6 @@ log = logging.getLogger(__name__)
 # -----------------------------
 # Outcomes autopush settings
 # -----------------------------
-# В Outcomes 2.0 используем новые event_type (из mm_event_types).
-# legacy типы (PRESSURE_CHANGE/STAGE_CHANGE) будут смэпплены ниже.
 _AUTOPUSH_EVENT_TYPES = {"pressure_shift", "trend_shift"}
 _AUTOPUSH_TF = "1h"
 _AUTOPUSH_HORIZON = "1h"
@@ -51,20 +49,13 @@ def _bias_ru(bias: str) -> str:
     return "↔️ нейтрально"
 
 
-# -----------------------------
-# helpers
-# -----------------------------
-
 def _exchange_okx_only() -> str:
-    # Жёсткое правило проекта: источник цен и OI = OKX
     return "okx"
 
 
-# legacy -> new taxonomy mapping
 _EVENT_TYPE_MAP = {
     "PRESSURE_CHANGE": "pressure_shift",
     "STAGE_CHANGE": "trend_shift",
-    # возможные legacy варианты:
     "PRESSURESHIFT": "pressure_shift",
     "TREND_CHANGE": "trend_shift",
 }
@@ -77,13 +68,11 @@ def _normalize_event_type(event_type: str) -> str:
     up = raw.upper()
     if up in _EVENT_TYPE_MAP:
         return _EVENT_TYPE_MAP[up]
-    # если уже новое имя — приводим к lower
     return raw.strip().lower()
 
 
 def _normalize_tf(tf: str) -> str:
     t = (tf or "").strip().lower()
-    # приводим варианты к канону БД
     if t in ("h1", "1h", "60m"):
         return "1h"
     if t in ("h4", "4h", "240m"):
@@ -102,10 +91,6 @@ async def _send_outcomes_autopush(
     symbol: str,
     tf: str,
 ) -> None:
-    """
-    Автопуш в телегу: Outcomes Score по конкретному event_type на горизонте 1h.
-    Без падений наружу.
-    """
     try:
         from config import TOKEN, ALERT_CHAT_ID  # type: ignore
         from telegram import Bot  # type: ignore
@@ -170,14 +155,7 @@ async def append_event(
     """
     Outcomes 2.0 append-only запись события в public.mm_events.
 
-    ОБЯЗАТЕЛЬНО:
-      - snapshot_id (UUID из public.mm_snapshots)
-      - ref_price (строго из snapshot.close; не из OKX)
-      - event_type должен существовать в public.mm_event_types и быть enabled
-      - meta должен содержать обязательные ключи (проверит триггер БД)
-
-    Возвращает event_id (UUID строкой) если вставка успешна.
-    Ошибки наружу не бросаем (бот не падает).
+    ВАЖНО: в твоей схеме колонка времени называется ts (НЕ ts_utc).
     """
     et = _normalize_event_type(event_type)
     timeframe = _normalize_tf(tf)
@@ -185,7 +163,6 @@ async def append_event(
     sym = (symbol or "").strip().upper()
     payload_meta: Dict[str, Any] = meta or {}
 
-    # чуть больше устойчивости к коротким обрывам
     tries = 3
     for attempt in range(tries):
         try:
@@ -238,7 +215,6 @@ async def append_event(
             return event_id
 
         except OperationalError as e:
-            # сеть/SSL/обрыв — пробуем ещё раз
             log.warning(
                 "MM events: OperationalError on append (attempt %s/%s): %s",
                 attempt + 1,
@@ -251,7 +227,6 @@ async def append_event(
             return None
 
         except PsycopgError:
-            # неизвестный event_type, disabled event_type, meta_required missing, bad snapshot_id, etc.
             log.exception(
                 "MM events: append_event failed (psycopg). "
                 "event_type=%s symbol=%s tf=%s snapshot_id=%s",
