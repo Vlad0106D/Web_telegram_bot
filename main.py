@@ -11,13 +11,6 @@ from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
 from bot.watcher import schedule_watcher_jobs
 
-# ✅ Outcomes Score (новый модуль) — подключаем безопасно, чтобы бот не падал если файла нет
-try:
-    from bot.outcomes_score import register_outcomes_score_handlers
-except Exception as ex:
-    register_outcomes_score_handlers = None  # type: ignore
-    logging.getLogger("main").warning("outcomes_score not available: %r", ex)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -61,7 +54,7 @@ async def _post_init(app: Application) -> None:
     await app.bot.delete_webhook(drop_pending_updates=True)
     log.info("Webhook deleted (drop_pending_updates=True)")
 
-    # 2) Устанавливаем команды в системное меню Telegram
+    # 2) Устанавливаем команды в системное меню Telegram (без MM/Outcomes)
     commands: List[BotCommand] = [
         BotCommand("start", "Запуск и краткая справка"),
         BotCommand("help", "Помощь и список команд"),
@@ -72,21 +65,6 @@ async def _post_init(app: Application) -> None:
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
         BotCommand("menu", "Показать меню-кнопки внутри чата"),
-
-        # --- MM mode ---
-        BotCommand("mm", "MM mode: ручной отчёт"),
-        BotCommand("mm_on", "MM mode: включить авто-отчёты"),
-        BotCommand("mm_off", "MM mode: выключить"),
-        BotCommand("mm_status", "MM mode: статус"),
-
-        # --- Outcomes ---
-        BotCommand("out", "Outcomes: ручной прогон (1 батч)"),
-        BotCommand("out_on", "Outcomes: включить авто-расчёт"),
-        BotCommand("out_off", "Outcomes: выключить"),
-        BotCommand("out_status", "Outcomes: статус"),
-
-        # --- Outcomes Score ---
-        BotCommand("out_score", "Outcomes Score: статистика по событиям"),
     ]
 
     await app.bot.set_my_commands(commands)
@@ -97,7 +75,7 @@ async def _post_init(app: Application) -> None:
 
 
 async def _on_error(update, context) -> None:
-    # ✅ чтобы не было "No error handlers are registered" и чтобы любые ошибки логировались
+    # чтобы не было "No error handlers are registered" и чтобы любые ошибки логировались
     log.exception("Unhandled error in handler/job", exc_info=context.error)
 
 
@@ -112,22 +90,12 @@ def main() -> None:
         .build()
     )
 
-    # ✅ глобальный error handler
+    # глобальный error handler
     app.add_error_handler(_on_error)
 
-    # Базовые хендлеры (включая MM mode + Outcomes)
+    # Базовые хендлеры (MM/Outcomes будут вычищены внутри bot.handlers)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
-
-    # ✅ Outcomes Score handlers
-    if register_outcomes_score_handlers is not None:
-        try:
-            register_outcomes_score_handlers(app)
-            log.info("Outcomes score handlers registered via bot.outcomes_score.register_outcomes_score_handlers()")
-        except Exception:
-            log.exception("Failed to register outcomes_score handlers")
-    else:
-        log.warning("Outcomes score handlers not registered (module not available)")
 
     # Планирование вотчера (основного, не MM)
     tfs = _normalize_tfs(WATCHER_TFS)
