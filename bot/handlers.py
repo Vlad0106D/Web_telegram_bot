@@ -24,8 +24,9 @@ from services.signal_text import build_signal_message
 # === True Trading ===
 from services.true_trading import get_tt
 
-# === MM v2 manual command ===
+# === MM v2 commands ===
 from bot.mm_v2_commands import register_mm_v2_handlers
+from bot.mm_v2_events_commands import register_mm_v2_events_handlers  # ✅ NEW
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
 
         # MM v2 (manual)
         [KeyboardButton("/mm_run")],
+        [KeyboardButton("/mm_events_backfill")],  # ✅ NEW
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -85,7 +87,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /tt_on — включить True Trading\n"
         "• /tt_off — выключить True Trading\n"
         "• /tt_status — статус True Trading\n"
-        "• /mm_run — MM v2: ручной прогон (snapshots + regime + phase)\n"
+        "• /mm_run — MM v2: ручной прогон (snapshots + regime + phase + live events)\n"
+        "• /mm_events_backfill — MM v2: one-shot backfill событий за 30 дней\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -96,7 +99,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm_run, "
+        "/mm_run, /mm_events_backfill, "
         "/menu"
     )
 
@@ -291,7 +294,7 @@ def register_handlers(app: Application) -> None:
         "Handlers зарегистрированы: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm_run, "
+        "/mm_run, /mm_events_backfill, "
         "/menu"
     )
 
@@ -311,8 +314,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("tt_off", cmd_tt_off))
     app.add_handler(CommandHandler("tt_status", cmd_tt_status))
 
-    # MM v2 manual
+    # MM v2 (manual + one-shot backfill)
     register_mm_v2_handlers(app)
+    register_mm_v2_events_handlers(app)  # ✅ NEW
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
