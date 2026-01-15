@@ -406,8 +406,10 @@ async def _get_snapshot_id(symbol: str, tf: str, ts_utc: datetime) -> Optional[s
         return None
 
 
+# ✅ FIX-1: добавили event_ts_utc и прокидываем в append_event(ts_utc=...)
 async def _safe_append_event_v2(
     *,
+    event_ts_utc: datetime,  # ✅ ts события = ts снапшота
     event_type: str,
     symbol: str,
     tf: str,
@@ -428,6 +430,7 @@ async def _safe_append_event_v2(
             mem[dedupe_slot] = dedupe_key
 
         await append_event(
+            ts_utc=event_ts_utc,  # ✅ FIX-1
             event_type=event_type,
             symbol=symbol,
             tf=tf,
@@ -613,6 +616,10 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
     # 1) snapshot
     ts_snap = btc.candle_ts_utc or now_dt.astimezone(timezone.utc)
+    if ts_snap.tzinfo is None:
+        ts_snap = ts_snap.replace(tzinfo=timezone.utc)
+    ts_snap = ts_snap.astimezone(timezone.utc)
+
     await append_snapshot(
         snap=mm,
         source_mode=mode,
@@ -630,7 +637,6 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         version="ema20_50_v1",
     )
 
-    # ✅ DEBUG: фиксируем, доходим ли до места записи событий, и с какими ключами
     log.warning(
         "MM DEBUG: want events | ts_snap=%s | tf=%s | state=%s | stage=%s",
         ts_snap, tf_mode, state, stage
@@ -667,12 +673,13 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
                 "ctx": event_ctx,
             }
             await _safe_append_event_v2(
+                event_ts_utc=ts_snap,  # ✅ FIX-1
                 event_type="pressure_shift",
                 symbol="BTCUSDT",
                 tf=tf_mode,
                 snapshot_id=snapshot_id_btc,
                 ref_price=ref_price_btc,
-                event_state=None,  # ✅ FIX: не бьёмся об chk_mm_events_state_format
+                event_state=None,
                 meta=meta,
                 dedupe_key=(tf_mode, state),
                 dedupe_slot="last_pressure_event",
@@ -703,6 +710,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             if swept_dn is not None:
                 meta = {"side": "down", "level": float(swept_dn), "strength": 0.7, "ctx": {**event_ctx, "stage": stage}}
                 await _safe_append_event_v2(
+                    event_ts_utc=ts_snap,  # ✅ FIX-1
                     event_type="sweep",
                     symbol="BTCUSDT",
                     tf="1h",
@@ -717,6 +725,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
             if swept_up is not None:
                 meta = {"side": "up", "level": float(swept_up), "strength": 0.7, "ctx": {**event_ctx, "stage": stage}}
                 await _safe_append_event_v2(
+                    event_ts_utc=ts_snap,  # ✅ FIX-1
                     event_type="sweep",
                     symbol="BTCUSDT",
                     tf="1h",
@@ -734,6 +743,7 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
 
             meta = {"side": side, "level": float(reclaimed_lvl), "ctx": {**event_ctx, "stage": stage}}
             await _safe_append_event_v2(
+                event_ts_utc=ts_snap,  # ✅ FIX-1
                 event_type="reclaim",
                 symbol="BTCUSDT",
                 tf="1h",
@@ -756,12 +766,13 @@ async def build_mm_snapshot(now_dt: datetime, mode: str = "h1_close") -> MMSnaps
         if prev_stage is None or prev_stage != stage:
             meta = {"from": (prev_stage or "NONE"), "to": stage, "ctx": event_ctx}
             await _safe_append_event_v2(
+                event_ts_utc=ts_snap,  # ✅ FIX-1
                 event_type="trend_shift",
                 symbol="BTCUSDT",
                 tf=tf_mode,
                 snapshot_id=snapshot_id_btc,
                 ref_price=ref_price_btc,
-                event_state=None,  # ✅ FIX: чтобы не словить chk_mm_events_state_format
+                event_state=None,
                 meta=meta,
                 dedupe_key=(tf_mode, stage),
                 dedupe_slot="last_stage_event",
