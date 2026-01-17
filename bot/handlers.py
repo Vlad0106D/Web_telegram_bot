@@ -31,8 +31,9 @@ from services.signal_text import build_signal_message
 # === True Trading ===
 from services.true_trading import get_tt
 
-# === MM (new) ===
+# === MM (snapshots + commands) ===
 from services.mm.snapshots import run_snapshots_once
+from bot.mm_commands import register_mm_commands   # ✅ NEW
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("/watch_status")],
         [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
         [KeyboardButton("/tt_status")],
-        # MM (ручной запуск снапшотов)
+        # MM
         [KeyboardButton("/mm_snapshots")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -94,7 +95,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /tt_on — включить True Trading\n"
         "• /tt_off — выключить True Trading\n"
         "• /tt_status — статус True Trading\n"
-        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1, только закрытые)\n"
+        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1)\n"
+        "• /mm_report — MM: ручной отчёт\n"
+        "• /mm_on /mm_off — MM авто режим\n"
+        "• /mm_status — статус MM\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -105,7 +109,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm_snapshots, "
+        "/mm_snapshots, /mm_report, /mm_on, /mm_off, /mm_status, "
         "/menu"
     )
 
@@ -175,18 +179,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
 
-# ------------ MM (ручной запуск) ------------
+# ------------ MM (ручной запуск снапшотов) ------------
 async def cmd_mm_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Ручной one-shot: записывает в БД live снапшоты по закрытым свечам
-    BTC/ETH на H1/H4/D1/W1 + funding/OI в meta_json.
-
-    Важно: повторный запуск не создаёт дублей (UPSERT по UNIQUE(symbol,tf,ts)).
-    """
     await update.message.reply_text("MM: пишу live снапшоты в БД (закрытые свечи)…")
     try:
         rows = await run_snapshots_once()
-        # Чтобы не упереться в лимиты Telegram — выводим компактно
         msg = "✅ MM snapshots записаны:\n" + "\n".join(f"• {r}" for r in rows[:20])
         if len(rows) > 20:
             msg += f"\n…и ещё {len(rows) - 20}"
@@ -198,18 +195,12 @@ async def cmd_mm_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ------------ Вотчер ------------
 async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tfs = WATCHER_TFS
     created = schedule_watcher_jobs(
         app=context.application,
-        tfs=tfs,
+        tfs=WATCHER_TFS,
         interval_sec=int(WATCHER_INTERVAL_SEC),
     )
-    try:
-        tfs_txt = ", ".join([t for t in tfs])
-    except Exception:
-        tfs_txt = str(tfs)
-    tfs_txt = tfs_txt or "—"
-
+    tfs_txt = ", ".join(WATCHER_TFS) if WATCHER_TFS else "—"
     await update.message.reply_text(
         f"Вотчер включён ✅\nTF: {tfs_txt}\ninterval={WATCHER_INTERVAL_SEC}s\njobs: {', '.join(created) or '—'}"
     )
@@ -245,45 +236,31 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines))
 
 
-# ------------ True Trading команды ------------
+# ------------ True Trading ------------
 async def cmd_tt_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tt = get_tt(context.application)
     tt.enable()
     st = tt.status()
-    txt = (
+    await update.message.reply_text(
         "✅ True Trading включён.\n"
-        f"Режим: REAL\n"
-        f"Риск/сделку: {st.risk_pct*100:.2f}%\n"
-        f"Лимит позиций: {st.max_open_pos}\n"
-        f"Дневной лимит просадки: {st.daily_loss_limit_pct*100:.2f}%\n"
-        f"Кулдаун по символу: {st.symbol_cooldown_min} мин.\n"
-        f"Требуется 1D тренд: {'да' if st.require_trend_1d else 'нет'}\n"
-        f"Мин RR до TP1: {st.min_rr_tp1:.2f}\n"
-        f"Биржа подключена: {'да' if st.exchange_connected else 'нет (проверь ключи)'}"
+        f"Риск/сделку: {st.risk_pct*100:.2f}% | Лимит позиций: {st.max_open_pos}"
     )
-    await update.message.reply_text(txt)
 
 
 async def cmd_tt_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tt = get_tt(context.application)
     tt.disable()
-    await update.message.reply_text("⛔ True Trading выключен. Ордеры не будут выставляться.")
+    await update.message.reply_text("⛔ True Trading выключен.")
 
 
 async def cmd_tt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tt = get_tt(context.application)
     st = tt.status()
-    since = st.since_ts
-    txt = (
-        "📟 Статус True Trading\n"
+    await update.message.reply_text(
+        f"📟 True Trading\n"
         f"Состояние: {'ВКЛ' if st.enabled else 'ВЫКЛ'}\n"
-        f"С момента: {since if since else '—'} (unix)\n"
-        f"Риск/сделку: {st.risk_pct*100:.2f}% | Мин RR: {st.min_rr_tp1:.2f}\n"
-        f"Лимит позиций: {st.max_open_pos} | Дневной лимит: {st.daily_loss_limit_pct*100:.2f}%\n"
-        f"Кулдаун по символу: {st.symbol_cooldown_min} мин | Slippage guard: {st.slippage_bps} б.п.\n"
-        f"1D фильтр: {'да' if st.require_trend_1d else 'нет'} | Биржа: {'OK' if st.exchange_connected else 'нет ключей'}"
+        f"Риск: {st.risk_pct*100:.2f}% | RR min: {st.min_rr_tp1:.2f}"
     )
-    await update.message.reply_text(txt)
 
 
 # ------------ Callback-кнопки ------------
@@ -306,8 +283,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if action == "sig":
         try:
             res = await analyze_symbol(sym)
-            text = build_signal_message(res)
-            await q.message.reply_text(text)
+            await q.message.reply_text(build_signal_message(res))
         except Exception as e:
             log.exception("signal %s failed", sym)
             await q.message.reply_text(f"{sym}: ошибка анализа — {e}")
@@ -323,13 +299,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ------------ Регистрация ------------
 def register_handlers(app: Application) -> None:
-    log.info(
-        "Handlers зарегистрированы: /start, /help, /list, /find, /check, "
-        "/watch_on, /watch_off, /watch_status, "
-        "/tt_on, /tt_off, /tt_status, "
-        "/mm_snapshots, "
-        "/menu"
-    )
+    log.info("Registering bot handlers")
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -348,6 +318,9 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("tt_on", cmd_tt_on))
     app.add_handler(CommandHandler("tt_off", cmd_tt_off))
     app.add_handler(CommandHandler("tt_status", cmd_tt_status))
+
+    # ✅ MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
+    register_mm_commands(app)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
