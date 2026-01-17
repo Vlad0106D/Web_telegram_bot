@@ -15,12 +15,12 @@ from telegram.ext import Application
 from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
 from services.mm.liquidity import update_liquidity_memory
-from services.mm.market_events_detector import detect_and_store_market_events  # ✅ NEW
+from services.mm.market_events_detector import detect_and_store_market_events
 
 log = logging.getLogger(__name__)
 
 
-MM_AUTO_ENABLED = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
+MM_AUTO_ENABLED_ENV = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
 MM_AUTO_CHECK_SEC = int(os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60")
 
 
@@ -49,6 +49,17 @@ def _db_url() -> str:
     return url
 
 
+def _mm_is_enabled(app: Application) -> bool:
+    # env = “глобальный рубильник”, runtime = /mm_on/off
+    if not MM_AUTO_ENABLED_ENV:
+        return False
+    v = app.bot_data.get("mm_enabled")
+    if v is None:
+        app.bot_data["mm_enabled"] = True
+        return True
+    return bool(v)
+
+
 def _get_latest_snapshot_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
     sql = """
     SELECT ts
@@ -74,7 +85,8 @@ def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> boo
     """
     with conn.cursor() as cur:
         cur.execute(sql, (tf, ts))
-        return bool(cur.fetchone())
+        row = cur.fetchone()
+    return bool(row)
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
@@ -87,14 +99,14 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 
 async def _mm_auto_tick(app: Application) -> None:
-    if not MM_AUTO_ENABLED:
+    if not _mm_is_enabled(app):
         return
 
     if MM_ALERT_CHAT_ID is None:
-        log.warning("MM_AUTO enabled but ALERT_CHAT_ID is not set — skipping")
+        log.warning("MM auto enabled but ALERT_CHAT_ID is not set — skipping")
         return
 
-    # 1) SNAPSHOTS (только закрытые свечи)
+    # 1) SNAPSHOTS
     try:
         await run_snapshots_once()
     except Exception:
@@ -107,12 +119,12 @@ async def _mm_auto_tick(app: Application) -> None:
     except Exception:
         log.exception("MM auto: liquidity memory failed")
 
-    # 3) MARKET EVENTS (sweep / reclaim / decision / wait)
+    # 3) MARKET EVENTS
     for tf in MM_TFS:
         try:
             events = detect_and_store_market_events(tf)
             if events:
-                log.info("MM events %s: %s", tf, "; ".join(events))
+                log.info("MM market events %s: %s", tf, "; ".join(events))
         except Exception:
             log.exception("MM auto: market events failed for tf=%s", tf)
 
@@ -132,10 +144,7 @@ async def _mm_auto_tick(app: Application) -> None:
                 view = build_market_view(tf, manual=False)
                 text = render_report(view)
 
-                await app.bot.send_message(
-                    chat_id=MM_ALERT_CHAT_ID,
-                    text=text,
-                )
+                await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
                 payload = {
                     "kind": "auto",
@@ -156,9 +165,13 @@ async def _mm_auto_tick(app: Application) -> None:
 def schedule_mm_auto(app: Application) -> List[str]:
     created: List[str] = []
 
-    if not MM_AUTO_ENABLED:
+    if not MM_AUTO_ENABLED_ENV:
         log.warning("MM_AUTO_ENABLED=0 — mm auto disabled")
         return created
+
+    # default runtime enabled
+    if "mm_enabled" not in app.bot_data:
+        app.bot_data["mm_enabled"] = True
 
     jq = app.job_queue
     if jq is None:
