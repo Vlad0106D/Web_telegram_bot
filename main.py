@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import logging
-import os
 import traceback
 from typing import Iterable, List
 
-from telegram import BotCommand
 from telegram.constants import ParseMode
-from telegram.ext import Application, ApplicationBuilder, Defaults
+from telegram.ext import ApplicationBuilder, Application, Defaults
+from telegram import BotCommand
 
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
 from bot.watcher import schedule_watcher_jobs
+
+# === MM AUTO ===
+from services.mm.auto import schedule_mm_auto
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +43,7 @@ def _normalize_tfs(value) -> List[str]:
         return [str(x).strip() for x in value if str(x).strip()]
 
     if isinstance(value, Iterable):
-        out: List[str] = []
+        out = []
         for x in value:
             xs = str(x).strip()
             if xs:
@@ -56,7 +58,7 @@ async def _post_init(app: Application) -> None:
     await app.bot.delete_webhook(drop_pending_updates=True)
     log.info("Webhook deleted (drop_pending_updates=True)")
 
-    # 2) Устанавливаем команды в системное меню Telegram (без MM/Outcomes)
+    # 2) Устанавливаем команды в системное меню Telegram
     commands: List[BotCommand] = [
         BotCommand("start", "Запуск и краткая справка"),
         BotCommand("help", "Помощь и список команд"),
@@ -66,18 +68,20 @@ async def _post_init(app: Application) -> None:
         BotCommand("watch_on", "Включить вотчер (уведомления)"),
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
+        BotCommand("mm_snapshots", "MM: записать live снапшоты в БД (закрытые свечи)"),
         BotCommand("menu", "Показать меню-кнопки внутри чата"),
     ]
 
     await app.bot.set_my_commands(commands)
-    log.info("Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands))
+    log.info(
+        "Bot commands set globally: %s",
+        ", ".join(f"/{c.command}" for c in commands),
+    )
 
 
 async def _on_error(update, context) -> None:
     """
     Глобальный error handler.
-    Важно: это НЕ inside-except, поэтому используем traceback.format_exception,
-    иначе log.exception() может не показать стек.
     """
     err = context.error
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
@@ -94,16 +98,9 @@ async def _on_error(update, context) -> None:
 def main() -> None:
     log.info(">>> ENTER main.py")
 
-    # Жёсткая проверка, чтобы не запускаться с пустым токеном
-    token = (TOKEN or "").strip()
-    if not token:
-        # Доп. подсказка: часто на Render токен приходит из env
-        env_hint = "TELEGRAM_TOKEN" if os.getenv("TELEGRAM_TOKEN") else "TOKEN"
-        raise RuntimeError(f"Telegram TOKEN is empty. Check config/env var ({env_hint}).")
-
     app = (
         ApplicationBuilder()
-        .token(token)
+        .token(TOKEN)
         .post_init(_post_init)
         .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
@@ -112,7 +109,7 @@ def main() -> None:
     # глобальный error handler
     app.add_error_handler(_on_error)
 
-    # Базовые хендлеры (MM/Outcomes уже вычищены)
+    # Базовые хендлеры
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
@@ -143,6 +140,13 @@ def main() -> None:
             log.exception("Failed to schedule watcher jobs")
     else:
         log.warning("Watcher is disabled (WATCHER_ENABLED=False) — auto signals will NOT run")
+
+    # === MM AUTO ===
+    try:
+        mm_jobs = schedule_mm_auto(app)
+        log.info("MM auto scheduled | jobs: %s", ", ".join(mm_jobs) if mm_jobs else "[]")
+    except Exception:
+        log.exception("Failed to schedule MM auto jobs")
 
     # Запуск polling
     app.run_polling(drop_pending_updates=True)
