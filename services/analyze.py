@@ -17,37 +17,37 @@ from services.indicators import (
 
 # ====== Параметры с безопасными дефолтами (можно переопределить в config.py) ======
 try:
-    from config import MTF_TFS              # строка, например: "1d,4h,1h,30m,15m,5m"
+    from config import MTF_TFS  # строка, например: "1d,4h,1h,30m,15m,5m"
 except Exception:
     MTF_TFS = "1d,4h,1h,30m,15m,5m"
 
 try:
-    from config import ENTRY_TF             # основной ТФ для входа/метрик в карточке
+    from config import ENTRY_TF  # основной ТФ для входа/метрик в карточке
 except Exception:
     ENTRY_TF = "1h"
 
 try:
-    from config import LEVEL_PIVOT_WINDOW   # окно поиска локальных экстремумов (роллинг)
+    from config import LEVEL_PIVOT_WINDOW  # окно поиска локальных экстремумов (роллинг)
 except Exception:
     LEVEL_PIVOT_WINDOW = 10
 
 try:
-    from config import LEVEL_LOOKBACK       # сколько последних баров сканировать на уровне
+    from config import LEVEL_LOOKBACK  # сколько последних баров сканировать на уровне
 except Exception:
     LEVEL_LOOKBACK = 120
 
 try:
-    from config import ATR_PERIOD           # период ATR для запасов и fallback-TP
+    from config import ATR_PERIOD  # период ATR для запасов и fallback-TP
 except Exception:
     ATR_PERIOD = 14
 
 try:
-    from config import ADX_TREND_MIN        # минимальный ADX для «силы тренда»
+    from config import ADX_TREND_MIN  # минимальный ADX для «силы тренда»
 except Exception:
     ADX_TREND_MIN = 18.0
 
 try:
-    from config import TP_R_MULTIPLIERS     # fallback цели в R-множителях
+    from config import TP_R_MULTIPLIERS  # fallback цели в R-множителях
 except Exception:
     TP_R_MULTIPLIERS = (1.0, 2.0)
 
@@ -64,14 +64,18 @@ def _last(series: pd.Series) -> Optional[float]:
     return None
 
 
-def _trend_by_ema(df: pd.DataFrame, ema_len: int = 200) -> str:
+def _trend_by_ema(df: Optional[pd.DataFrame], ema_len: int = 200) -> str:
     if df is None or df.empty:
         return "flat"
+    if "close" not in df.columns:
+        return "flat"
+
     ema = ema_series(df["close"], ema_len)
     last_close = _last(df["close"])
     last_ema = _last(ema)
     if last_close is None or last_ema is None:
         return "flat"
+
     ema_slope = _last(ema.diff())
     if last_close > last_ema and (ema_slope or 0) > 0:
         return "up"
@@ -80,24 +84,24 @@ def _trend_by_ema(df: pd.DataFrame, ema_len: int = 200) -> str:
     return "flat"
 
 
-def _levels(df: pd.DataFrame, pivot_window: int, lookback: int) -> Tuple[List[float], List[float]]:
+def _levels(df: Optional[pd.DataFrame], pivot_window: int, lookback: int) -> Tuple[List[float], List[float]]:
     """
     Локальные уровни: экстремумы последних `lookback` свечей, сглаженные роллингом.
     Возвращаем 3 ближайших сверху/снизу к текущей цене.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or "close" not in df.columns:
         return [], []
+
     close = df["close"]
     hi = close.rolling(pivot_window, center=True).max().dropna().iloc[-lookback:]
     lo = close.rolling(pivot_window, center=True).min().dropna().iloc[-lookback:]
     if hi.empty and lo.empty:
         return [], []
+
     last = float(close.iloc[-1])
+    res_raw = [float(x) for x in hi.unique() if float(x) > last]
+    sup_raw = [float(x) for x in lo.unique() if float(x) < last]
 
-    res_raw = [float(x) for x in hi.unique() if x > last]
-    sup_raw = [float(x) for x in lo.unique() if x < last]
-
-    # сортировка «ближайшие вперёд»
     res = sorted(res_raw)[:3]
     sup = sorted(sup_raw, reverse=True)[:3]
     return res, sup
@@ -111,21 +115,22 @@ async def _get_df(symbol: str, tf: str, limit: int) -> pd.DataFrame:
 async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
     """
     Возвращает dict в формате, который ожидает build_signal_message().
-    Теперь с мульти-таймфрейм анализом:
-      • Тренды по 1d/4h/1h/30m/15m/5m (по EMA200 + её наклон)
+
+    Мульти-таймфрейм анализ:
+      • Тренды по 1d/4h/1h/30m/15m/5m (по EMA200 + наклон)
       • «entry»-метрики считаются на ENTRY_TF или на переданном tf (если задан)
       • Метки: mtf-aligned / counter-trend / scalp / squeeze / trend-up/down
       • TP/SL: по ближайшим уровням (ENTRY_TF + 4h), fallback — ATR и R-множители
     """
-    # --- фактический entry TF: берём переданный tf, если он есть
-    ENTRY_TF_USED = (tf or ENTRY_TF).strip()
+    sym = symbol.strip().upper()
+    ENTRY_TF_USED = (tf or ENTRY_TF).strip() or "1h"
 
-    # --- подготовка ТФ для MTF
-    tfs = [t.strip() for t in MTF_TFS.split(",") if t.strip()]
+    # --- подготовка ТФ для MTF (поддержка "1d,4h" и "1d 4h")
+    raw_tfs = str(MTF_TFS or "").strip()
+    tfs = [t.strip() for t in raw_tfs.replace(",", " ").split() if t.strip()]
     if ENTRY_TF_USED not in tfs:
         tfs.append(ENTRY_TF_USED)
 
-    # разумные лимиты для разных ТФ
     def _lim(x: str) -> int:
         if x == "1d":
             return 400
@@ -137,33 +142,39 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
             return 400
         return 350
 
-    # --- цена
-    price, ex_price = await get_price(symbol)
+    # --- цена (мягко, чтобы не валить /check)
+    try:
+        price, ex_price = await get_price(sym)
+    except Exception:
+        price, ex_price = None, None
 
     # --- загрузка свечей по всем ТФ
     dfs: Dict[str, pd.DataFrame] = {}
     for tf_ in tfs:
         try:
-            dfs[tf_] = await _get_df(symbol, tf_, _lim(tf_))
+            dfs[tf_] = await _get_df(sym, tf_, _lim(tf_))
         except Exception:
             dfs[tf_] = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
 
     # --- тренды по ключевым ТФ
-    trend_1d  = _trend_by_ema(dfs.get("1d"))
-    trend_4h  = _trend_by_ema(dfs.get("4h"))
-    trend_1h  = _trend_by_ema(dfs.get("1h"))
+    trend_1d = _trend_by_ema(dfs.get("1d"))
+    trend_4h = _trend_by_ema(dfs.get("4h"))
+    trend_1h = _trend_by_ema(dfs.get("1h"))
     trend_30m = _trend_by_ema(dfs.get("30m"))
     trend_15m = _trend_by_ema(dfs.get("15m"))
-    trend_5m  = _trend_by_ema(dfs.get("5m"))
+    trend_5m = _trend_by_ema(dfs.get("5m"))
 
-    # --- «entry» фрейм и индикаторы
+    # --- entry фрейм
     dfe = dfs.get(ENTRY_TF_USED) if dfs.get(ENTRY_TF_USED) is not None else dfs.get("1h")
     if dfe is None or dfe.empty:
-        dfe = next((dfs[x] for x in ["1h", "4h", "30m", "15m", "5m", "1d"] if dfs.get(x) is not None and not dfs[x].empty), pd.DataFrame())
+        dfe = next(
+            (dfs[x] for x in ["1h", "4h", "30m", "15m", "5m", "1d"] if dfs.get(x) is not None and not dfs[x].empty),
+            pd.DataFrame(),
+        )
+
     if dfe.empty:
-        # совсем нет — вернём «none»
         return {
-            "symbol": symbol.upper(),
+            "symbol": sym,
             "price": price,
             "exchange": ex_price,
             "signal": "none",
@@ -176,7 +187,9 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
             "bb_width": None,
             "reasons": ["Нет данных по свечам"],
             "levels": {"resistance": [], "support": []},
-            "tp1": None, "tp2": None, "sl": None,
+            "tp1": None,
+            "tp2": None,
+            "sl": None,
             "tags": [],
             "scenario": None,
         }
@@ -215,7 +228,6 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
 
     major = trend_1d
     mid = trend_4h
-    entry_tr = trend_1h  # историческая совместимость
 
     signal = "none"
     confidence = 0
@@ -323,21 +335,20 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
             tp1 = tp1 or (last_close - r1 * risk)
             tp2 = tp2 or (last_close - r2 * risk)
 
-    # --- мягкие sanity-фиксы сторон (не пересчитываем, просто приводим к инвариантам)
+    # --- мягкие sanity-фиксы
     if signal == "long":
         if sl is not None and sl >= last_close and last_atr:
             sl = last_close - max(0.8 * last_atr, 1e-6)
-        # цели выше entry и по возрастанию
         if tp1 is not None and tp2 is not None and tp1 > tp2:
             tp1, tp2 = tp2, tp1
         if tp1 is not None and tp1 <= last_close:
             tp1 = last_close + 1e-8
         if tp2 is not None and tp1 is not None and tp2 <= tp1:
             tp2 = tp1 + 1e-8
+
     elif signal == "short":
         if sl is not None and sl <= last_close and last_atr:
             sl = last_close + max(0.8 * last_atr, 1e-6)
-        # цели ниже entry и по убыванию
         if tp1 is not None and tp2 is not None and tp1 < tp2:
             tp1, tp2 = tp2, tp1
         if tp1 is not None and tp1 >= last_close:
@@ -345,16 +356,15 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
         if tp2 is not None and tp1 is not None and tp2 >= tp1:
             tp2 = tp1 - 1e-8
 
-    # --- Итог
     return {
-        "symbol": symbol.upper(),
+        "symbol": sym,
         "price": price,
         "exchange": ex_price,
         "signal": signal,
-        "direction": signal,                # совместимость с кодом, который ждёт 'direction'
+        "direction": signal,  # совместимость
         "confidence": int(max(0, min(100, confidence))),
         "entry_tf": ENTRY_TF_USED,
-        "trend_4h": trend_4h,              # для совместимости с текущим месседжем
+        "trend_4h": trend_4h,
         "h_adx": last_adx,
         "h_rsi": last_rsi,
         "bb_width": last_bbw,
@@ -363,7 +373,6 @@ async def analyze_symbol(symbol: str, tf: Optional[str] = None) -> Dict:
         "tp1": tp1,
         "tp2": tp2,
         "sl": sl,
-        "tags": list(dict.fromkeys(tags))[:8],  # уникализируем, сохраняем порядок
+        "tags": list(dict.fromkeys(tags))[:8],  # уникальные, по порядку
         "scenario": scenario,
     }
-    
