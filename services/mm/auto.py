@@ -14,7 +14,8 @@ from telegram.ext import Application
 
 from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
-from services.mm.liquidity import update_liquidity_memory  # ✅ NEW
+from services.mm.liquidity import update_liquidity_memory
+from services.mm.market_events_detector import detect_and_store_market_events  # ✅ NEW
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +35,11 @@ def _read_chat_id() -> Optional[int]:
 
 
 MM_ALERT_CHAT_ID = _read_chat_id()
-MM_TFS = [t.strip() for t in (os.getenv("MM_TFS", "H1,H4,D1,W1").replace(" ", "").split(",")) if t.strip()]
+MM_TFS = [
+    t.strip()
+    for t in (os.getenv("MM_TFS", "H1,H4,D1,W1").replace(" ", "").split(","))
+    if t.strip()
+]
 
 
 def _db_url() -> str:
@@ -69,8 +74,7 @@ def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> boo
     """
     with conn.cursor() as cur:
         cur.execute(sql, (tf, ts))
-        row = cur.fetchone()
-    return bool(row)
+        return bool(cur.fetchone())
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
@@ -87,24 +91,32 @@ async def _mm_auto_tick(app: Application) -> None:
         return
 
     if MM_ALERT_CHAT_ID is None:
-        log.warning("MM_AUTO enabled but ALERT_CHAT_ID is not set — skipping auto send")
+        log.warning("MM_AUTO enabled but ALERT_CHAT_ID is not set — skipping")
         return
 
-    # 1) обновляем снапшоты (закрытые свечи) + funding/OI
+    # 1) SNAPSHOTS (только закрытые свечи)
     try:
         await run_snapshots_once()
     except Exception:
-        log.exception("MM auto: run_snapshots_once failed")
+        log.exception("MM auto: snapshots failed")
         return
 
-    # ✅ 2) обновляем память ликвидности (цели EQH/EQL / range high/low)
+    # 2) LIQUIDITY MEMORY
     try:
         await update_liquidity_memory(MM_TFS)
     except Exception:
-        # не валим авто-отчёты, если на раннем этапе мало истории или что-то пошло не так
-        log.exception("MM auto: update_liquidity_memory failed")
+        log.exception("MM auto: liquidity memory failed")
 
-    # 3) проверяем новые закрытия и шлём отчёты
+    # 3) MARKET EVENTS (sweep / reclaim / decision / wait)
+    for tf in MM_TFS:
+        try:
+            events = detect_and_store_market_events(tf)
+            if events:
+                log.info("MM events %s: %s", tf, "; ".join(events))
+        except Exception:
+            log.exception("MM auto: market events failed for tf=%s", tf)
+
+    # 4) REPORTS
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
@@ -118,39 +130,39 @@ async def _mm_auto_tick(app: Application) -> None:
                     continue
 
                 view = build_market_view(tf, manual=False)
-
-                if view.ts != latest_ts:
-                    log.warning("MM auto: ts mismatch for %s (latest=%s view=%s)", tf, latest_ts, view.ts)
-
                 text = render_report(view)
-                await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
+
+                await app.bot.send_message(
+                    chat_id=MM_ALERT_CHAT_ID,
+                    text=text,
+                )
 
                 payload = {
                     "kind": "auto",
                     "tf": tf,
-                    "report_ts": (view.ts.astimezone(timezone.utc).isoformat()),
+                    "report_ts": view.ts.isoformat(),
                     "sent_at": datetime.now(timezone.utc).isoformat(),
                 }
                 _mark_report_sent(conn, tf, view.ts, payload)
                 conn.commit()
 
-                log.info("MM auto: report sent tf=%s ts=%s", tf, view.ts)
+                log.info("MM report sent tf=%s ts=%s", tf, view.ts)
 
             except Exception:
                 conn.rollback()
-                log.exception("MM auto: failed for tf=%s", tf)
+                log.exception("MM auto: report failed tf=%s", tf)
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
     created: List[str] = []
 
     if not MM_AUTO_ENABLED:
-        log.warning("MM_AUTO_ENABLED=0 — mm auto is disabled")
+        log.warning("MM_AUTO_ENABLED=0 — mm auto disabled")
         return created
 
     jq = app.job_queue
     if jq is None:
-        log.warning("JobQueue is not available — cannot schedule MM auto")
+        log.warning("JobQueue unavailable — cannot schedule MM auto")
         return created
 
     for job in list(jq.jobs()):
