@@ -31,6 +31,9 @@ from services.signal_text import build_signal_message
 # === True Trading ===
 from services.true_trading import get_tt
 
+# === MM (new) ===
+from services.mm.snapshots import run_snapshots_once
+
 log = logging.getLogger(__name__)
 
 
@@ -43,6 +46,8 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("/watch_status")],
         [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
         [KeyboardButton("/tt_status")],
+        # MM (ручной запуск снапшотов)
+        [KeyboardButton("/mm_snapshots")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -89,6 +94,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /tt_on — включить True Trading\n"
         "• /tt_off — выключить True Trading\n"
         "• /tt_status — статус True Trading\n"
+        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1, только закрытые)\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -99,6 +105,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
+        "/mm_snapshots, "
         "/menu"
     )
 
@@ -168,9 +175,29 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
 
+# ------------ MM (ручной запуск) ------------
+async def cmd_mm_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Ручной one-shot: записывает в БД live снапшоты по закрытым свечам
+    BTC/ETH на H1/H4/D1/W1 + funding/OI в meta_json.
+
+    Важно: повторный запуск не создаёт дублей (UPSERT по UNIQUE(symbol,tf,ts)).
+    """
+    await update.message.reply_text("MM: пишу live снапшоты в БД (закрытые свечи)…")
+    try:
+        rows = await run_snapshots_once()
+        # Чтобы не упереться в лимиты Telegram — выводим компактно
+        msg = "✅ MM snapshots записаны:\n" + "\n".join(f"• {r}" for r in rows[:20])
+        if len(rows) > 20:
+            msg += f"\n…и ещё {len(rows) - 20}"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        log.exception("mm_snapshots failed")
+        await update.message.reply_text(f"❌ MM snapshots: ошибка — {e}")
+
+
 # ------------ Вотчер ------------
 async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # WATCHER_TFS может быть list или строкой (в main.py нормализуем, но тут оставим мягко)
     tfs = WATCHER_TFS
     created = schedule_watcher_jobs(
         app=context.application,
@@ -178,7 +205,7 @@ async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         interval_sec=int(WATCHER_INTERVAL_SEC),
     )
     try:
-        tfs_txt = ", ".join([t for t in tfs])  # если список
+        tfs_txt = ", ".join([t for t in tfs])
     except Exception:
         tfs_txt = str(tfs)
     tfs_txt = tfs_txt or "—"
@@ -300,6 +327,7 @@ def register_handlers(app: Application) -> None:
         "Handlers зарегистрированы: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
+        "/mm_snapshots, "
         "/menu"
     )
 
@@ -310,6 +338,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("check", cmd_check))
+
+    app.add_handler(CommandHandler("mm_snapshots", cmd_mm_snapshots))
 
     app.add_handler(CommandHandler("watch_on", cmd_watch_on))
     app.add_handler(CommandHandler("watch_off", cmd_watch_off))
