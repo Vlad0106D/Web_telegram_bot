@@ -11,7 +11,8 @@ import psycopg
 from psycopg.rows import dict_row
 
 from services.mm.state_store import save_state, load_last_state
-from services.mm.liquidity import load_last_liquidity_levels  # ✅ NEW
+from services.mm.liquidity import load_last_liquidity_levels
+from services.mm.market_events_store import get_last_market_event  # ✅ event-driven
 
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
@@ -22,13 +23,6 @@ TF_LABELS = {
     "D1": "ЗАКРЫТИЕ ДНЯ",
     "W1": "ЗАКРЫТИЕ НЕДЕЛИ",
     "MANUAL": "РУЧНОЙ СНИМОК",
-}
-
-HORIZON_LOOKBACK = {
-    "H1": 300,
-    "H4": 300,
-    "D1": 260,
-    "W1": 260,
 }
 
 FUNDING_BIAS_LONG = 0.008
@@ -138,26 +132,8 @@ def _fetch_prev_snapshot(conn: psycopg.Connection, symbol: str, tf: str, ts: dat
         return cur.fetchone()
 
 
-def _fetch_history(conn: psycopg.Connection, symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-    sql = """
-    SELECT ts, high, low, close
-    FROM mm_snapshots
-    WHERE symbol=%s AND tf=%s
-    ORDER BY ts DESC
-    LIMIT %s;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (symbol, tf, limit))
-        return cur.fetchall() or []
-
-
 def _targets_from_liq_levels(tf: str) -> Tuple[List[float], List[float], Optional[str]]:
-    """
-    Достаём цели из сохранённой памяти liq_levels.
-    """
-    liq = load_last_liquidity_levels(tf)
-    if not liq:
-        return [], [], None
+    liq = load_last_liquidity_levels(tf) or {}
 
     def _flt_list(x):
         out = []
@@ -170,42 +146,8 @@ def _targets_from_liq_levels(tf: str) -> Tuple[List[float], List[float], Optiona
 
     dn = _flt_list(liq.get("dn_targets"))
     up = _flt_list(liq.get("up_targets"))
-    key_zone = liq.get("key_zone")  # на будущее; сейчас может быть None
+    key_zone = liq.get("key_zone")  # на будущее
     return dn[:2], up[:2], (str(key_zone) if key_zone else None)
-
-
-def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[float], List[float], Optional[str]]:
-    """
-    1) Пытаемся взять цели из liq_levels (память)
-    2) Если там пусто — считаем грубо из истории mm_snapshots
-    3) Если и истории мало — вернём пусто
-    """
-    dn0, up0, kz0 = _targets_from_liq_levels(tf)
-    if dn0 or up0:
-        return dn0, up0, kz0
-
-    hist = _fetch_history(conn, "BTC-USDT", tf, HORIZON_LOOKBACK.get(tf, 300))
-    if len(hist) < 20:
-        return [], [], None
-
-    last_close = None
-    for row in hist:
-        if row.get("close") is not None:
-            last_close = float(row["close"])
-            break
-    if last_close is None:
-        return [], [], None
-
-    highs = sorted({float(r["high"]) for r in hist if r.get("high") is not None})
-    lows = sorted({float(r["low"]) for r in hist if r.get("low") is not None})
-
-    up_pool = [x for x in highs if x > last_close]
-    dn_pool = [x for x in lows if x < last_close]
-
-    up_targets = sorted(up_pool)[:2]
-    down_targets = sorted(dn_pool, reverse=True)[:2]
-
-    return down_targets, up_targets, None
 
 
 def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone: Optional[str]) -> Tuple[List[float], List[float], Optional[str]]:
@@ -230,6 +172,119 @@ def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone:
         return out
 
     return _flt_list(down), _flt_list(up), (str(key_zone) if key_zone else None)
+
+
+def _event_driven_state(tf: str) -> Dict[str, Any]:
+    """
+    Читает последнее рыночное событие и мапит его в:
+      state_title/icon, phase, execution, whats_next, invalidation, key_zone, probs baseline
+    """
+    ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
+    if not ev:
+        return {
+            "state_title": "ОЖИДАНИЕ",
+            "state_icon": "🟡",
+            "phase": "—",
+            "prob_up": 48,
+            "prob_down": 52,
+            "execution": "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона.",
+            "whats_next": ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"],
+            "invalidation": "—",
+            "key_zone": None,
+            "event_type": None,
+        }
+
+    et = (ev.get("event_type") or "").strip()
+    side = (ev.get("side") or "").strip() or None
+    zone = ev.get("zone")
+    key_zone = None
+
+    # decision zone
+    if et == "decision_zone":
+        key_zone = zone or ("H4 RANGE HIGH" if side == "up" else "H4 RANGE LOW")
+        return {
+            "state_title": "ЗОНА ПРИНЯТИЯ РЕШЕНИЯ",
+            "state_icon": "⚠️",
+            "phase": "Ожидается возврат цены (reclaim)",
+            "prob_up": 80 if side == "up" else 20,
+            "prob_down": 20 if side == "up" else 80,
+            "execution": "зона решения — вход только после реакции/удержания; без подтверждения лучше WAIT.",
+            "whats_next": ["Ждём подтверждение реакции (возврат/удержание)", "Затем ретест зоны без обновления экстремума"],
+            "invalidation": "Принятие цены за зоной (H4 закрытие) без возврата",
+            "key_zone": key_zone,
+            "event_type": et,
+        }
+
+    # sweep / reclaim
+    if et == "sweep_high":
+        return {
+            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
+            "state_icon": "🟢",
+            "phase": "Ликвидность снята",
+            "prob_up": 68,
+            "prob_down": 32,
+            "execution": "ждать sweep вверх → reclaim; шорт/контртрейд — только после возврата под зону, иначе не спешить.",
+            "whats_next": ["Ликвидность по хаям снята", "Теперь ждём возврат (reclaim) под уровнем"],
+            "invalidation": "H4 закрытие ниже ближайшей цели снизу",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "sweep_low":
+        return {
+            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
+            "state_icon": "🔴",
+            "phase": "Ликвидность снята",
+            "prob_up": 34,
+            "prob_down": 66,
+            "execution": "ждать sweep вниз → reclaim; лимитный набор — ближе к цели вниз, подтверждение — возврат над зоной.",
+            "whats_next": ["Ликвидность по лоям снята", "Теперь ждём возврат (reclaim) над уровнем"],
+            "invalidation": "H4 закрытие выше ближайшей цели сверху",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "reclaim_down":
+        return {
+            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
+            "state_icon": "🔴",
+            "phase": "Возврат цены подтверждён",
+            "prob_up": 34,
+            "prob_down": 66,
+            "execution": "ждать ретест зоны без обновления лоя; агрессия только после подтверждения.",
+            "whats_next": ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления лоя"],
+            "invalidation": "H4 закрытие выше ближайшей цели сверху",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "reclaim_up":
+        return {
+            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
+            "state_icon": "🟢",
+            "phase": "Возврат цены подтверждён",
+            "prob_up": 66,
+            "prob_down": 34,
+            "execution": "ждать ретест зоны без обновления хая; агрессия только после подтверждения.",
+            "whats_next": ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления хая"],
+            "invalidation": "H4 закрытие ниже ближайшей цели снизу",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    # wait fallback
+    return {
+        "state_title": "ОЖИДАНИЕ",
+        "state_icon": "🟡",
+        "phase": "—",
+        "prob_up": 48,
+        "prob_down": 52,
+        "execution": "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона.",
+        "whats_next": ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"],
+        "invalidation": "—",
+        "key_zone": None,
+        "event_type": et,
+    }
 
 
 @dataclass
@@ -293,77 +348,23 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         btc_fr, btc_fr_lbl = _extract_funding(btc_meta)
         eth_fr, eth_fr_lbl = _extract_funding(eth_meta)
 
-        down_t, up_t, key_zone = _liquidity_targets_btc(conn, tf)
-        down_t, up_t, key_zone = _merge_with_persisted(tf, down_t, up_t, key_zone)
+        # targets from liquidity memory first
+        down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
+        down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        btc_prev_close = float(btc_prev["close"]) if btc_prev and btc_prev.get("close") is not None else None
-        btc_close = float(btc["close"]) if btc.get("close") is not None else None
+        # event-driven state
+        st = _event_driven_state(tf)
+        state_title = st["state_title"]
+        state_icon = st["state_icon"]
+        phase = st["phase"]
+        prob_up = int(st["prob_up"])
+        prob_down = int(st["prob_down"])
+        execution = st["execution"]
+        whats_next = st["whats_next"]
+        invalidation = st["invalidation"]
+        key_zone = st.get("key_zone") or key_zone0
 
-        bias_up = 0
-        bias_dn = 0
-
-        if btc_close is not None and btc_prev_close is not None:
-            if btc_close > btc_prev_close:
-                bias_up += 1
-            elif btc_close < btc_prev_close:
-                bias_dn += 1
-
-        if btc_fr is not None:
-            if btc_fr >= FUNDING_BIAS_LONG:
-                bias_up += 1
-            elif btc_fr <= FUNDING_BIAS_SHORT:
-                bias_dn += 1
-
-        if key_zone is not None:
-            state_title = "ЗОНА ПРИНЯТИЯ РЕШЕНИЯ"
-            state_icon = "⚠️"
-            phase = "Ожидается возврат цены (reclaim)"
-            prob_up = 80 if "HIGH" in key_zone else 20
-            prob_down = 100 - prob_up
-            execution = "зона решения — вход только после реакции/удержания; без подтверждения лучше WAIT."
-            whats_next = [
-                "Ждём подтверждение реакции (возврат/удержание)",
-                "Затем ретест зоны без обновления экстремума",
-            ]
-            invalidation = "Принятие цены за зоной (H4 закрытие) без возврата"
-        else:
-            if bias_up >= bias_dn + 1:
-                state_title = "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ"
-                state_icon = "🟢"
-                phase = "Ожидается снятие ликвидности"
-                prob_up = 70
-                prob_down = 30
-                execution = "ждать sweep вверх → reclaim; шорт/контртрейд — только после возврата под зону, иначе не спешить."
-                whats_next = [
-                    "Ожидается снятие ближайших хаёв",
-                    "После снятия — ждём возврат (reclaim)",
-                ]
-                invalidation = "H4 закрытие ниже ближайшей цели снизу"
-            elif bias_dn >= bias_up + 1:
-                state_title = "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ"
-                state_icon = "🔴"
-                phase = "Ожидается снятие ликвидности"
-                prob_down = 75
-                prob_up = 25
-                execution = "ждать sweep вниз → reclaim; лимитный набор — ближе к цели вниз, подтверждение — возврат над зоной."
-                whats_next = [
-                    "Ожидается снятие ближайших лоев",
-                    "После снятия — ждём возврат (reclaim)",
-                ]
-                invalidation = "H4 закрытие выше ближайшей цели сверху"
-            else:
-                state_title = "ОЖИДАНИЕ"
-                state_icon = "🟡"
-                phase = "—"
-                prob_down = 52
-                prob_up = 48
-                execution = "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона."
-                whats_next = [
-                    "Ждём появления перекоса/выхода из диапазона",
-                    "Следим за EQH/EQL поблизости",
-                ]
-                invalidation = "—"
-
+        # ETH confirmation: funding confirms / diverges
         eth_conf = "нейтрален 🟡"
         if state_icon in ("🟢", "⚠️"):
             if eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
@@ -376,6 +377,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             elif eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
                 eth_conf = "расходится ⚠️ (снижает уверенность)"
 
+        # tweak probabilities slightly with ETH confirmation
         if "подтверждает" in eth_conf:
             if state_icon == "🟢":
                 prob_up = min(85, prob_up + 5)
@@ -416,6 +418,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             eth_confirmation=eth_conf,
         )
 
+        # persist state for stability
         try:
             save_state(
                 tf=tf,
@@ -430,6 +433,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                     "btc_up_targets": view.btc_up_targets,
                     "key_zone": view.key_zone,
                     "eth_confirmation": view.eth_confirmation,
+                    "event_type": st.get("event_type"),
                 },
             )
         except Exception:
