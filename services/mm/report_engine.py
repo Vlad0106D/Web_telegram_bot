@@ -10,9 +10,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from psycopg.rows import dict_row
 
+from services.mm.state_store import save_state, load_last_state
 
-# --------- Конфиг (пока фиксируем под твоё правило) ----------
+
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
+
 TF_LABELS = {
     "H1": "H1",
     "H4": "H4 UPDATE",
@@ -28,12 +30,10 @@ HORIZON_LOOKBACK = {
     "W1": 260,
 }
 
-# OI/Funding bias thresholds (можно подкрутить позже по твоим ощущениям)
-FUNDING_BIAS_LONG = 0.008    # 0.8%? нет, это 0.008% (как в твоих отчётах)
+FUNDING_BIAS_LONG = 0.008
 FUNDING_BIAS_SHORT = -0.008
 
 
-# --------- DB ----------
 def _db_url() -> str:
     url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
@@ -44,7 +44,6 @@ def _db_url() -> str:
 def _fmt_price(x: Optional[float]) -> str:
     if x is None or not math.isfinite(float(x)):
         return "—"
-    # BTC часто без копеек, но иногда есть .50/.40 — оставим до 2 знаков если нужно
     if abs(x) >= 1000:
         if abs(x - round(x)) < 1e-6:
             return f"{int(round(x)):,}".replace(",", " ")
@@ -62,16 +61,7 @@ def _utc_str(ts: datetime) -> str:
     return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _meta_get(snapshot: Dict[str, Any], key: str, default=None):
-    meta = snapshot.get("meta_json") or {}
-    return meta.get(key, default)
-
-
 def _extract_funding(meta: Dict[str, Any]) -> Tuple[Optional[float], str]:
-    """
-    Возвращает (funding_rate, label)
-    label: 'нейтрально' / 'перекос в лонг' / 'перекос в шорт'
-    """
     fr = None
     try:
         fr = (meta.get("funding") or {}).get("funding_rate")
@@ -100,7 +90,6 @@ def _extract_oi(meta: Dict[str, Any]) -> Optional[float]:
 def _pretty_oi(x: Optional[float]) -> str:
     if x is None or not math.isfinite(float(x)):
         return "—"
-    # у тебя в отчётах было 2.58M и т.п.
     if x >= 1e9:
         return f"{x/1e9:.2f}B"
     if x >= 1e6:
@@ -122,7 +111,6 @@ def _arrow(x: Optional[float]) -> str:
     return "↑" if x > 0 else ("↓" if x < 0 else "→")
 
 
-# --------- Queries ----------
 def _fetch_latest_snapshot(conn: psycopg.Connection, symbol: str, tf: str) -> Optional[Dict[str, Any]]:
     sql = """
     SELECT *
@@ -162,21 +150,11 @@ def _fetch_history(conn: psycopg.Connection, symbol: str, tf: str, limit: int) -
         return cur.fetchall() or []
 
 
-# --------- Liquidity targets (упрощённо, но в стиле старого модуля) ----------
 def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[float], List[float], Optional[str]]:
-    """
-    Возвращает (down_targets, up_targets, key_zone_label)
-    - down_targets: ближайшие уровни "под ценой"
-    - up_targets: ближайшие уровни "над ценой"
-
-    Пока без backfill: уровни строятся из накопленной истории mm_snapshots.
-    По мере накопления история станет достаточной, и цели будут “как раньше”.
-    """
     hist = _fetch_history(conn, "BTC-USDT", tf, HORIZON_LOOKBACK.get(tf, 300))
     if len(hist) < 20:
         return [], [], None
 
-    # Текущая цена = последний close
     last_close = None
     for row in hist:
         if row.get("close") is not None:
@@ -188,23 +166,18 @@ def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[floa
     highs = sorted({float(r["high"]) for r in hist if r.get("high") is not None})
     lows = sorted({float(r["low"]) for r in hist if r.get("low") is not None})
 
-    # Берём ближайшие 1-2 уровня над/под ценой
-    up = [x for x in highs if x > last_close][-10:]
-    dn = [x for x in lows if x < last_close][:10]
+    up_pool = [x for x in highs if x > last_close]
+    dn_pool = [x for x in lows if x < last_close]
 
-    # ближние уровни (над ценой — по возрастанию, под ценой — по убыванию)
-    up_targets = sorted(up)[:2]
-    down_targets = sorted(dn, reverse=True)[:2]
+    up_targets = sorted(up_pool)[:2]
+    down_targets = sorted(dn_pool, reverse=True)[:2]
 
-    # “ключевая зона” — пока грубо: если близко к H4 экстремуму
     key_zone = None
     if tf == "H1":
-        # проверим proximity к последнему H4 high/low (range границы)
         h4 = _fetch_history(conn, "BTC-USDT", "H4", 120)
         if len(h4) >= 20:
             h4_high = max(float(r["high"]) for r in h4 if r.get("high") is not None)
             h4_low = min(float(r["low"]) for r in h4 if r.get("low") is not None)
-            # если в пределах 0.35% к границе — зона решения
             if h4_high and abs(last_close / h4_high - 1) < 0.0035:
                 key_zone = "H4 RANGE HIGH"
             elif h4_low and abs(last_close / h4_low - 1) < 0.0035:
@@ -213,7 +186,34 @@ def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[floa
     return down_targets, up_targets, key_zone
 
 
-# --------- State machine (минимальный восстановленный скелет) ----------
+def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone: Optional[str]) -> Tuple[List[float], List[float], Optional[str]]:
+    """
+    Если пока нет достаточной истории (down/up пустые), подтягиваем последнее сохранённое состояние.
+    """
+    st = load_last_state(tf=tf)
+    if not st:
+        return down, up, key_zone
+
+    if not down:
+        down = st.get("btc_down_targets") or []
+    if not up:
+        up = st.get("btc_up_targets") or []
+    if key_zone is None:
+        key_zone = st.get("key_zone")
+
+    # нормализуем типы
+    def _flt_list(x):
+        out = []
+        for v in (x or []):
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        return out
+
+    return _flt_list(down), _flt_list(up), (str(key_zone) if key_zone else None)
+
+
 @dataclass
 class MarketView:
     tf: str
@@ -244,25 +244,20 @@ class MarketView:
     whats_next: List[str]
     invalidation: str
 
-    eth_confirmation: str  # "подтверждает" / "расходится" / "нейтрален"
+    eth_confirmation: str
 
 
 def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
-    """
-    Собирает MARKET VIEW строго из БД-снапшотов.
-    manual=True — только для заголовка (РУЧНОЙ СНИМОК). Данные всё равно берём из последних закрытых.
-    """
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
-        # latest snapshots for BTC/ETH at tf
         btc = _fetch_latest_snapshot(conn, "BTC-USDT", tf)
         eth = _fetch_latest_snapshot(conn, "ETH-USDT", tf)
         if not btc or not eth:
             raise RuntimeError(f"Not enough snapshots for tf={tf}. Run /mm_snapshots a few times.")
 
         ts = btc["ts"]
-        # prev snapshots for OI delta
+
         btc_prev = _fetch_prev_snapshot(conn, "BTC-USDT", tf, ts)
         eth_prev = _fetch_prev_snapshot(conn, "ETH-USDT", tf, ts)
 
@@ -280,11 +275,10 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         btc_fr, btc_fr_lbl = _extract_funding(btc_meta)
         eth_fr, eth_fr_lbl = _extract_funding(eth_meta)
 
-        # liquidity targets
         down_t, up_t, key_zone = _liquidity_targets_btc(conn, tf)
+        down_t, up_t, key_zone = _merge_with_persisted(tf, down_t, up_t, key_zone)
 
-        # --------- восстановление логики состояний (упрощённо, но в стиле твоих отчётов) ----------
-        # базовый bias: по направлению последних закрытий (close vs prev close)
+        # ---- state core (упрощённый, но уже похожий на старый) ----
         btc_prev_close = float(btc_prev["close"]) if btc_prev and btc_prev.get("close") is not None else None
         btc_close = float(btc["close"]) if btc.get("close") is not None else None
 
@@ -297,20 +291,12 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             elif btc_close < btc_prev_close:
                 bias_dn += 1
 
-        # OI рост + funding перекос усиливают направление (как модификатор)
-        if btc_oi_d is not None:
-            if btc_oi_d > 0:
-                bias_up += 1  # рост OI чаще означает активность, но направление уточняет reclaim/sweep позже
-            elif btc_oi_d < 0:
-                bias_dn += 0  # падение OI — нейтр/снятие, позже используем в событиях
-
         if btc_fr is not None:
             if btc_fr >= FUNDING_BIAS_LONG:
                 bias_up += 1
             elif btc_fr <= FUNDING_BIAS_SHORT:
                 bias_dn += 1
 
-        # Decision zone — если рядом H4 range граница
         if key_zone is not None:
             state_title = "ЗОНА ПРИНЯТИЯ РЕШЕНИЯ"
             state_icon = "⚠️"
@@ -324,7 +310,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             ]
             invalidation = "Принятие цены за зоной (H4 закрытие) без возврата"
         else:
-            # Pressure / Wait
             if bias_up >= bias_dn + 1:
                 state_title = "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ"
                 state_icon = "🟢"
@@ -362,8 +347,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 ]
                 invalidation = "—"
 
-        # ETH confirmation (очень похоже на твои отчёты)
-        # Пока правило простое: если ETH funding bias в ту же сторону и OI не конфликтует — confirm
+        # ETH confirmation
         eth_conf = "нейтрален 🟡"
         if state_icon in ("🟢", "⚠️"):
             if eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
@@ -376,7 +360,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             elif eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
                 eth_conf = "расходится ⚠️ (снижает уверенность)"
 
-        # prob корректировка от ETH
         if "подтверждает" in eth_conf:
             if state_icon == "🟢":
                 prob_up = min(85, prob_up + 5)
@@ -392,36 +375,53 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
-        return MarketView(
+        view = MarketView(
             tf=("MANUAL" if manual else tf),
             ts=ts,
-
             state_title=state_title,
             state_icon=state_icon,
             phase=phase,
-
             prob_down=int(prob_down),
             prob_up=int(prob_up),
-
             btc_down_targets=down_t,
             btc_up_targets=up_t,
             key_zone=key_zone,
-
             btc_oi=btc_oi,
             btc_oi_delta=btc_oi_d,
             btc_funding=btc_fr,
             btc_funding_label=btc_fr_lbl,
-
             eth_oi=eth_oi,
             eth_oi_delta=eth_oi_d,
             eth_funding=eth_fr,
             eth_funding_label=eth_fr_lbl,
-
             execution=execution,
             whats_next=whats_next,
             invalidation=invalidation,
             eth_confirmation=eth_conf,
         )
+
+        # --- persist state (без дублей мы не заморачиваемся: это "память", пусть обновляется часто) ---
+        try:
+            save_state(
+                tf=tf,
+                ts=ts,
+                payload={
+                    "state_title": view.state_title,
+                    "state_icon": view.state_icon,
+                    "phase": view.phase,
+                    "prob_down": view.prob_down,
+                    "prob_up": view.prob_up,
+                    "btc_down_targets": view.btc_down_targets,
+                    "btc_up_targets": view.btc_up_targets,
+                    "key_zone": view.key_zone,
+                    "eth_confirmation": view.eth_confirmation,
+                },
+            )
+        except Exception:
+            # не ломаем отчёт, если сохранение памяти не удалось
+            pass
+
+        return view
 
 
 def render_report(view: MarketView) -> str:
@@ -461,26 +461,31 @@ def render_report(view: MarketView) -> str:
     lines.append("")
     lines.append("Деривативы (OKX SWAP):")
 
-    # Для подписи "с прошлого H1/H4/DAILY_CLOSE/MANUAL" — используем label
     prev_lbl = view.tf if view.tf in ("H1", "H4") else ("DAILY_CLOSE" if view.tf == "D1" else ("WEEKLY_CLOSE" if view.tf == "W1" else "MANUAL"))
 
     btc_oi_txt = _pretty_oi(view.btc_oi)
     btc_d = view.btc_oi_delta
     btc_d_txt = "—" if btc_d is None else f"Δ {_arrow(btc_d)} {btc_d:+.2f}%"
-    lines.append(
-        f"• BTC BTC-USDT-SWAP | OI: {btc_oi_txt} ({btc_d_txt} с прошлого {prev_lbl}) | Funding: {_fmt_pct((view.btc_funding or 0)*100)} | {view.btc_funding_label}"
-        if view.btc_funding is not None
-        else f"• BTC BTC-USDT-SWAP | OI: {btc_oi_txt} ({btc_d_txt} с прошлого {prev_lbl}) | Funding: — | {view.btc_funding_label}"
-    )
+    if view.btc_funding is not None:
+        lines.append(
+            f"• BTC BTC-USDT-SWAP | OI: {btc_oi_txt} ({btc_d_txt} с прошлого {prev_lbl}) | Funding: {_fmt_pct(view.btc_funding * 100)} | {view.btc_funding_label}"
+        )
+    else:
+        lines.append(
+            f"• BTC BTC-USDT-SWAP | OI: {btc_oi_txt} ({btc_d_txt} с прошлого {prev_lbl}) | Funding: — | {view.btc_funding_label}"
+        )
 
     eth_oi_txt = _pretty_oi(view.eth_oi)
     eth_d = view.eth_oi_delta
     eth_d_txt = "—" if eth_d is None else f"Δ {_arrow(eth_d)} {eth_d:+.2f}%"
-    lines.append(
-        f"• ETH ETH-USDT-SWAP | OI: {eth_oi_txt} ({eth_d_txt} с прошлого {prev_lbl}) | Funding: {_fmt_pct((view.eth_funding or 0)*100)} | {view.eth_funding_label}"
-        if view.eth_funding is not None
-        else f"• ETH ETH-USDT-SWAP | OI: {eth_oi_txt} ({eth_d_txt} с прошлого {prev_lbl}) | Funding: — | {view.eth_funding_label}"
-    )
+    if view.eth_funding is not None:
+        lines.append(
+            f"• ETH ETH-USDT-SWAP | OI: {eth_oi_txt} ({eth_d_txt} с прошлого {prev_lbl}) | Funding: {_fmt_pct(view.eth_funding * 100)} | {view.eth_funding_label}"
+        )
+    else:
+        lines.append(
+            f"• ETH ETH-USDT-SWAP | OI: {eth_oi_txt} ({eth_d_txt} с прошлого {prev_lbl}) | Funding: — | {view.eth_funding_label}"
+        )
 
     lines.append("")
     lines.append(f"Execution: {view.execution}")
