@@ -14,15 +14,15 @@ from telegram.ext import Application
 
 from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
+from services.mm.liquidity import update_liquidity_memory  # ✅ NEW
 
 log = logging.getLogger(__name__)
 
 
-# ---- настройки авто-проверки ----
 MM_AUTO_ENABLED = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
 MM_AUTO_CHECK_SEC = int(os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60")
 
-# куда слать авто-отчёты (в личку тебе)
+
 def _read_chat_id() -> Optional[int]:
     raw = (os.getenv("ALERT_CHAT_ID") or "").strip()
     if not raw:
@@ -32,9 +32,8 @@ def _read_chat_id() -> Optional[int]:
     except Exception:
         return None
 
-MM_ALERT_CHAT_ID = _read_chat_id()
 
-# какие ТФ мониторим
+MM_ALERT_CHAT_ID = _read_chat_id()
 MM_TFS = [t.strip() for t in (os.getenv("MM_TFS", "H1,H4,D1,W1").replace(" ", "").split(",")) if t.strip()]
 
 
@@ -60,9 +59,6 @@ def _get_latest_snapshot_ts(conn: psycopg.Connection, tf: str) -> Optional[datet
 
 
 def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
-    """
-    Анти-дубль: если уже есть событие report_sent на этот tf+ts — не шлём повторно.
-    """
     sql = """
     SELECT 1
     FROM mm_events
@@ -87,18 +83,10 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 
 async def _mm_auto_tick(app: Application) -> None:
-    """
-    Одна итерация авто-цикла:
-    1) пишет live снапшоты (только закрытые свечи) в БД
-    2) для каждого TF проверяет: появилась ли новая закрытая свеча
-    3) если да — строит отчёт из БД и отправляет
-    4) пишет mm_events(report_sent), чтобы не было дублей
-    """
     if not MM_AUTO_ENABLED:
         return
 
     if MM_ALERT_CHAT_ID is None:
-        # не падаем, просто логируем — авто-отчёты некуда слать
         log.warning("MM_AUTO enabled but ALERT_CHAT_ID is not set — skipping auto send")
         return
 
@@ -109,7 +97,14 @@ async def _mm_auto_tick(app: Application) -> None:
         log.exception("MM auto: run_snapshots_once failed")
         return
 
-    # 2) проверяем новые закрытия и шлём отчёты
+    # ✅ 2) обновляем память ликвидности (цели EQH/EQL / range high/low)
+    try:
+        await update_liquidity_memory(MM_TFS)
+    except Exception:
+        # не валим авто-отчёты, если на раннем этапе мало истории или что-то пошло не так
+        log.exception("MM auto: update_liquidity_memory failed")
+
+    # 3) проверяем новые закрытия и шлём отчёты
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
@@ -119,21 +114,17 @@ async def _mm_auto_tick(app: Application) -> None:
                 if latest_ts is None:
                     continue
 
-                # анти-дубль: если уже отправляли отчёт по этой свече — пропускаем
                 if _report_already_sent(conn, tf, latest_ts):
                     continue
 
-                # 3) строим отчёт из БД и шлём
                 view = build_market_view(tf, manual=False)
-                # safety: убеждаемся, что view.ts совпадает с latest_ts (иногда BTC/ETH могут разъехаться)
-                # если разъехались — всё равно шлём по view.ts, но логируем
+
                 if view.ts != latest_ts:
                     log.warning("MM auto: ts mismatch for %s (latest=%s view=%s)", tf, latest_ts, view.ts)
 
                 text = render_report(view)
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
-                # 4) фиксируем факт отправки
                 payload = {
                     "kind": "auto",
                     "tf": tf,
@@ -151,10 +142,6 @@ async def _mm_auto_tick(app: Application) -> None:
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
-    """
-    Планирует авто-проверку.
-    Запуск раз в MM_AUTO_CHECK_SEC секунд.
-    """
     created: List[str] = []
 
     if not MM_AUTO_ENABLED:
@@ -166,7 +153,6 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("JobQueue is not available — cannot schedule MM auto")
         return created
 
-    # Чтобы не создавать дубликаты jobs при /watch_on или рестартах — удалим старые mm_auto jobs
     for job in list(jq.jobs()):
         if job and job.name and job.name.startswith("mm_auto"):
             try:
@@ -178,12 +164,16 @@ def schedule_mm_auto(app: Application) -> List[str]:
     jq.run_repeating(
         callback=lambda ctx: _mm_auto_tick(ctx.application),
         interval=MM_AUTO_CHECK_SEC,
-        first=10,  # через 10 секунд после старта
+        first=10,
         name=name,
     )
     created.append(name)
 
-    log.info("MM auto scheduled: every %ss | tfs=%s | chat_id=%s",
-             MM_AUTO_CHECK_SEC, ",".join(MM_TFS), MM_ALERT_CHAT_ID)
+    log.info(
+        "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",
+        MM_AUTO_CHECK_SEC,
+        ",".join(MM_TFS),
+        MM_ALERT_CHAT_ID,
+    )
 
     return created
