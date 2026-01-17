@@ -33,7 +33,7 @@ from services.true_trading import get_tt
 
 # === MM (snapshots + commands) ===
 from services.mm.snapshots import run_snapshots_once
-from bot.mm_commands import register_mm_commands   # ✅ NEW
+from bot.mm_commands import register_mm_commands
 
 log = logging.getLogger(__name__)
 
@@ -43,11 +43,16 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
     rows: List[List[KeyboardButton]] = [
         [KeyboardButton("/list"), KeyboardButton("/find")],
         [KeyboardButton("/check")],
+
         [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
         [KeyboardButton("/watch_status")],
+
         [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
         [KeyboardButton("/tt_status")],
+
         # MM
+        [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
+        [KeyboardButton("/mm_status"), KeyboardButton("/mm_report")],
         [KeyboardButton("/mm_snapshots")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -95,10 +100,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /tt_on — включить True Trading\n"
         "• /tt_off — выключить True Trading\n"
         "• /tt_status — статус True Trading\n"
-        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1)\n"
-        "• /mm_report — MM: ручной отчёт\n"
-        "• /mm_on /mm_off — MM авто режим\n"
+        "• /mm_on — включить MM авто\n"
+        "• /mm_off — выключить MM авто\n"
         "• /mm_status — статус MM\n"
+        "• /mm_report — ручной MM отчёт\n"
+        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1)\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -109,7 +115,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды: /start, /help, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
-        "/mm_snapshots, /mm_report, /mm_on, /mm_off, /mm_status, "
+        "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
         "/menu"
     )
 
@@ -319,7 +325,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("tt_off", cmd_tt_off))
     app.add_handler(CommandHandler("tt_status", cmd_tt_status))
 
-    # ✅ MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
+    # MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
     register_mm_commands(app)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
