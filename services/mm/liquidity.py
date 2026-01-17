@@ -18,7 +18,6 @@ def _db_url() -> str:
     return url
 
 
-# Сколько последних свечей использовать для "памяти ликвидности"
 LOOKBACK = {
     "H1": 200,
     "H4": 180,
@@ -35,8 +34,8 @@ class LiquidityLevels:
     range_high: Optional[float]
     range_low: Optional[float]
 
-    eqh: Optional[float]   # equal highs cluster
-    eql: Optional[float]   # equal lows cluster
+    eqh: Optional[float]
+    eql: Optional[float]
 
     up_targets: List[float]
     dn_targets: List[float]
@@ -58,24 +57,19 @@ def _fetch_history(conn: psycopg.Connection, tf: str, limit: int) -> List[Dict[s
 
 
 def _near(a: float, b: float, tol: float) -> bool:
-    # tol — относительная (например 0.001 = 0.1%)
     if a == 0 or b == 0:
         return False
     return abs(a / b - 1.0) <= tol
 
 
 def _cluster_level(values: List[float], tol: float, min_hits: int = 2) -> Optional[float]:
-    """
-    Ищем "кластер" близких значений (EQH/EQL).
-    Возвращаем среднее кластера с max hits.
-    """
     if len(values) < min_hits:
         return None
 
     best_hits = 0
     best_mean = None
 
-    for i, v in enumerate(values):
+    for v in values:
         hits = [x for x in values if _near(x, v, tol)]
         if len(hits) > best_hits:
             best_hits = len(hits)
@@ -87,16 +81,11 @@ def _cluster_level(values: List[float], tol: float, min_hits: int = 2) -> Option
 
 
 def compute_liquidity_levels(tf: str) -> LiquidityLevels:
-    """
-    Считает уровни ликвидности из накопленной истории mm_snapshots (BTC-USDT, tf).
-    Без backfill: уровни становятся лучше по мере накопления.
-    """
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
         hist = _fetch_history(conn, tf, LOOKBACK.get(tf, 200))
 
     if len(hist) < 30:
-        # слишком рано, но всё равно вернём структуру
         ts = hist[0]["ts"] if hist else datetime.now(timezone.utc)
         return LiquidityLevels(
             tf=tf,
@@ -113,21 +102,17 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     highs = [float(r["high"]) for r in hist if r.get("high") is not None]
     lows = [float(r["low"]) for r in hist if r.get("low") is not None]
 
-    # range boundaries
     range_high = max(highs) if highs else None
     range_low = min(lows) if lows else None
 
-    # EQH/EQL: кластеры экстремумов (толеранс 0.12% для H1/H4, 0.18% для D1, 0.25% для W1)
     tol = 0.0012 if tf in ("H1", "H4") else (0.0018 if tf == "D1" else 0.0025)
 
-    # берём "верхние" экстремумы и ищем EQH, "нижние" — EQL
     top_highs = sorted(highs, reverse=True)[:40]
     bot_lows = sorted(lows)[:40]
 
     eqh = _cluster_level(top_highs, tol=tol, min_hits=2)
     eql = _cluster_level(bot_lows, tol=tol, min_hits=2)
 
-    # цели: если есть EQH/EQL — они приоритетнее, дальше границы range
     up_targets: List[float] = []
     dn_targets: List[float] = []
     notes: List[str] = []
@@ -148,10 +133,7 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
             dn_targets.append(range_low)
         notes.append("range_low")
 
-    # нормализуем порядок как в твоих отчётах:
-    # вниз: ближе->дальше (обычно сверху вниз): [near] → [far], поэтому по убыванию
     dn_targets = sorted(list(dict.fromkeys(dn_targets)), reverse=True)[:2]
-    # вверх: ближе->дальше по возрастанию
     up_targets = sorted(list(dict.fromkeys(up_targets)))[:2]
 
     ts = hist[0]["ts"]
@@ -169,10 +151,6 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
 
 
 def save_liquidity_levels(levels: LiquidityLevels) -> None:
-    """
-    Сохраняет уровни ликвидности в mm_events как память.
-    event_type='liq_levels'
-    """
     payload = {
         "tf": levels.tf,
         "range_high": levels.range_high,
@@ -216,14 +194,33 @@ def load_last_liquidity_levels(tf: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _has_targets(payload: Optional[Dict[str, Any]]) -> bool:
+    if not payload:
+        return False
+    up = payload.get("up_targets") or []
+    dn = payload.get("dn_targets") or []
+    return bool(up) or bool(dn)
+
+
 async def update_liquidity_memory(tfs: List[str]) -> List[str]:
     """
-    Вызывается авто-циклом: пересчитывает уровни и сохраняет, если есть история.
+    Пересчитывает уровни и сохраняет.
+    Важно: НЕ перезаписываем "последние хорошие уровни" пустыми значениями,
+    иначе в отчёте будут вечные "—".
     """
     out: List[str] = []
+
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
-        # сохраняем всегда — даже если insufficient_history, это тоже “память состояния”
+
+        # ✅ если новый расчёт пустой, но в БД уже есть непустой — пропускаем сохранение
+        if (not lv.up_targets and not lv.dn_targets) and ("insufficient_history" in (lv.notes or [])):
+            prev = load_last_liquidity_levels(tf)
+            if _has_targets(prev):
+                out.append(f"{tf}: skip(empty) keep_prev up={prev.get('up_targets')} dn={prev.get('dn_targets')}")
+                continue
+
         save_liquidity_levels(lv)
         out.append(f"{tf}: up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+
     return out
