@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import Iterable, List
 
-from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, Application, Defaults
 from telegram import BotCommand
+from telegram.constants import ParseMode
+from telegram.ext import Application, ApplicationBuilder, Defaults
 
 from config import TOKEN, WATCHER_ENABLED, WATCHER_INTERVAL_SEC, WATCHER_TFS
 from bot.handlers import register_handlers
@@ -40,7 +41,7 @@ def _normalize_tfs(value) -> List[str]:
         return [str(x).strip() for x in value if str(x).strip()]
 
     if isinstance(value, Iterable):
-        out = []
+        out: List[str] = []
         for x in value:
             xs = str(x).strip()
             if xs:
@@ -69,10 +70,7 @@ async def _post_init(app: Application) -> None:
     ]
 
     await app.bot.set_my_commands(commands)
-    log.info(
-        "Bot commands set globally: %s",
-        ", ".join(f"/{c.command}" for c in commands),
-    )
+    log.info("Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands))
 
 
 async def _on_error(update, context) -> None:
@@ -96,9 +94,16 @@ async def _on_error(update, context) -> None:
 def main() -> None:
     log.info(">>> ENTER main.py")
 
+    # Жёсткая проверка, чтобы не запускаться с пустым токеном
+    token = (TOKEN or "").strip()
+    if not token:
+        # Доп. подсказка: часто на Render токен приходит из env
+        env_hint = "TELEGRAM_TOKEN" if os.getenv("TELEGRAM_TOKEN") else "TOKEN"
+        raise RuntimeError(f"Telegram TOKEN is empty. Check config/env var ({env_hint}).")
+
     app = (
         ApplicationBuilder()
-        .token(TOKEN)
+        .token(token)
         .post_init(_post_init)
         .defaults(Defaults(parse_mode=ParseMode.HTML))
         .build()
