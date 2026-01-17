@@ -11,6 +11,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from services.mm.state_store import save_state, load_last_state
+from services.mm.liquidity import load_last_liquidity_levels  # ✅ NEW
 
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
@@ -150,7 +151,39 @@ def _fetch_history(conn: psycopg.Connection, symbol: str, tf: str, limit: int) -
         return cur.fetchall() or []
 
 
+def _targets_from_liq_levels(tf: str) -> Tuple[List[float], List[float], Optional[str]]:
+    """
+    Достаём цели из сохранённой памяти liq_levels.
+    """
+    liq = load_last_liquidity_levels(tf)
+    if not liq:
+        return [], [], None
+
+    def _flt_list(x):
+        out = []
+        for v in (x or []):
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        return out
+
+    dn = _flt_list(liq.get("dn_targets"))
+    up = _flt_list(liq.get("up_targets"))
+    key_zone = liq.get("key_zone")  # на будущее; сейчас может быть None
+    return dn[:2], up[:2], (str(key_zone) if key_zone else None)
+
+
 def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[float], List[float], Optional[str]]:
+    """
+    1) Пытаемся взять цели из liq_levels (память)
+    2) Если там пусто — считаем грубо из истории mm_snapshots
+    3) Если и истории мало — вернём пусто
+    """
+    dn0, up0, kz0 = _targets_from_liq_levels(tf)
+    if dn0 or up0:
+        return dn0, up0, kz0
+
     hist = _fetch_history(conn, "BTC-USDT", tf, HORIZON_LOOKBACK.get(tf, 300))
     if len(hist) < 20:
         return [], [], None
@@ -172,24 +205,10 @@ def _liquidity_targets_btc(conn: psycopg.Connection, tf: str) -> Tuple[List[floa
     up_targets = sorted(up_pool)[:2]
     down_targets = sorted(dn_pool, reverse=True)[:2]
 
-    key_zone = None
-    if tf == "H1":
-        h4 = _fetch_history(conn, "BTC-USDT", "H4", 120)
-        if len(h4) >= 20:
-            h4_high = max(float(r["high"]) for r in h4 if r.get("high") is not None)
-            h4_low = min(float(r["low"]) for r in h4 if r.get("low") is not None)
-            if h4_high and abs(last_close / h4_high - 1) < 0.0035:
-                key_zone = "H4 RANGE HIGH"
-            elif h4_low and abs(last_close / h4_low - 1) < 0.0035:
-                key_zone = "H4 RANGE LOW"
-
-    return down_targets, up_targets, key_zone
+    return down_targets, up_targets, None
 
 
 def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone: Optional[str]) -> Tuple[List[float], List[float], Optional[str]]:
-    """
-    Если пока нет достаточной истории (down/up пустые), подтягиваем последнее сохранённое состояние.
-    """
     st = load_last_state(tf=tf)
     if not st:
         return down, up, key_zone
@@ -201,7 +220,6 @@ def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone:
     if key_zone is None:
         key_zone = st.get("key_zone")
 
-    # нормализуем типы
     def _flt_list(x):
         out = []
         for v in (x or []):
@@ -278,7 +296,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         down_t, up_t, key_zone = _liquidity_targets_btc(conn, tf)
         down_t, up_t, key_zone = _merge_with_persisted(tf, down_t, up_t, key_zone)
 
-        # ---- state core (упрощённый, но уже похожий на старый) ----
         btc_prev_close = float(btc_prev["close"]) if btc_prev and btc_prev.get("close") is not None else None
         btc_close = float(btc["close"]) if btc.get("close") is not None else None
 
@@ -347,7 +364,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 ]
                 invalidation = "—"
 
-        # ETH confirmation
         eth_conf = "нейтрален 🟡"
         if state_icon in ("🟢", "⚠️"):
             if eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
@@ -400,7 +416,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             eth_confirmation=eth_conf,
         )
 
-        # --- persist state (без дублей мы не заморачиваемся: это "память", пусть обновляется часто) ---
         try:
             save_state(
                 tf=tf,
@@ -418,7 +433,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 },
             )
         except Exception:
-            # не ломаем отчёт, если сохранение памяти не удалось
             pass
 
         return view
