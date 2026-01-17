@@ -1,7 +1,12 @@
 import os
 
 # === Телеграм токен ===
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Поддерживаем оба варианта переменных окружения (на разных деплоях называют по-разному)
+TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or ""
+).strip()
 
 # === Настройки вочера ===
 WATCHER_ENABLED = os.getenv("WATCHER_ENABLED", "1").strip() == "1"
@@ -9,10 +14,12 @@ WATCHER_ENABLED = os.getenv("WATCHER_ENABLED", "1").strip() == "1"
 # Период между запусками джобы (в секундах)
 WATCHER_INTERVAL_SEC = int(os.getenv("WATCHER_INTERVAL_SEC", "45").strip() or "45")
 
-# Таймфреймы для планировщика вочера (как и было: список)
+# Таймфреймы для планировщика вочера
+# Поддержка: "1h,4h" и "1h 4h"
+_raw_tfs = os.getenv("WATCHER_TFS", "1h").strip()
 WATCHER_TFS = [
     t.strip()
-    for t in os.getenv("WATCHER_TFS", "1h").split(",")
+    for t in _raw_tfs.replace(",", " ").split()
     if t.strip()
 ]
 
@@ -48,7 +55,7 @@ FUSION_REQUIRE_ANY = int(os.getenv("FUSION_REQUIRE_ANY", "2").strip() or "2")  #
 
 # === Настройки Фибоначчи (статические) ===
 FIBO_ENABLED = True                   # включить модуль
-FIBO_TFS = ["1h", "4h", "1d"]         # ТФ, на которых слать сигналы Фибо
+FIBO_TFS = ["1h", "4h", "1d"]         # ТФ, на которых слать сигнналы Фибо
 FIBO_COOLDOWN_SEC = 1200              # кулдаун по повторным сигналам (сек)
 FIBO_PIVOT_WINDOW = 3                 # свинг-пивот: N баров слева/справа
 FIBO_CONFIRM_PULLBACK_PCT = 0.15      # мин. откат, чтобы импульс считался завершённым (15%)
