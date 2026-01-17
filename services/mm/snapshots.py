@@ -10,7 +10,6 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 
-# ===== Конфигурация (пока жёстко под правило проекта) =====
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
 TFS = ["H1", "H4", "D1", "W1"]
 
@@ -19,7 +18,6 @@ OKX_FUNDING = "https://www.okx.com/api/v5/public/funding-rate"
 OKX_OI = "https://www.okx.com/api/v5/public/open-interest"
 
 
-# ===== Utils =====
 def _db_url() -> str:
     url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
@@ -34,11 +32,12 @@ def _tf_to_okx(tf: str) -> str:
     return m[tf]
 
 
+def _swap_inst_id(spot_symbol: str) -> str:
+    # BTC-USDT -> BTC-USDT-SWAP
+    return f"{spot_symbol}-SWAP"
+
+
 def _floor_ts(tf: str, ts: datetime) -> datetime:
-    """
-    Нормализуем ts к началу свечи выбранного TF (UTC).
-    Это критично для уникальности (symbol, tf, ts).
-    """
     ts = ts.astimezone(timezone.utc).replace(microsecond=0)
 
     if tf == "H1":
@@ -52,7 +51,6 @@ def _floor_ts(tf: str, ts: datetime) -> datetime:
         return ts.replace(hour=0, minute=0, second=0)
 
     if tf == "W1":
-        # ISO week start: Monday 00:00 UTC
         base = ts.replace(hour=0, minute=0, second=0)
         return base - timedelta(days=base.weekday())
 
@@ -60,10 +58,6 @@ def _floor_ts(tf: str, ts: datetime) -> datetime:
 
 
 def _parse_okx_candle(row: List[str]) -> Dict[str, float]:
-    """
-    OKX candle row format:
-    [ts_ms, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-    """
     return {
         "ts_ms": int(row[0]),
         "open": float(row[1]),
@@ -98,21 +92,15 @@ def _safe_int(x) -> Optional[int]:
         return None
 
 
-# ===== OKX fetchers =====
 async def fetch_last_closed_candle(client: httpx.AsyncClient, symbol: str, tf: str) -> Tuple[datetime, Dict]:
-    """
-    Берём 2 свечи и используем предпоследнюю (последняя закрытая).
-    OKX отдаёт новые свечи первыми.
-    """
     params = {"instId": symbol, "bar": _tf_to_okx(tf), "limit": "2"}
     r = await client.get(OKX_CANDLES, params=params)
     r.raise_for_status()
-    js = r.json()
-    data = js.get("data") or []
+    data = (r.json().get("data") or [])
     if len(data) < 2:
         raise RuntimeError(f"Not enough candles for {symbol} {tf}")
 
-    row = data[1]  # предпоследняя = закрытая
+    row = data[1]  # закрытая свеча
     cndl = _parse_okx_candle(row)
 
     ts = datetime.fromtimestamp(cndl["ts_ms"] / 1000, tz=timezone.utc)
@@ -120,21 +108,19 @@ async def fetch_last_closed_candle(client: httpx.AsyncClient, symbol: str, tf: s
     return ts, cndl
 
 
-async def fetch_funding_rate(client: httpx.AsyncClient, symbol: str) -> Dict:
-    """
-    Funding-rate по OKX.
-    Возвращает словарь с полями fundingRate / fundingTime / nextFundingRate / nextFundingTime (если есть).
-    """
-    params = {"instId": symbol}
+async def fetch_funding_rate(client: httpx.AsyncClient, spot_symbol: str) -> Dict:
+    # Funding относится к SWAP
+    inst_id = _swap_inst_id(spot_symbol)
+    params = {"instId": inst_id}
     r = await client.get(OKX_FUNDING, params=params)
     r.raise_for_status()
-    js = r.json()
-    data = (js.get("data") or [])
+    data = (r.json().get("data") or [])
     if not data:
         return {}
 
     d0 = data[0]
     return {
+        "instId": inst_id,
         "funding_rate": _safe_float(d0.get("fundingRate")),
         "funding_time_ms": _safe_int(d0.get("fundingTime")),
         "next_funding_rate": _safe_float(d0.get("nextFundingRate")),
@@ -142,31 +128,25 @@ async def fetch_funding_rate(client: httpx.AsyncClient, symbol: str) -> Dict:
     }
 
 
-async def fetch_open_interest(client: httpx.AsyncClient, symbol: str) -> Dict:
-    """
-    Open Interest по OKX.
-    Для swap рынка обычно нужен instType=SWAP. OKX вернёт массив, берём первую запись.
-    Поля могут отличаться, поэтому храним аккуратно.
-    """
-    params = {"instType": "SWAP", "instId": symbol}
+async def fetch_open_interest(client: httpx.AsyncClient, spot_symbol: str) -> Dict:
+    # OI тоже по SWAP
+    inst_id = _swap_inst_id(spot_symbol)
+    params = {"instType": "SWAP", "instId": inst_id}
     r = await client.get(OKX_OI, params=params)
     r.raise_for_status()
-    js = r.json()
-    data = (js.get("data") or [])
+    data = (r.json().get("data") or [])
     if not data:
-        # иногда instId может не сработать — вернём пусто (не валим снапшот)
         return {}
 
     d0 = data[0]
-    # Обычно: oi / oiCcy / ts
     return {
+        "instId": inst_id,
         "open_interest": _safe_float(d0.get("oi")),
         "open_interest_ccy": _safe_float(d0.get("oiCcy")),
         "oi_ts_ms": _safe_int(d0.get("ts")),
     }
 
 
-# ===== DB =====
 def upsert_snapshot(
     conn: psycopg.Connection,
     *,
@@ -198,20 +178,13 @@ def upsert_snapshot(
     return int(row[0])
 
 
-# ===== Public API =====
 async def run_snapshots_once(
     symbols: List[str] = SYMBOLS,
     tfs: List[str] = TFS,
 ) -> List[str]:
-    """
-    Ручной (one-shot) запуск.
-    Пишет в БД ТОЛЬКО последние закрытые свечи по каждому TF.
-    Funding/OI пишутся в meta_json как дополнительные метрики на момент записи.
-    """
     results: List[str] = []
 
     async with httpx.AsyncClient(timeout=20) as client:
-        # Метрики funding/OI лучше тянуть один раз на символ и использовать для всех TF в этом запуске
         funding_map: Dict[str, Dict] = {}
         oi_map: Dict[str, Dict] = {}
 
@@ -238,7 +211,6 @@ async def run_snapshots_once(
                         "bar": _tf_to_okx(tf),
                         "ts_ms": cndl["ts_ms"],
 
-                        # доп метрики (на момент записи)
                         "funding": funding_map.get(symbol, {}),
                         "open_interest": oi_map.get(symbol, {}),
                         "metrics_fetched_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -256,7 +228,6 @@ async def run_snapshots_once(
                         v=cndl["volume"],
                         meta=meta,
                     )
-
                     results.append(f"{symbol} {tf} {ts.isoformat()} id={snap_id}")
 
             conn.commit()
