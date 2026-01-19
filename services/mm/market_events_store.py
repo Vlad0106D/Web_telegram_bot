@@ -17,6 +17,29 @@ def _db_url() -> str:
     return url
 
 
+def get_last_market_event(
+    *,
+    tf: str,
+    symbol: str = "BTC-USDT",
+) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает последнее рыночное событие по TF.
+    """
+    sql = """
+    SELECT *
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s
+    ORDER BY ts DESC, id DESC
+    LIMIT 1;
+    """
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, tf))
+            row = cur.fetchone()
+    return row
+
+
 def insert_market_event(
     *,
     ts: datetime,
@@ -30,62 +53,58 @@ def insert_market_event(
     payload: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Пишет рыночное событие в mm_market_events.
-    Возвращает True если вставили, False если событие уже было (unique conflict).
+    Пишет рыночное событие в mm_market_events
+    ТОЛЬКО если состояние изменилось.
+
+    Возвращает True если вставили, False если пропустили.
     """
+
+    payload = payload or {}
+
+    # 1️⃣ Проверяем последнее состояние
+    last = get_last_market_event(tf=tf, symbol=symbol)
+    if last:
+        same_state = (
+            last.get("event_type") == event_type
+            and last.get("side") == side
+            and last.get("zone") == zone
+        )
+        if same_state:
+            # состояние не изменилось — НЕ пишем
+            return False
+
+    # 2️⃣ Вставляем новое состояние
     sql = """
-    INSERT INTO mm_market_events (ts, tf, symbol, event_type, side, level, zone, confidence, payload_json)
+    INSERT INTO mm_market_events (
+        ts, tf, symbol,
+        event_type, side, level, zone, confidence,
+        payload_json
+    )
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT (symbol, tf, ts, event_type) DO NOTHING
     RETURNING id;
     """
-    payload = payload or {}
+
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
         with conn.cursor() as cur:
             cur.execute(
                 sql,
-                (ts, tf, symbol, event_type, side, level, zone, confidence, Jsonb(payload)),
+                (
+                    ts,
+                    tf,
+                    symbol,
+                    event_type,
+                    side,
+                    level,
+                    zone,
+                    confidence,
+                    Jsonb(payload),
+                ),
             )
             row = cur.fetchone()
         conn.commit()
+
     return bool(row)
-
-
-def get_last_market_event(
-    *,
-    tf: str,
-    symbol: str = "BTC-USDT",
-    event_type: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает последнее событие по TF (опционально фильтр по event_type).
-    """
-    if event_type:
-        sql = """
-        SELECT *
-        FROM mm_market_events
-        WHERE symbol=%s AND tf=%s AND event_type=%s
-        ORDER BY ts DESC, id DESC
-        LIMIT 1;
-        """
-        params = (symbol, tf, event_type)
-    else:
-        sql = """
-        SELECT *
-        FROM mm_market_events
-        WHERE symbol=%s AND tf=%s
-        ORDER BY ts DESC, id DESC
-        LIMIT 1;
-        """
-        params = (symbol, tf)
-
-    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-        conn.execute("SET TIME ZONE 'UTC';")
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
-    return row
 
 
 def list_market_events(
