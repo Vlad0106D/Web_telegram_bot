@@ -95,25 +95,42 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
         return None
 
 
-def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
+# =============================================================================
+# report_sent — ВАЖНО: в твоей БД уникальность по (event_type, tf)
+# значит report_sent должен быть "последняя запись" на TF => UPSERT
+# =============================================================================
+
+def _load_last_report_sent_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
     sql = """
-    SELECT 1
+    SELECT ts
     FROM mm_events
     WHERE event_type='report_sent'
       AND tf=%s
-      AND ts=%s
     LIMIT 1;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (tf, ts))
+        cur.execute(sql, (tf,))
         row = cur.fetchone()
-    return bool(row)
+    return row["ts"] if row else None
+
+
+def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
+    last_ts = _load_last_report_sent_ts(conn, tf)
+    if last_ts is None:
+        return False
+    return last_ts == ts
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
+    # UPSERT под уникальный индекс ux_mm_events_state (event_type, tf)
     sql = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s);
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (event_type, tf)
+    DO UPDATE SET
+        ts = EXCLUDED.ts,
+        symbol = EXCLUDED.symbol,
+        payload_json = EXCLUDED.payload_json;
     """
     with conn.cursor() as cur:
         cur.execute(sql, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
@@ -184,7 +201,7 @@ def _max_horizon(tf: str) -> int:
         "H1": 6,   # ~6 часов
         "H4": 3,   # ~12 часов
         "D1": 2,   # 2 дня
-        "W1": 1,   # 1 неделя (дальше смысла мало без отдельной логики)
+        "W1": 1,   # 1 неделя
     }.get(tf, 6)
 
 
@@ -221,7 +238,6 @@ def _insert_action_row(
         fields.append("symbol")
         values.append(symbol)
 
-    # любые дополнительные поля — если они есть, кладём самые важные
     if "action" in cols and "action" in payload:
         fields.append("action")
         values.append(payload.get("action"))
@@ -303,9 +319,6 @@ def _update_action_payload(conn: psycopg.Connection, cols: Set[str], row_id: int
 
 
 def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, latest_ts: datetime, latest_close: float) -> None:
-    """
-    На каждой новой закрытой свече подтверждаем старые решения.
-    """
     pending = _fetch_pending_decisions(conn, tf)
     if not pending:
         return
@@ -321,13 +334,11 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
 
         decision_ts = r.get("ts")
         if decision_ts is None:
-            # если в таблице нет ts колонки — fallback из payload
             try:
                 decision_ts = datetime.fromisoformat(payload.get("ts_iso"))
             except Exception:
                 continue
 
-        # не подтверждаем "будущее" относительно latest_ts
         try:
             if decision_ts >= latest_ts:
                 continue
@@ -350,31 +361,21 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
         candles_after = _count_snapshots_after(conn, tf, decision_ts)
         delta = (latest_close / entry_close_f) - 1.0
 
-        # базовое решение направления
         want_up = action == "LONG_ALLOWED"
         want_down = action == "SHORT_ALLOWED"
 
         status = "WAIT"
-        verdict = None  # RIGHT/WRONG
-
         if want_up or want_down:
             if abs(delta) >= thr:
                 if want_up:
-                    verdict = "RIGHT" if delta > 0 else "WRONG"
+                    status = "RIGHT" if delta > 0 else "WRONG"
                 else:
-                    verdict = "RIGHT" if delta < 0 else "WRONG"
-                status = verdict
+                    status = "RIGHT" if delta < 0 else "WRONG"
             else:
-                # не дошли до порога
-                if candles_after >= max_h:
-                    status = "NEED_MORE_TIME"
-                else:
-                    status = "WAIT"
+                status = "NEED_MORE_TIME" if candles_after >= max_h else "WAIT"
         else:
-            # NONE решения не подтверждаем (но можем оставить след)
             status = "WAIT"
 
-        # апдейт decision payload
         patch = {
             "status": status,
             "last_checked_ts": latest_ts.isoformat(),
@@ -387,7 +388,6 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
             patch["resolved_ts"] = latest_ts.isoformat()
             patch["resolved_close"] = latest_close
 
-        # пишем патч в decision
         row_id = None
         if "id" in cols:
             try:
@@ -398,7 +398,6 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
         if row_id is not None:
             _update_action_payload(conn, cols, row_id, patch)
 
-        # дополнительно — отдельная запись result (история), чтобы потом строить статистику проще
         result_payload = {
             "kind": "result",
             "tf": tf,
@@ -411,26 +410,14 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
             "candles_after": patch["candles_after"],
             "checked_ts": latest_ts.isoformat(),
         }
-        _insert_action_row(
-            conn,
-            cols,
-            ts=latest_ts,
-            tf=tf,
-            symbol="BTC-USDT",
-            payload=result_payload,
-        )
+        _insert_action_row(conn, cols, ts=latest_ts, tf=tf, symbol="BTC-USDT", payload=result_payload)
 
 
 def _record_action_for_candle(conn: psycopg.Connection, cols: Set[str], tf: str, ts: datetime, close: float) -> None:
-    """
-    Пишем decision на конкретную закрытую свечу (tf+ts).
-    """
-    # дубль-guard
     try:
         if _decision_exists(conn, tf, ts):
             return
     except Exception:
-        # если таблица ещё пустая/нет колонки — просто продолжаем
         pass
 
     dec = compute_action(tf)
@@ -458,7 +445,7 @@ async def _mm_auto_tick(app: Application) -> None:
         log.warning("MM auto enabled but ALERT_CHAT_ID is not set — skipping")
         return
 
-    # 1) SNAPSHOTS (upsert; можно дергать часто, но downstream делаем только на новый ts)
+    # 1) SNAPSHOTS
     try:
         await run_snapshots_once()
     except Exception:
@@ -467,11 +454,10 @@ async def _mm_auto_tick(app: Application) -> None:
 
     seen = _get_seen_map(app)
 
-    # 2-5) Downstream (liquidity / market_events / action / reports) — ТОЛЬКО при новом закрытии свечи по TF
+    # 2-5) Downstream
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
-        # определим, на каких TF реально появился новый закрытый бар
         tfs_to_process: List[Tuple[str, datetime]] = []
         for tf in MM_TFS:
             latest_ts = _get_latest_snapshot_ts(conn, tf)
@@ -480,7 +466,6 @@ async def _mm_auto_tick(app: Application) -> None:
 
             latest_iso = _iso(latest_ts)
             last_seen_iso = seen.get(tf)
-
             if last_seen_iso == latest_iso:
                 continue
 
@@ -489,17 +474,16 @@ async def _mm_auto_tick(app: Application) -> None:
         if not tfs_to_process:
             return
 
-        # обновим seen сразу, чтобы даже при падении ниже не было повторов спама на следующий тик
         for tf, ts in tfs_to_process:
             seen[tf] = _iso(ts)
 
-        # 2) LIQUIDITY MEMORY — можно дергать пачкой по тем TF, где новая свеча
+        # 2) LIQUIDITY MEMORY
         try:
             await update_liquidity_memory([tf for tf, _ in tfs_to_process])
         except Exception:
             log.exception("MM auto: liquidity memory failed")
 
-        # 3) MARKET EVENTS — только на новых свечах
+        # 3) MARKET EVENTS
         for tf, _ in tfs_to_process:
             try:
                 events = detect_and_store_market_events(tf)
@@ -508,7 +492,7 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("MM auto: market events failed for tf=%s", tf)
 
-        # 4) ACTION ENGINE — decision + confirm (только на новых свечах)
+        # 4) ACTION ENGINE — decision + confirm
         try:
             cols = _table_columns(conn, "mm_action_engine")
         except Exception:
@@ -521,10 +505,7 @@ async def _mm_auto_tick(app: Application) -> None:
                     if latest_close is None:
                         continue
 
-                    # decision на этой свече
                     _record_action_for_candle(conn, cols, tf, ts, latest_close)
-
-                    # confirm всех pending по этому TF на этой же новой свече
                     _confirm_pending_actions(conn, cols, tf, ts, latest_close)
 
                     conn.commit()
@@ -532,10 +513,9 @@ async def _mm_auto_tick(app: Application) -> None:
                     conn.rollback()
                     log.exception("MM auto: action engine persistence failed tf=%s", tf)
         else:
-            # не падаем — просто логируем
             log.info("mm_action_engine table not ready (need payload_json), skipping action persistence")
 
-        # 5) REPORTS — только на новых свечах, плюс защита report_sent
+        # 5) REPORTS — только на новых свечах, плюс защита report_sent (single row per TF)
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
@@ -573,11 +553,9 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("MM_AUTO_ENABLED=0 — mm auto disabled")
         return created
 
-    # default runtime enabled
     if "mm_enabled" not in app.bot_data:
         app.bot_data["mm_enabled"] = True
 
-    # init map
     if "mm_last_seen_snapshot_ts" not in app.bot_data:
         app.bot_data["mm_last_seen_snapshot_ts"] = {}
 
