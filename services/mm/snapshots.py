@@ -109,7 +109,6 @@ async def fetch_last_closed_candle(client: httpx.AsyncClient, symbol: str, tf: s
 
 
 async def fetch_funding_rate(client: httpx.AsyncClient, spot_symbol: str) -> Dict:
-    # Funding относится к SWAP
     inst_id = _swap_inst_id(spot_symbol)
     params = {"instId": inst_id}
     r = await client.get(OKX_FUNDING, params=params)
@@ -129,7 +128,6 @@ async def fetch_funding_rate(client: httpx.AsyncClient, spot_symbol: str) -> Dic
 
 
 async def fetch_open_interest(client: httpx.AsyncClient, spot_symbol: str) -> Dict:
-    # OI тоже по SWAP
     inst_id = _swap_inst_id(spot_symbol)
     params = {"instType": "SWAP", "instId": inst_id}
     r = await client.get(OKX_OI, params=params)
@@ -145,6 +143,31 @@ async def fetch_open_interest(client: httpx.AsyncClient, spot_symbol: str) -> Di
         "open_interest_ccy": _safe_float(d0.get("oiCcy")),
         "oi_ts_ms": _safe_int(d0.get("ts")),
     }
+
+
+def _load_last_snapshot_ts(
+    conn: psycopg.Connection,
+    *,
+    symbols: List[str],
+    tfs: List[str],
+) -> Dict[Tuple[str, str], Optional[datetime]]:
+    """
+    Возвращает map[(symbol, tf)] = max(ts) из mm_snapshots.
+    Нужно, чтобы НЕ дергать цепочку дальше, если новая закрытая свеча еще не появилась.
+    """
+    out: Dict[Tuple[str, str], Optional[datetime]] = {(s, tf): None for s in symbols for tf in tfs}
+
+    sql = """
+    SELECT symbol, tf, MAX(ts) AS last_ts
+    FROM mm_snapshots
+    WHERE symbol = ANY(%s) AND tf = ANY(%s)
+    GROUP BY symbol, tf;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (symbols, tfs))
+        for symbol, tf, last_ts in cur.fetchall():
+            out[(symbol, tf)] = last_ts
+    return out
 
 
 def upsert_snapshot(
@@ -202,15 +225,22 @@ async def run_snapshots_once(
         with psycopg.connect(_db_url()) as conn:
             conn.execute("SET TIME ZONE 'UTC';")
 
+            # 1) Смотрим, что уже записано (чтобы НЕ писать каждый тик)
+            last_ts_map = _load_last_snapshot_ts(conn, symbols=symbols, tfs=tfs)
+
             for symbol in symbols:
                 for tf in tfs:
                     ts, cndl = await fetch_last_closed_candle(client, symbol, tf)
+
+                    last_ts = last_ts_map.get((symbol, tf))
+                    # Если закрытая свеча уже есть в БД — ничего не делаем (и не триггерим downstream)
+                    if last_ts is not None and last_ts >= ts:
+                        continue
 
                     meta = {
                         "src": "okx",
                         "bar": _tf_to_okx(tf),
                         "ts_ms": cndl["ts_ms"],
-
                         "funding": funding_map.get(symbol, {}),
                         "open_interest": oi_map.get(symbol, {}),
                         "metrics_fetched_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
