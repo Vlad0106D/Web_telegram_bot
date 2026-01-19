@@ -232,9 +232,16 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    sql = """
+    # ВАЖНО: в твоей БД уникальность по (event_type, tf).
+    # Значит liq_levels должен быть "single latest row" => UPSERT.
+    sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s);
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (event_type, tf)
+    DO UPDATE SET
+        ts = EXCLUDED.ts,
+        symbol = EXCLUDED.symbol,
+        payload_json = EXCLUDED.payload_json;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
@@ -248,7 +255,7 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
                 return False
 
         with conn.cursor() as cur:
-            cur.execute(sql, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
+            cur.execute(sql_upsert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
         conn.commit()
 
     return True
