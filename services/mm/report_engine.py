@@ -175,10 +175,6 @@ def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone:
 
 
 def _event_driven_state(tf: str) -> Dict[str, Any]:
-    """
-    Читает последнее рыночное событие и мапит его в:
-      state_title/icon, phase, execution, whats_next, invalidation, key_zone, probs baseline
-    """
     ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
     if not ev:
         return {
@@ -199,7 +195,6 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
     zone = ev.get("zone")
     key_zone = None
 
-    # decision zone
     if et == "decision_zone":
         key_zone = zone or ("H4 RANGE HIGH" if side == "up" else "H4 RANGE LOW")
         return {
@@ -215,7 +210,6 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
             "event_type": et,
         }
 
-    # sweep / reclaim
     if et == "sweep_high":
         return {
             "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
@@ -272,7 +266,6 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
             "event_type": et,
         }
 
-    # wait fallback
     return {
         "state_title": "ОЖИДАНИЕ",
         "state_icon": "🟡",
@@ -330,6 +323,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             raise RuntimeError(f"Not enough snapshots for tf={tf}. Run /mm_snapshots a few times.")
 
         ts = btc["ts"]
+        btc_close = float(btc["close"])
 
         btc_prev = _fetch_prev_snapshot(conn, "BTC-USDT", tf, ts)
         eth_prev = _fetch_prev_snapshot(conn, "ETH-USDT", tf, ts)
@@ -351,6 +345,13 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         # targets from liquidity memory first
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
+
+        # ✅ Фильтрация целей относительно текущей цены (чтобы "Вниз" не показывался выше цены)
+        down_filtered = [x for x in down_t if x < btc_close]
+        up_filtered = [x for x in up_t if x > btc_close]
+        # если после фильтрации всё пусто — оставляем как было (лучше показать хоть что-то, чем "—")
+        down_t = down_filtered or down_t
+        up_t = up_filtered or up_t
 
         # event-driven state
         st = _event_driven_state(tf)
