@@ -217,8 +217,12 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     """
     Сохраняет liq_levels в mm_events.
+
     ✅ True  — записали (изменился ts или уровни)
     ❌ False — пропустили (тот же ts и те же уровни)
+
+    Важно: в твоей БД есть уникальность (ux_mm_events_state), и судя по логам она
+    не подходит под ON CONFLICT (поэтому делаем ручной insert->update).
     """
     payload = {
         "tf": levels.tf,
@@ -232,16 +236,18 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ВАЖНО: в твоей БД уникальность по (event_type, tf).
-    # Значит liq_levels должен быть "single latest row" => UPSERT.
-    sql_upsert = """
+    sql_insert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (event_type, tf)
-    DO UPDATE SET
-        ts = EXCLUDED.ts,
-        symbol = EXCLUDED.symbol,
-        payload_json = EXCLUDED.payload_json;
+    VALUES (%s, %s, %s, %s, %s);
+    """
+
+    # обновляем "последнюю запись" по tf (уникальность у тебя завязана на event_type/tf)
+    sql_update = """
+    UPDATE mm_events
+    SET ts=%s,
+        symbol=%s,
+        payload_json=%s
+    WHERE event_type='liq_levels' AND tf=%s;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
@@ -254,8 +260,15 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
             if prev_ts == levels.ts and _same_liq(prev_payload, levels):
                 return False
 
-        with conn.cursor() as cur:
-            cur.execute(sql_upsert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql_insert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
+        except psycopg.errors.UniqueViolation:
+            # если запись уже существует (из-за ux_mm_events_state) — делаем update
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(sql_update, (levels.ts, "BTC-USDT", Jsonb(payload), levels.tf))
+
         conn.commit()
 
     return True
