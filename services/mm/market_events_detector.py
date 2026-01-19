@@ -89,8 +89,6 @@ def detect_and_store_market_events(tf: str) -> List[str]:
     eqh = _as_float(levels.get("eqh"))
     eql = _as_float(levels.get("eql"))
 
-    # если уровней ещё нет — смысла детектить sweep/reclaim мало
-    # но wait/decision_zone всё равно можем писать позже, когда появятся
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
         pair = _fetch_last_two(conn, "BTC-USDT", tf)
@@ -102,17 +100,8 @@ def detect_and_store_market_events(tf: str) -> List[str]:
     px = last.close
 
     # Пороги "близости"
-    # decision zone: 0.35% к границе
     dz_tol = 0.0035 if tf in ("H1", "H4") else (0.005 if tf == "D1" else 0.007)
-
-    # sweep: прокол уровня минимум на 0.05% (чтобы не ловить шум)
     sweep_tol = 0.0005 if tf in ("H1", "H4") else 0.001
-
-    # reclaim: закрытие обратно "внутрь" уровня (после sweep)
-    # мы проверяем структуру last candle vs prev candle относительно границы
-    # для sweep_high: prev.close <= rh AND last.high > rh*(1+sweep_tol)
-    # reclaim_down: после sweep_high, last.close < rh
-    # аналогично по low
 
     wrote_any = False
 
@@ -213,8 +202,9 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                 out.append(f"{tf} reclaim_up {'+1' if ok2 else 'skip'}")
                 wrote_any = wrote_any or ok2
 
-    # --- wait (если ничего не произошло) ---
-    if not out:
+    # --- wait (если не было НОВЫХ записей состояния на этой свече) ---
+    # Важно: out может быть не пустым из-за "skip", поэтому ориентируемся на wrote_any.
+    if not wrote_any:
         ok = insert_market_event(
             ts=last.ts,
             tf=tf,
