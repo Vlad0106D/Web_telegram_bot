@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -150,9 +150,9 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     )
 
 
-def _load_last_liq_payload(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
+def _load_last_liq_row(conn: psycopg.Connection, tf: str) -> Optional[Tuple[datetime, Dict[str, Any]]]:
     sql = """
-    SELECT payload_json
+    SELECT ts, payload_json
     FROM mm_events
     WHERE event_type='liq_levels' AND symbol='BTC-USDT' AND tf=%s
     ORDER BY ts DESC, id DESC
@@ -161,37 +161,64 @@ def _load_last_liq_payload(conn: psycopg.Connection, tf: str) -> Optional[Dict[s
     with conn.cursor() as cur:
         cur.execute(sql, (tf,))
         row = cur.fetchone()
-    return (row.get("payload_json") if row else None) or None
+    if not row:
+        return None
+    payload = row.get("payload_json") or {}
+    return row.get("ts"), payload
 
 
-def _same_liq(prev: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bool:
-    if not prev:
+def _nfloat(x: Any, ndigits: int = 8) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+        return round(v, ndigits)
+    except Exception:
+        return None
+
+
+def _nlist(xs: Any, ndigits: int = 8) -> List[float]:
+    out: List[float] = []
+    for v in (xs or []):
+        nv = _nfloat(v, ndigits=ndigits)
+        if nv is not None:
+            out.append(nv)
+    return out
+
+
+def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bool:
+    if not prev_payload:
         return False
 
-    def norm_targets(x) -> List[float]:
-        xs = x or []
-        try:
-            return [float(v) for v in xs]
-        except Exception:
-            return []
+    prev_range_high = _nfloat(prev_payload.get("range_high"))
+    prev_range_low = _nfloat(prev_payload.get("range_low"))
+    prev_eqh = _nfloat(prev_payload.get("eqh"))
+    prev_eql = _nfloat(prev_payload.get("eql"))
+    prev_up = _nlist(prev_payload.get("up_targets"))
+    prev_dn = _nlist(prev_payload.get("dn_targets"))
+
+    lv_range_high = _nfloat(lv.range_high)
+    lv_range_low = _nfloat(lv.range_low)
+    lv_eqh = _nfloat(lv.eqh)
+    lv_eql = _nfloat(lv.eql)
+    lv_up = _nlist(lv.up_targets)
+    lv_dn = _nlist(lv.dn_targets)
 
     return (
-        float(prev.get("range_high")) if prev.get("range_high") is not None else None
-    ) == lv.range_high and (
-        float(prev.get("range_low")) if prev.get("range_low") is not None else None
-    ) == lv.range_low and (
-        float(prev.get("eqh")) if prev.get("eqh") is not None else None
-    ) == lv.eqh and (
-        float(prev.get("eql")) if prev.get("eql") is not None else None
-    ) == lv.eql and norm_targets(prev.get("up_targets")) == [float(x) for x in (lv.up_targets or [])] and norm_targets(
-        prev.get("dn_targets")
-    ) == [float(x) for x in (lv.dn_targets or [])]
+        prev_range_high == lv_range_high
+        and prev_range_low == lv_range_low
+        and prev_eqh == lv_eqh
+        and prev_eql == lv_eql
+        and prev_up == lv_up
+        and prev_dn == lv_dn
+    )
 
 
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     """
     Сохраняет liq_levels в mm_events.
-    Возвращает True если записали, False если пропустили (без изменений).
+    ✅ True  — записали (изменился ts или уровни)
+    ❌ False — пропустили (тот же ts и те же уровни)
     """
     payload = {
         "tf": levels.tf,
@@ -213,9 +240,12 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
-        prev = _load_last_liq_payload(conn, levels.tf)
-        if _same_liq(prev, levels):
-            return False
+        prev = _load_last_liq_row(conn, levels.tf)
+        if prev:
+            prev_ts, prev_payload = prev
+            # ✅ пропускаем только если И ts тот же, И уровни те же
+            if prev_ts == levels.ts and _same_liq(prev_payload, levels):
+                return False
 
         with conn.cursor() as cur:
             cur.execute(sql, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
@@ -272,8 +302,8 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
 
         wrote = save_liquidity_levels(lv)
         if wrote:
-            out.append(f"{tf}: up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+            out.append(f"{tf}: wrote(ts_or_change) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
         else:
-            out.append(f"{tf}: skip(no_change) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+            out.append(f"{tf}: skip(no_change_same_ts) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
 
     return out
