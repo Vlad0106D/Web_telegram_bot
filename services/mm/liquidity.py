@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -150,7 +150,49 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     )
 
 
-def save_liquidity_levels(levels: LiquidityLevels) -> None:
+def _load_last_liq_payload(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
+    sql = """
+    SELECT payload_json
+    FROM mm_events
+    WHERE event_type='liq_levels' AND symbol='BTC-USDT' AND tf=%s
+    ORDER BY ts DESC, id DESC
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (tf,))
+        row = cur.fetchone()
+    return (row.get("payload_json") if row else None) or None
+
+
+def _same_liq(prev: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bool:
+    if not prev:
+        return False
+
+    def norm_targets(x) -> List[float]:
+        xs = x or []
+        try:
+            return [float(v) for v in xs]
+        except Exception:
+            return []
+
+    return (
+        float(prev.get("range_high")) if prev.get("range_high") is not None else None
+    ) == lv.range_high and (
+        float(prev.get("range_low")) if prev.get("range_low") is not None else None
+    ) == lv.range_low and (
+        float(prev.get("eqh")) if prev.get("eqh") is not None else None
+    ) == lv.eqh and (
+        float(prev.get("eql")) if prev.get("eql") is not None else None
+    ) == lv.eql and norm_targets(prev.get("up_targets")) == [float(x) for x in (lv.up_targets or [])] and norm_targets(
+        prev.get("dn_targets")
+    ) == [float(x) for x in (lv.dn_targets or [])]
+
+
+def save_liquidity_levels(levels: LiquidityLevels) -> bool:
+    """
+    Сохраняет liq_levels в mm_events.
+    Возвращает True если записали, False если пропустили (без изменений).
+    """
     payload = {
         "tf": levels.tf,
         "range_high": levels.range_high,
@@ -167,11 +209,19 @@ def save_liquidity_levels(levels: LiquidityLevels) -> None:
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
     VALUES (%s, %s, %s, %s, %s);
     """
+
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
+
+        prev = _load_last_liq_payload(conn, levels.tf)
+        if _same_liq(prev, levels):
+            return False
+
         with conn.cursor() as cur:
             cur.execute(sql, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
         conn.commit()
+
+    return True
 
 
 def load_last_liquidity_levels(tf: str) -> Optional[Dict[str, Any]]:
@@ -220,7 +270,10 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
                 out.append(f"{tf}: skip(empty) keep_prev up={prev.get('up_targets')} dn={prev.get('dn_targets')}")
                 continue
 
-        save_liquidity_levels(lv)
-        out.append(f"{tf}: up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+        wrote = save_liquidity_levels(lv)
+        if wrote:
+            out.append(f"{tf}: up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+        else:
+            out.append(f"{tf}: skip(no_change) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
 
     return out
