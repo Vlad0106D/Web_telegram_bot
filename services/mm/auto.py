@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -18,7 +18,6 @@ from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
 
 log = logging.getLogger(__name__)
-
 
 MM_AUTO_ENABLED_ENV = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
 MM_AUTO_CHECK_SEC = int(os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60")
@@ -98,6 +97,28 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
         cur.execute(sql, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
 
 
+def _get_seen_map(app: Application) -> Dict[str, str]:
+    """
+    Храним последний обработанный snapshot_ts по TF, чтобы downstream логика
+    (events/liquidity/report) выполнялась только один раз на закрытую свечу.
+    """
+    m = app.bot_data.get("mm_last_seen_snapshot_ts")
+    if not isinstance(m, dict):
+        m = {}
+        app.bot_data["mm_last_seen_snapshot_ts"] = m
+    # гарантируем строковый формат значений
+    out: Dict[str, str] = {}
+    for k, v in m.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    app.bot_data["mm_last_seen_snapshot_ts"] = out
+    return out
+
+
+def _iso(ts: datetime) -> str:
+    return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 async def _mm_auto_tick(app: Application) -> None:
     if not _mm_is_enabled(app):
         return
@@ -106,33 +127,60 @@ async def _mm_auto_tick(app: Application) -> None:
         log.warning("MM auto enabled but ALERT_CHAT_ID is not set — skipping")
         return
 
-    # 1) SNAPSHOTS
+    # 1) SNAPSHOTS (upsert; можно дергать часто, но downstream делаем только на новый ts)
     try:
         await run_snapshots_once()
     except Exception:
         log.exception("MM auto: snapshots failed")
         return
 
-    # 2) LIQUIDITY MEMORY
-    try:
-        await update_liquidity_memory(MM_TFS)
-    except Exception:
-        log.exception("MM auto: liquidity memory failed")
+    seen = _get_seen_map(app)
 
-    # 3) MARKET EVENTS
-    for tf in MM_TFS:
-        try:
-            events = detect_and_store_market_events(tf)
-            if events:
-                log.info("MM market events %s: %s", tf, "; ".join(events))
-        except Exception:
-            log.exception("MM auto: market events failed for tf=%s", tf)
-
-    # 4) REPORTS
+    # 2-4) Downstream (liquidity / market_events / reports) — ТОЛЬКО при новом закрытии свечи по TF
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
+        # определим, на каких TF реально появился новый закрытый бар
+        tfs_to_process: List[Tuple[str, datetime]] = []
         for tf in MM_TFS:
+            latest_ts = _get_latest_snapshot_ts(conn, tf)
+            if latest_ts is None:
+                continue
+
+            latest_iso = _iso(latest_ts)
+            last_seen_iso = seen.get(tf)
+
+            if last_seen_iso == latest_iso:
+                # эта свеча уже обработана
+                continue
+
+            # новая закрытая свеча (или первый запуск после деплоя)
+            tfs_to_process.append((tf, latest_ts))
+
+        if not tfs_to_process:
+            return
+
+        # обновим seen сразу, чтобы даже при падении ниже не было повторов спама на следующий тик
+        for tf, ts in tfs_to_process:
+            seen[tf] = _iso(ts)
+
+        # 2) LIQUIDITY MEMORY — можно дергать пачкой по тем TF, где новая свеча
+        try:
+            await update_liquidity_memory([tf for tf, _ in tfs_to_process])
+        except Exception:
+            log.exception("MM auto: liquidity memory failed")
+
+        # 3) MARKET EVENTS — только на новых свечах
+        for tf, _ in tfs_to_process:
+            try:
+                events = detect_and_store_market_events(tf)
+                if events:
+                    log.info("MM market events %s: %s", tf, "; ".join(events))
+            except Exception:
+                log.exception("MM auto: market events failed for tf=%s", tf)
+
+        # 4) REPORTS — тоже только на новых свечах, плюс защита report_sent
+        for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
                 if latest_ts is None:
@@ -172,6 +220,10 @@ def schedule_mm_auto(app: Application) -> List[str]:
     # default runtime enabled
     if "mm_enabled" not in app.bot_data:
         app.bot_data["mm_enabled"] = True
+
+    # init map
+    if "mm_last_seen_snapshot_ts" not in app.bot_data:
+        app.bot_data["mm_last_seen_snapshot_ts"] = {}
 
     jq = app.job_queue
     if jq is None:
