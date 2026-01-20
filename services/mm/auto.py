@@ -96,12 +96,11 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
 
 
 # =============================================================================
-# report_sent — у тебя уникальность (event_type, tf), поэтому храним одну "последнюю" строку на TF
+# report_sent — ВАЖНО: в твоей БД уникальность по (event_type, tf)
+# значит report_sent должен быть "последняя запись" на TF => UPSERT
 # =============================================================================
 
 def _load_last_report_sent_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
-    # В твоей БД тут фактически одна строка на tf (из-за unique),
-    # поэтому достаточно LIMIT 1.
     sql = """
     SELECT ts
     FROM mm_events
@@ -123,29 +122,18 @@ def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> boo
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
-    """
-    Ручной upsert:
-    - пробуем INSERT
-    - если UniqueViolation (ux_mm_events_state) -> UPDATE по (event_type='report_sent', tf)
-    """
-    sql_insert = """
+    # UPSERT под уникальный индекс ux_mm_events_state (event_type, tf)
+    sql = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s);
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (event_type, tf)
+    DO UPDATE SET
+        ts = EXCLUDED.ts,
+        symbol = EXCLUDED.symbol,
+        payload_json = EXCLUDED.payload_json;
     """
-    sql_update = """
-    UPDATE mm_events
-    SET ts=%s,
-        symbol=%s,
-        payload_json=%s
-    WHERE event_type='report_sent' AND tf=%s;
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql_insert, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
-    except psycopg.errors.UniqueViolation:
-        conn.rollback()
-        with conn.cursor() as cur:
-            cur.execute(sql_update, (ts, "BTC-USDT", Jsonb(payload), tf))
+    with conn.cursor() as cur:
+        cur.execute(sql, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
 
 
 def _get_seen_map(app: Application) -> Dict[str, str]:
@@ -263,10 +251,11 @@ def _insert_action_row(
     fields.append("payload_json")
     values.append(Jsonb(payload))
 
+    returning = "id" if "id" in cols else "payload_json"
     sql = f"""
     INSERT INTO mm_action_engine ({", ".join(fields)})
     VALUES ({", ".join(["%s"] * len(fields))})
-    RETURNING {"id" if "id" in cols else "payload_json"};
+    RETURNING {returning};
     """
     with conn.cursor() as cur:
         cur.execute(sql, values)
@@ -280,36 +269,68 @@ def _insert_action_row(
     return None
 
 
-def _decision_exists(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
+def _decision_exists(conn: psycopg.Connection, cols: Set[str], tf: str, ts: datetime) -> bool:
     """
     Защита от дублей: decision на один tf+ts должен быть один.
-    Делаем через payload_json.kind = 'decision'
+    Адаптируемся к схеме:
+    - если есть tf/ts колонки -> фильтруем по ним
+    - если нет -> фильтруем по payload_json
     """
+    ts_iso = ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+    if "tf" in cols and "ts" in cols:
+        sql = """
+        SELECT 1
+        FROM mm_action_engine
+        WHERE tf=%s
+          AND ts=%s
+          AND (payload_json->>'kind') = 'decision'
+        LIMIT 1;
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (tf, ts))
+            return bool(cur.fetchone())
+
+    # fallback: только по payload_json
     sql = """
     SELECT 1
     FROM mm_action_engine
-    WHERE tf=%s
-      AND ts=%s
-      AND (payload_json->>'kind') = 'decision'
+    WHERE (payload_json->>'kind') = 'decision'
+      AND (payload_json->>'tf') = %s
+      AND (payload_json->>'ts_iso') = %s
     LIMIT 1;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (tf, ts))
+        cur.execute(sql, (tf, ts_iso))
         return bool(cur.fetchone())
 
 
-def _fetch_pending_decisions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
+def _fetch_pending_decisions(conn: psycopg.Connection, cols: Set[str], tf: str) -> List[Dict[str, Any]]:
     """
-    Берём decisions с status PENDING/WAIT/NEED_MORE_TIME (по payload_json),
-    которые старее текущей свечи (подтверждаем на новой).
+    Берём decisions с status PENDING/WAIT/NEED_MORE_TIME (по payload_json).
+    Адаптируемся к схеме по наличию tf колонки.
     """
+    if "tf" in cols:
+        sql = """
+        SELECT *
+        FROM mm_action_engine
+        WHERE tf=%s
+          AND (payload_json->>'kind') = 'decision'
+          AND (payload_json->>'status') IN ('PENDING','WAIT','NEED_MORE_TIME')
+        ORDER BY ts ASC;
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (tf,))
+            return cur.fetchall() or []
+
+    # fallback: tf внутри payload_json
     sql = """
     SELECT *
     FROM mm_action_engine
-    WHERE tf=%s
-      AND (payload_json->>'kind') = 'decision'
+    WHERE (payload_json->>'kind') = 'decision'
+      AND (payload_json->>'tf') = %s
       AND (payload_json->>'status') IN ('PENDING','WAIT','NEED_MORE_TIME')
-    ORDER BY ts ASC;
+    ORDER BY (payload_json->>'ts_iso') ASC;
     """
     with conn.cursor() as cur:
         cur.execute(sql, (tf,))
@@ -317,9 +338,7 @@ def _fetch_pending_decisions(conn: psycopg.Connection, tf: str) -> List[Dict[str
 
 
 def _update_action_payload(conn: psycopg.Connection, cols: Set[str], row_id: int, patch: Dict[str, Any]) -> None:
-    if "id" not in cols:
-        return
-    if "payload_json" not in cols:
+    if "id" not in cols or "payload_json" not in cols:
         return
     sql = """
     UPDATE mm_action_engine
@@ -331,7 +350,7 @@ def _update_action_payload(conn: psycopg.Connection, cols: Set[str], row_id: int
 
 
 def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, latest_ts: datetime, latest_close: float) -> None:
-    pending = _fetch_pending_decisions(conn, tf)
+    pending = _fetch_pending_decisions(conn, cols, tf)
     if not pending:
         return
 
@@ -339,18 +358,16 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
     max_h = _max_horizon(tf)
 
     for r in pending:
-        try:
-            payload = r.get("payload_json") or {}
-        except Exception:
-            payload = {}
+        payload = (r.get("payload_json") or {}) if isinstance(r, dict) else {}
 
-        decision_ts = r.get("ts")
+        decision_ts = r.get("ts") if isinstance(r, dict) else None
         if decision_ts is None:
             try:
                 decision_ts = datetime.fromisoformat(payload.get("ts_iso"))
             except Exception:
                 continue
 
+        # не подтверждаем "будущее" относительно latest_ts
         try:
             if decision_ts >= latest_ts:
                 continue
@@ -385,8 +402,6 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
                     status = "RIGHT" if delta < 0 else "WRONG"
             else:
                 status = "NEED_MORE_TIME" if candles_after >= max_h else "WAIT"
-        else:
-            status = "WAIT"
 
         patch = {
             "status": status,
@@ -401,7 +416,7 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
             patch["resolved_close"] = latest_close
 
         row_id = None
-        if "id" in cols:
+        if "id" in cols and isinstance(r, dict):
             try:
                 row_id = int(r.get("id"))
             except Exception:
@@ -410,6 +425,7 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
         if row_id is not None:
             _update_action_payload(conn, cols, row_id, patch)
 
+        # отдельная история result (удобно для статистики)
         result_payload = {
             "kind": "result",
             "tf": tf,
@@ -426,18 +442,16 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
 
 
 def _record_action_for_candle(conn: psycopg.Connection, cols: Set[str], tf: str, ts: datetime, close: float) -> None:
-    try:
-        if _decision_exists(conn, tf, ts):
-            return
-    except Exception:
-        pass
+    # дубль-guard (без “отравления” транзакции)
+    if _decision_exists(conn, cols, tf, ts):
+        return
 
     dec = compute_action(tf)
     payload = {
         "kind": "decision",
         "tf": tf,
         "symbol": "BTC-USDT",
-        "ts_iso": ts.isoformat(),
+        "ts_iso": ts.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
         "entry_close": float(close),
         "action": dec.action,
         "confidence": int(dec.confidence),
@@ -517,17 +531,17 @@ async def _mm_auto_tick(app: Application) -> None:
                     if latest_close is None:
                         continue
 
-                    _record_action_for_candle(conn, cols, tf, ts, latest_close)
-                    _confirm_pending_actions(conn, cols, tf, ts, latest_close)
+                    # ✅ savepoint: ошибки не “отравляют” соединение
+                    with conn.transaction():
+                        _record_action_for_candle(conn, cols, tf, ts, latest_close)
+                        _confirm_pending_actions(conn, cols, tf, ts, latest_close)
 
-                    conn.commit()
                 except Exception:
-                    conn.rollback()
                     log.exception("MM auto: action engine persistence failed tf=%s", tf)
         else:
             log.info("mm_action_engine table not ready (need payload_json), skipping action persistence")
 
-        # 5) REPORTS — только на новых свечах + single-row report_sent per TF
+        # 5) REPORTS — только на новых свечах, плюс защита report_sent (single row per TF)
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
