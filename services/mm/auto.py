@@ -52,7 +52,6 @@ def _db_url() -> str:
 
 
 def _mm_is_enabled(app: Application) -> bool:
-    # env = “глобальный рубильник”, runtime = /mm_on/off
     if not MM_AUTO_ENABLED_ENV:
         return False
     v = app.bot_data.get("mm_enabled")
@@ -96,51 +95,33 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
 
 
 # =============================================================================
-# report_sent — ВАЖНО: в твоей БД уникальность по (event_type, tf)
-# значит report_sent должен быть "последняя запись" на TF => UPSERT
+# report_sent (без ON CONFLICT — работаем в любой схеме)
 # =============================================================================
 
-def _load_last_report_sent_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
+def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
     sql = """
-    SELECT ts
+    SELECT 1
     FROM mm_events
     WHERE event_type='report_sent'
       AND tf=%s
+      AND ts=%s
     LIMIT 1;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (tf,))
-        row = cur.fetchone()
-    return row["ts"] if row else None
-
-
-def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
-    last_ts = _load_last_report_sent_ts(conn, tf)
-    if last_ts is None:
-        return False
-    return last_ts == ts
+        cur.execute(sql, (tf, ts))
+        return bool(cur.fetchone())
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
-    # UPSERT под уникальный индекс ux_mm_events_state (event_type, tf)
     sql = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (event_type, tf)
-    DO UPDATE SET
-        ts = EXCLUDED.ts,
-        symbol = EXCLUDED.symbol,
-        payload_json = EXCLUDED.payload_json;
+    VALUES (%s, %s, %s, %s, %s);
     """
     with conn.cursor() as cur:
         cur.execute(sql, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
 
 
 def _get_seen_map(app: Application) -> Dict[str, str]:
-    """
-    Храним последний обработанный snapshot_ts по TF, чтобы downstream логика
-    (events/liquidity/report/action_confirm) выполнялась только один раз на закрытую свечу.
-    """
     m = app.bot_data.get("mm_last_seen_snapshot_ts")
     if not isinstance(m, dict):
         m = {}
@@ -158,7 +139,7 @@ def _iso(ts: datetime) -> str:
 
 
 # =============================================================================
-# ACTION ENGINE persistence + confirmation
+# ACTION ENGINE persistence + confirmation (под твою таблицу mm_action_engine)
 # =============================================================================
 
 def _table_columns(conn: psycopg.Connection, table: str) -> Set[str]:
@@ -186,7 +167,6 @@ def _count_snapshots_after(conn: psycopg.Connection, tf: str, ts: datetime) -> i
 
 
 def _decision_threshold(tf: str) -> float:
-    # Порог движения в долях (0.002 = 0.2%)
     return {
         "H1": 0.0020,
         "H4": 0.0035,
@@ -196,161 +176,184 @@ def _decision_threshold(tf: str) -> float:
 
 
 def _max_horizon(tf: str) -> int:
-    # Сколько следующих закрытых свечей ждём до "NEED_MORE_TIME"
     return {
-        "H1": 6,   # ~6 часов
-        "H4": 3,   # ~12 часов
-        "D1": 2,   # 2 дня
-        "W1": 1,   # 1 неделя
+        "H1": 6,
+        "H4": 3,
+        "D1": 2,
+        "W1": 1,
     }.get(tf, 6)
 
 
 def _action_table_ready(cols: Set[str]) -> bool:
-    return "payload_json" in cols
+    # минимум для твоей схемы
+    return ("payload_json" in cols) and ("action_ts" in cols) and ("symbol" in cols) and ("tf" in cols)
 
 
-def _insert_action_row(
+def _dir_from_action(action: str) -> str:
+    if action == "LONG_ALLOWED":
+        return "UP"
+    if action == "SHORT_ALLOWED":
+        return "DOWN"
+    return "NONE"
+
+
+def _insert_action_decision(
     conn: psycopg.Connection,
     cols: Set[str],
     *,
-    ts: datetime,
     tf: str,
     symbol: str,
-    payload: Dict[str, Any],
-) -> Optional[int]:
+    action_ts: datetime,
+    action_close: float,
+) -> None:
     """
-    Пишем строку в mm_action_engine, подстраиваясь под доступные колонки.
-    Возвращает id (если есть) иначе None.
+    Создаёт decision-строку (одна строка на одну свечу TF).
     """
-    if not _action_table_ready(cols):
-        raise RuntimeError("mm_action_engine table must have payload_json column")
+    dec = compute_action(tf)
 
+    payload = {
+        "kind": "decision",
+        "tf": tf,
+        "symbol": symbol,
+        "action_ts": action_ts.isoformat(),
+        "action_close": float(action_close),
+        "action": dec.action,
+        "direction": _dir_from_action(dec.action),
+        "confidence": int(dec.confidence),
+        "reason": dec.reason,
+        "event_type": dec.event_type,
+        "status": "PENDING",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    meta = {
+        "threshold_pct": round(_decision_threshold(tf) * 100.0, 4),
+        "max_horizon_bars": _max_horizon(tf),
+    }
+
+    # decision row
     fields: List[str] = []
     values: List[Any] = []
 
-    if "ts" in cols:
-        fields.append("ts")
-        values.append(ts)
-    if "tf" in cols:
-        fields.append("tf")
-        values.append(tf)
-    if "symbol" in cols:
-        fields.append("symbol")
-        values.append(symbol)
+    # обязательные в твоей таблице
+    fields += ["symbol", "tf", "action_ts"]
+    values += [symbol, tf, action_ts]
 
-    if "action" in cols and "action" in payload:
-        fields.append("action")
-        values.append(payload.get("action"))
-    if "confidence" in cols and "confidence" in payload:
+    if "action_close" in cols:
+        fields.append("action_close")
+        values.append(float(action_close))
+
+    if "action_direction" in cols:
+        fields.append("action_direction")
+        values.append(_dir_from_action(dec.action))
+
+    if "action_reason" in cols:
+        fields.append("action_reason")
+        values.append(dec.reason)
+
+    if "confidence" in cols:
         fields.append("confidence")
-        values.append(int(payload.get("confidence") or 0))
-    if "status" in cols and "status" in payload:
-        fields.append("status")
-        values.append(payload.get("status"))
+        values.append(int(dec.confidence))
+
+    if "eval_status" in cols:
+        fields.append("eval_status")
+        values.append("PENDING")
+
+    if "meta_json" in cols:
+        fields.append("meta_json")
+        values.append(Jsonb(meta))
+
+    if "created_at" in cols:
+        fields.append("created_at")
+        values.append(datetime.now(timezone.utc))
 
     fields.append("payload_json")
     values.append(Jsonb(payload))
 
-    returning = "id" if "id" in cols else "payload_json"
     sql = f"""
     INSERT INTO mm_action_engine ({", ".join(fields)})
-    VALUES ({", ".join(["%s"] * len(fields))})
-    RETURNING {returning};
+    VALUES ({", ".join(["%s"] * len(fields))});
     """
     with conn.cursor() as cur:
         cur.execute(sql, values)
-        row = cur.fetchone()
-
-    if "id" in cols and row and ("id" in row):
-        try:
-            return int(row["id"])
-        except Exception:
-            return None
-    return None
 
 
-def _decision_exists(conn: psycopg.Connection, cols: Set[str], tf: str, ts: datetime) -> bool:
-    """
-    Защита от дублей: decision на один tf+ts должен быть один.
-    Адаптируемся к схеме:
-    - если есть tf/ts колонки -> фильтруем по ним
-    - если нет -> фильтруем по payload_json
-    """
-    ts_iso = ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-    if "tf" in cols and "ts" in cols:
-        sql = """
-        SELECT 1
-        FROM mm_action_engine
-        WHERE tf=%s
-          AND ts=%s
-          AND (payload_json->>'kind') = 'decision'
-        LIMIT 1;
-        """
-        with conn.cursor() as cur:
-            cur.execute(sql, (tf, ts))
-            return bool(cur.fetchone())
-
-    # fallback: только по payload_json
+def _decision_exists(conn: psycopg.Connection, tf: str, action_ts: datetime) -> bool:
     sql = """
     SELECT 1
     FROM mm_action_engine
-    WHERE (payload_json->>'kind') = 'decision'
-      AND (payload_json->>'tf') = %s
-      AND (payload_json->>'ts_iso') = %s
+    WHERE tf=%s
+      AND action_ts=%s
+      AND (payload_json->>'kind') = 'decision'
     LIMIT 1;
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (tf, ts_iso))
+        cur.execute(sql, (tf, action_ts))
         return bool(cur.fetchone())
 
 
-def _fetch_pending_decisions(conn: psycopg.Connection, cols: Set[str], tf: str) -> List[Dict[str, Any]]:
-    """
-    Берём decisions с status PENDING/WAIT/NEED_MORE_TIME (по payload_json).
-    Адаптируемся к схеме по наличию tf колонки.
-    """
-    if "tf" in cols:
-        sql = """
-        SELECT *
-        FROM mm_action_engine
-        WHERE tf=%s
-          AND (payload_json->>'kind') = 'decision'
-          AND (payload_json->>'status') IN ('PENDING','WAIT','NEED_MORE_TIME')
-        ORDER BY ts ASC;
-        """
-        with conn.cursor() as cur:
-            cur.execute(sql, (tf,))
-            return cur.fetchall() or []
-
-    # fallback: tf внутри payload_json
+def _fetch_pending_decisions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
     sql = """
     SELECT *
     FROM mm_action_engine
-    WHERE (payload_json->>'kind') = 'decision'
-      AND (payload_json->>'tf') = %s
-      AND (payload_json->>'status') IN ('PENDING','WAIT','NEED_MORE_TIME')
-    ORDER BY (payload_json->>'ts_iso') ASC;
+    WHERE tf=%s
+      AND (payload_json->>'kind') = 'decision'
+      AND COALESCE(eval_status, (payload_json->>'status')) IN ('PENDING','WAIT','NEED_MORE_TIME')
+    ORDER BY action_ts ASC;
     """
     with conn.cursor() as cur:
         cur.execute(sql, (tf,))
         return cur.fetchall() or []
 
 
-def _update_action_payload(conn: psycopg.Connection, cols: Set[str], row_id: int, patch: Dict[str, Any]) -> None:
-    if "id" not in cols or "payload_json" not in cols:
-        return
-    sql = """
+def _update_decision_eval(
+    conn: psycopg.Connection,
+    cols: Set[str],
+    *,
+    row_id: int,
+    status: str,
+    eval_ts: datetime,
+    eval_close: float,
+    eval_delta_pct: float,
+    bars_passed: int,
+    patch_payload: Dict[str, Any],
+) -> None:
+    sets: List[str] = []
+    vals: List[Any] = []
+
+    if "eval_status" in cols:
+        sets.append("eval_status=%s")
+        vals.append(status)
+    if "eval_ts" in cols:
+        sets.append("eval_ts=%s")
+        vals.append(eval_ts)
+    if "eval_close" in cols:
+        sets.append("eval_close=%s")
+        vals.append(float(eval_close))
+    if "eval_delta_pct" in cols:
+        sets.append("eval_delta_pct=%s")
+        vals.append(float(eval_delta_pct))
+    if "bars_passed" in cols:
+        sets.append("bars_passed=%s")
+        vals.append(int(bars_passed))
+
+    # всегда обновляем payload_json (есть в cols по ready-check)
+    sets.append("payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb")
+    vals.append(Jsonb(patch_payload))
+
+    sql = f"""
     UPDATE mm_action_engine
-    SET payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb
-    WHERE id = %s;
+    SET {", ".join(sets)}
+    WHERE id=%s;
     """
+    vals.append(int(row_id))
+
     with conn.cursor() as cur:
-        cur.execute(sql, (Jsonb(patch), row_id))
+        cur.execute(sql, vals)
 
 
 def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, latest_ts: datetime, latest_close: float) -> None:
-    pending = _fetch_pending_decisions(conn, cols, tf)
+    pending = _fetch_pending_decisions(conn, tf)
     if not pending:
         return
 
@@ -358,38 +361,30 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
     max_h = _max_horizon(tf)
 
     for r in pending:
-        payload = (r.get("payload_json") or {}) if isinstance(r, dict) else {}
+        row_id = int(r["id"])
+        decision_ts = r.get("action_ts")
+        payload = r.get("payload_json") or {}
 
-        decision_ts = r.get("ts") if isinstance(r, dict) else None
-        if decision_ts is None:
-            try:
-                decision_ts = datetime.fromisoformat(payload.get("ts_iso"))
-            except Exception:
-                continue
-
-        # не подтверждаем "будущее" относительно latest_ts
-        try:
-            if decision_ts >= latest_ts:
-                continue
-        except Exception:
-            pass
-
-        action = payload.get("action")
-        entry_close = payload.get("entry_close")
-        if entry_close is None:
+        if not decision_ts or decision_ts >= latest_ts:
             continue
 
+        action_close = r.get("action_close")
+        if action_close is None:
+            # fallback из payload
+            action_close = payload.get("action_close")
+
         try:
-            entry_close_f = float(entry_close)
+            entry_close = float(action_close)
         except Exception:
             continue
 
-        if entry_close_f == 0:
+        if entry_close == 0:
             continue
 
-        candles_after = _count_snapshots_after(conn, tf, decision_ts)
-        delta = (latest_close / entry_close_f) - 1.0
+        bars_passed = _count_snapshots_after(conn, tf, decision_ts)
+        delta = (latest_close / entry_close) - 1.0
 
+        action = payload.get("action") or ""
         want_up = action == "LONG_ALLOWED"
         want_down = action == "SHORT_ALLOWED"
 
@@ -401,66 +396,33 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
                 else:
                     status = "RIGHT" if delta < 0 else "WRONG"
             else:
-                status = "NEED_MORE_TIME" if candles_after >= max_h else "WAIT"
+                status = "NEED_MORE_TIME" if bars_passed >= max_h else "WAIT"
+        else:
+            status = "WAIT"
 
         patch = {
             "status": status,
             "last_checked_ts": latest_ts.isoformat(),
-            "last_checked_close": latest_close,
+            "last_checked_close": float(latest_close),
             "delta_pct": round(delta * 100.0, 4),
-            "candles_after": int(candles_after),
+            "bars_passed": int(bars_passed),
             "threshold_pct": round(thr * 100.0, 4),
         }
         if status in ("RIGHT", "WRONG"):
             patch["resolved_ts"] = latest_ts.isoformat()
-            patch["resolved_close"] = latest_close
+            patch["resolved_close"] = float(latest_close)
 
-        row_id = None
-        if "id" in cols and isinstance(r, dict):
-            try:
-                row_id = int(r.get("id"))
-            except Exception:
-                row_id = None
-
-        if row_id is not None:
-            _update_action_payload(conn, cols, row_id, patch)
-
-        # отдельная история result (удобно для статистики)
-        result_payload = {
-            "kind": "result",
-            "tf": tf,
-            "symbol": "BTC-USDT",
-            "decision_ref_id": row_id,
-            "decision_ts": decision_ts.isoformat() if hasattr(decision_ts, "isoformat") else str(decision_ts),
-            "action": action,
-            "status": status,
-            "delta_pct": patch["delta_pct"],
-            "candles_after": patch["candles_after"],
-            "checked_ts": latest_ts.isoformat(),
-        }
-        _insert_action_row(conn, cols, ts=latest_ts, tf=tf, symbol="BTC-USDT", payload=result_payload)
-
-
-def _record_action_for_candle(conn: psycopg.Connection, cols: Set[str], tf: str, ts: datetime, close: float) -> None:
-    # дубль-guard (без “отравления” транзакции)
-    if _decision_exists(conn, cols, tf, ts):
-        return
-
-    dec = compute_action(tf)
-    payload = {
-        "kind": "decision",
-        "tf": tf,
-        "symbol": "BTC-USDT",
-        "ts_iso": ts.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-        "entry_close": float(close),
-        "action": dec.action,
-        "confidence": int(dec.confidence),
-        "reason": dec.reason,
-        "event_type": dec.event_type,
-        "status": "PENDING",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _insert_action_row(conn, cols, ts=ts, tf=tf, symbol="BTC-USDT", payload=payload)
+        _update_decision_eval(
+            conn,
+            cols,
+            row_id=row_id,
+            status=status,
+            eval_ts=latest_ts,
+            eval_close=float(latest_close),
+            eval_delta_pct=round(delta * 100.0, 6),
+            bars_passed=int(bars_passed),
+            patch_payload=patch,
+        )
 
 
 async def _mm_auto_tick(app: Application) -> None:
@@ -531,17 +493,28 @@ async def _mm_auto_tick(app: Application) -> None:
                     if latest_close is None:
                         continue
 
-                    # ✅ savepoint: ошибки не “отравляют” соединение
-                    with conn.transaction():
-                        _record_action_for_candle(conn, cols, tf, ts, latest_close)
-                        _confirm_pending_actions(conn, cols, tf, ts, latest_close)
+                    # decision (один на tf+action_ts)
+                    if not _decision_exists(conn, tf, ts):
+                        _insert_action_decision(
+                            conn,
+                            cols,
+                            tf=tf,
+                            symbol="BTC-USDT",
+                            action_ts=ts,
+                            action_close=float(latest_close),
+                        )
 
+                    # confirm pending decisions
+                    _confirm_pending_actions(conn, cols, tf, ts, float(latest_close))
+
+                    conn.commit()
                 except Exception:
+                    conn.rollback()
                     log.exception("MM auto: action engine persistence failed tf=%s", tf)
         else:
-            log.info("mm_action_engine table not ready (need payload_json), skipping action persistence")
+            log.info("mm_action_engine table not ready (need payload_json + action_ts + symbol + tf), skipping action persistence")
 
-        # 5) REPORTS — только на новых свечах, плюс защита report_sent (single row per TF)
+        # 5) REPORTS — только на новых свечах + защита report_sent
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
