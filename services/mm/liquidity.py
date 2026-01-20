@@ -217,12 +217,8 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     """
     Сохраняет liq_levels в mm_events.
-
     ✅ True  — записали (изменился ts или уровни)
     ❌ False — пропустили (тот же ts и те же уровни)
-
-    Важно: в твоей БД есть уникальность (ux_mm_events_state), и судя по логам она
-    не подходит под ON CONFLICT (поэтому делаем ручной insert->update).
     """
     payload = {
         "tf": levels.tf,
@@ -241,34 +237,17 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     VALUES (%s, %s, %s, %s, %s);
     """
 
-    # обновляем "последнюю запись" по tf (уникальность у тебя завязана на event_type/tf)
-    sql_update = """
-    UPDATE mm_events
-    SET ts=%s,
-        symbol=%s,
-        payload_json=%s
-    WHERE event_type='liq_levels' AND tf=%s;
-    """
-
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
         prev = _load_last_liq_row(conn, levels.tf)
         if prev:
             prev_ts, prev_payload = prev
-            # ✅ пропускаем только если И ts тот же, И уровни те же
             if prev_ts == levels.ts and _same_liq(prev_payload, levels):
                 return False
 
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql_insert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
-        except psycopg.errors.UniqueViolation:
-            # если запись уже существует (из-за ux_mm_events_state) — делаем update
-            conn.rollback()
-            with conn.cursor() as cur:
-                cur.execute(sql_update, (levels.ts, "BTC-USDT", Jsonb(payload), levels.tf))
-
+        with conn.cursor() as cur:
+            cur.execute(sql_insert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
         conn.commit()
 
     return True
@@ -305,15 +284,13 @@ def _has_targets(payload: Optional[Dict[str, Any]]) -> bool:
 async def update_liquidity_memory(tfs: List[str]) -> List[str]:
     """
     Пересчитывает уровни и сохраняет.
-    Важно: НЕ перезаписываем "последние хорошие уровни" пустыми значениями,
-    иначе в отчёте будут вечные "—".
+    НЕ перезаписываем "последние хорошие уровни" пустыми значениями.
     """
     out: List[str] = []
 
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
 
-        # ✅ если новый расчёт пустой, но в БД уже есть непустой — пропускаем сохранение
         if (not lv.up_targets and not lv.dn_targets) and ("insufficient_history" in (lv.notes or [])):
             prev = load_last_liquidity_levels(tf)
             if _has_targets(prev):
