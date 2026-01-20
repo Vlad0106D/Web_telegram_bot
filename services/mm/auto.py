@@ -95,7 +95,7 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
 
 
 # =============================================================================
-# report_sent (без ON CONFLICT — работает в любой схеме)
+# report_sent (без ON CONFLICT — максимально совместимо)
 # =============================================================================
 
 def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
@@ -139,14 +139,14 @@ def _iso(ts: datetime) -> str:
 
 
 # =============================================================================
-# ACTION ENGINE persistence + confirmation (под твою таблицу mm_action_engine)
+# ACTION ENGINE persistence + confirmation (под схему mm_action_engine)
 # =============================================================================
 
 def _table_columns(conn: psycopg.Connection, table: str) -> Set[str]:
     sql = """
     SELECT column_name
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = %s;
+    WHERE table_schema='public' AND table_name=%s;
     """
     with conn.cursor() as cur:
         cur.execute(sql, (table,))
@@ -185,18 +185,31 @@ def _max_horizon(tf: str) -> int:
 
 
 def _action_table_ready(cols: Set[str]) -> bool:
-    # минимум для твоей схемы
-    return ("payload_json" in cols) and ("action_ts" in cols) and ("symbol" in cols) and ("tf" in cols)
+    # минимум под твою таблицу
+    return {"payload_json", "action_ts", "symbol", "tf"}.issubset(cols)
 
 
 def _dir_from_action(action: str) -> Optional[str]:
-    # ВАЖНО: action_direction в БД имеет CHECK и НЕ принимает "NONE".
-    # Для NONE возвращаем None => колонка останется NULL.
+    # В БД: action_direction NOT NULL + CHECK => только валидные направления
     if action == "LONG_ALLOWED":
         return "UP"
     if action == "SHORT_ALLOWED":
         return "DOWN"
-    return None
+    return None  # NONE => НЕ пишем строку вообще
+
+
+def _decision_exists(conn: psycopg.Connection, tf: str, action_ts: datetime) -> bool:
+    sql = """
+    SELECT 1
+    FROM mm_action_engine
+    WHERE tf=%s
+      AND action_ts=%s
+      AND (payload_json->>'kind') = 'decision'
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (tf, action_ts))
+        return bool(cur.fetchone())
 
 
 def _insert_action_decision(
@@ -207,9 +220,17 @@ def _insert_action_decision(
     symbol: str,
     action_ts: datetime,
     action_close: float,
-) -> None:
+) -> bool:
+    """
+    Пишем decision только если есть направление UP/DOWN.
+    Возвращает True если записали, False если пропустили (NONE).
+    """
     dec = compute_action(tf)
     direction = _dir_from_action(dec.action)
+
+    # ✅ КРИТИЧНО: если NONE — не вставляем, иначе упадём на NOT NULL/CHECK
+    if direction is None:
+        return False
 
     payload = {
         "kind": "decision",
@@ -218,7 +239,7 @@ def _insert_action_decision(
         "action_ts": action_ts.isoformat(),
         "action_close": float(action_close),
         "action": dec.action,
-        "direction": (direction or "NONE"),
+        "direction": direction,
         "confidence": int(dec.confidence),
         "reason": dec.reason,
         "event_type": dec.event_type,
@@ -242,8 +263,8 @@ def _insert_action_decision(
         fields.append("action_close")
         values.append(float(action_close))
 
-    # ✅ пишем action_direction ТОЛЬКО если direction не None (иначе чек упадёт)
-    if "action_direction" in cols and direction is not None:
+    # обязательное в твоей схеме (NOT NULL + CHECK)
+    if "action_direction" in cols:
         fields.append("action_direction")
         values.append(direction)
 
@@ -277,19 +298,7 @@ def _insert_action_decision(
     with conn.cursor() as cur:
         cur.execute(sql, values)
 
-
-def _decision_exists(conn: psycopg.Connection, tf: str, action_ts: datetime) -> bool:
-    sql = """
-    SELECT 1
-    FROM mm_action_engine
-    WHERE tf=%s
-      AND action_ts=%s
-      AND (payload_json->>'kind') = 'decision'
-    LIMIT 1;
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (tf, action_ts))
-        return bool(cur.fetchone())
+    return True
 
 
 def _fetch_pending_decisions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
@@ -386,17 +395,15 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
         want_up = action == "LONG_ALLOWED"
         want_down = action == "SHORT_ALLOWED"
 
+        # сюда NONE уже не попадёт (мы не вставляем NONE decisions)
         status = "WAIT"
-        if want_up or want_down:
-            if abs(delta) >= thr:
-                if want_up:
-                    status = "RIGHT" if delta > 0 else "WRONG"
-                else:
-                    status = "RIGHT" if delta < 0 else "WRONG"
-            else:
-                status = "NEED_MORE_TIME" if bars_passed >= max_h else "WAIT"
+        if abs(delta) >= thr:
+            if want_up:
+                status = "RIGHT" if delta > 0 else "WRONG"
+            elif want_down:
+                status = "RIGHT" if delta < 0 else "WRONG"
         else:
-            status = "WAIT"
+            status = "NEED_MORE_TIME" if bars_passed >= max_h else "WAIT"
 
         patch = {
             "status": status,
@@ -492,7 +499,7 @@ async def _mm_auto_tick(app: Application) -> None:
                         continue
 
                     if not _decision_exists(conn, tf, ts):
-                        _insert_action_decision(
+                        wrote = _insert_action_decision(
                             conn,
                             cols,
                             tf=tf,
@@ -500,6 +507,10 @@ async def _mm_auto_tick(app: Application) -> None:
                             action_ts=ts,
                             action_close=float(latest_close),
                         )
+                        if wrote:
+                            log.info("MM action decision wrote tf=%s ts=%s", tf, ts)
+                        else:
+                            log.info("MM action decision skipped(tf=%s ts=%s): NONE", tf, ts)
 
                     _confirm_pending_actions(conn, cols, tf, ts, float(latest_close))
 
