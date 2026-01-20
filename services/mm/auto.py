@@ -95,7 +95,7 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
 
 
 # =============================================================================
-# report_sent (без ON CONFLICT — работаем в любой схеме)
+# report_sent (без ON CONFLICT — работает в любой схеме)
 # =============================================================================
 
 def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
@@ -189,12 +189,14 @@ def _action_table_ready(cols: Set[str]) -> bool:
     return ("payload_json" in cols) and ("action_ts" in cols) and ("symbol" in cols) and ("tf" in cols)
 
 
-def _dir_from_action(action: str) -> str:
+def _dir_from_action(action: str) -> Optional[str]:
+    # ВАЖНО: action_direction в БД имеет CHECK и НЕ принимает "NONE".
+    # Для NONE возвращаем None => колонка останется NULL.
     if action == "LONG_ALLOWED":
         return "UP"
     if action == "SHORT_ALLOWED":
         return "DOWN"
-    return "NONE"
+    return None
 
 
 def _insert_action_decision(
@@ -206,10 +208,8 @@ def _insert_action_decision(
     action_ts: datetime,
     action_close: float,
 ) -> None:
-    """
-    Создаёт decision-строку (одна строка на одну свечу TF).
-    """
     dec = compute_action(tf)
+    direction = _dir_from_action(dec.action)
 
     payload = {
         "kind": "decision",
@@ -218,7 +218,7 @@ def _insert_action_decision(
         "action_ts": action_ts.isoformat(),
         "action_close": float(action_close),
         "action": dec.action,
-        "direction": _dir_from_action(dec.action),
+        "direction": (direction or "NONE"),
         "confidence": int(dec.confidence),
         "reason": dec.reason,
         "event_type": dec.event_type,
@@ -231,11 +231,10 @@ def _insert_action_decision(
         "max_horizon_bars": _max_horizon(tf),
     }
 
-    # decision row
     fields: List[str] = []
     values: List[Any] = []
 
-    # обязательные в твоей таблице
+    # обязательные
     fields += ["symbol", "tf", "action_ts"]
     values += [symbol, tf, action_ts]
 
@@ -243,9 +242,10 @@ def _insert_action_decision(
         fields.append("action_close")
         values.append(float(action_close))
 
-    if "action_direction" in cols:
+    # ✅ пишем action_direction ТОЛЬКО если direction не None (иначе чек упадёт)
+    if "action_direction" in cols and direction is not None:
         fields.append("action_direction")
-        values.append(_dir_from_action(dec.action))
+        values.append(direction)
 
     if "action_reason" in cols:
         fields.append("action_reason")
@@ -337,7 +337,6 @@ def _update_decision_eval(
         sets.append("bars_passed=%s")
         vals.append(int(bars_passed))
 
-    # всегда обновляем payload_json (есть в cols по ready-check)
     sets.append("payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb")
     vals.append(Jsonb(patch_payload))
 
@@ -370,7 +369,6 @@ def _confirm_pending_actions(conn: psycopg.Connection, cols: Set[str], tf: str, 
 
         action_close = r.get("action_close")
         if action_close is None:
-            # fallback из payload
             action_close = payload.get("action_close")
 
         try:
@@ -493,7 +491,6 @@ async def _mm_auto_tick(app: Application) -> None:
                     if latest_close is None:
                         continue
 
-                    # decision (один на tf+action_ts)
                     if not _decision_exists(conn, tf, ts):
                         _insert_action_decision(
                             conn,
@@ -504,7 +501,6 @@ async def _mm_auto_tick(app: Application) -> None:
                             action_close=float(latest_close),
                         )
 
-                    # confirm pending decisions
                     _confirm_pending_actions(conn, cols, tf, ts, float(latest_close))
 
                     conn.commit()
