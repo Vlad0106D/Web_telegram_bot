@@ -34,9 +34,6 @@ def _load_last_state_payload(conn: psycopg.Connection, *, tf: str, symbol: str) 
 
 
 def _same_state(prev: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> bool:
-    """
-    Сравниваем только смысловые поля (без saved_at и прочей служебки).
-    """
     if not prev:
         return False
 
@@ -44,16 +41,16 @@ def _same_state(prev: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> bool
     p0 = {k: v for k, v in prev.items() if k not in ignore}
     p1 = {k: v for k, v in payload.items() if k not in ignore}
 
-    # Нормализуем списки таргетов (могут быть float/int/str)
+    def _norm_list(x):
+        out = []
+        for v in (x or []):
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        return out
+
     for k in ("btc_down_targets", "btc_up_targets"):
-        def _norm_list(x):
-            out = []
-            for v in (x or []):
-                try:
-                    out.append(float(v))
-                except Exception:
-                    pass
-            return out
         if k in p0 or k in p1:
             p0[k] = _norm_list(p0.get(k))
             p1[k] = _norm_list(p1.get(k))
@@ -69,15 +66,25 @@ def save_state(
     symbol: str = "BTC-USDT",
 ) -> bool:
     """
-    Сохраняет последнее вычисленное состояние MM в mm_events.
-    Возвращает True если записали, False если пропустили (без изменений).
+    Сохраняет "последнее состояние" mm_state в mm_events.
+
+    ВАЖНО: в твоей схеме есть partial unique index ux_mm_events_state
+    по (event_type, tf) для event_type IN ('mm_state','report_sent','liq_levels').
+    Поэтому используем UPSERT, иначе ловим UniqueViolation.
     """
     payload = dict(payload)
     payload.setdefault("saved_at", datetime.now(timezone.utc).isoformat())
 
-    sql = """
+    # Этот WHERE должен совпадать с predicate в ux_mm_events_state
+    sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s);
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (event_type, tf)
+        WHERE (event_type = ANY (ARRAY['mm_state','report_sent','liq_levels']::text[]))
+    DO UPDATE SET
+        ts = EXCLUDED.ts,
+        symbol = EXCLUDED.symbol,
+        payload_json = EXCLUDED.payload_json;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
@@ -88,7 +95,7 @@ def save_state(
             return False
 
         with conn.cursor() as cur:
-            cur.execute(sql, (ts, tf, symbol, "mm_state", Jsonb(payload)))
+            cur.execute(sql_upsert, (ts, tf, symbol, "mm_state", Jsonb(payload)))
         conn.commit()
 
     return True
@@ -99,9 +106,6 @@ def load_last_state(
     tf: str,
     symbol: str = "BTC-USDT",
 ) -> Optional[Dict[str, Any]]:
-    """
-    Возвращает последнее сохранённое состояние по TF.
-    """
     sql = """
     SELECT ts, payload_json
     FROM mm_events
