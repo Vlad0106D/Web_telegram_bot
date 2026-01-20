@@ -216,7 +216,8 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
 
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     """
-    Сохраняет liq_levels в mm_events.
+    Сохраняет liq_levels в mm_events как "последнее состояние" на TF.
+    Так как в БД уникальность по (event_type, tf), используем UPSERT.
     ✅ True  — записали (изменился ts или уровни)
     ❌ False — пропустили (тот же ts и те же уровни)
     """
@@ -232,9 +233,17 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    sql_insert = """
+    # Надёжнее всего конфликтовать по имени constraint,
+    # потому что схема у тебя уже точно содержит ux_mm_events_state
+    # (видно по логу UniqueViolation).
+    sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s);
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT ON CONSTRAINT ux_mm_events_state
+    DO UPDATE SET
+        ts = EXCLUDED.ts,
+        symbol = EXCLUDED.symbol,
+        payload_json = EXCLUDED.payload_json;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
@@ -247,7 +256,7 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
                 return False
 
         with conn.cursor() as cur:
-            cur.execute(sql_insert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
+            cur.execute(sql_upsert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
         conn.commit()
 
     return True
@@ -284,13 +293,14 @@ def _has_targets(payload: Optional[Dict[str, Any]]) -> bool:
 async def update_liquidity_memory(tfs: List[str]) -> List[str]:
     """
     Пересчитывает уровни и сохраняет.
-    НЕ перезаписываем "последние хорошие уровни" пустыми значениями.
+    Важно: НЕ перезаписываем "последние хорошие уровни" пустыми значениями.
     """
     out: List[str] = []
 
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
 
+        # если новый расчёт пустой, но в БД уже есть непустой — пропускаем сохранение
         if (not lv.up_targets and not lv.dn_targets) and ("insufficient_history" in (lv.notes or [])):
             prev = load_last_liquidity_levels(tf)
             if _has_targets(prev):
