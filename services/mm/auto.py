@@ -96,11 +96,12 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
 
 
 # =============================================================================
-# report_sent — ВАЖНО: в твоей БД уникальность по (event_type, tf)
-# значит report_sent должен быть "последняя запись" на TF => UPSERT
+# report_sent — у тебя уникальность (event_type, tf), поэтому храним одну "последнюю" строку на TF
 # =============================================================================
 
 def _load_last_report_sent_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
+    # В твоей БД тут фактически одна строка на tf (из-за unique),
+    # поэтому достаточно LIMIT 1.
     sql = """
     SELECT ts
     FROM mm_events
@@ -122,18 +123,29 @@ def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> boo
 
 
 def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]) -> None:
-    # UPSERT под уникальный индекс ux_mm_events_state (event_type, tf)
-    sql = """
-    INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
-    VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT (event_type, tf)
-    DO UPDATE SET
-        ts = EXCLUDED.ts,
-        symbol = EXCLUDED.symbol,
-        payload_json = EXCLUDED.payload_json;
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
+    Ручной upsert:
+    - пробуем INSERT
+    - если UniqueViolation (ux_mm_events_state) -> UPDATE по (event_type='report_sent', tf)
+    """
+    sql_insert = """
+    INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
+    VALUES (%s, %s, %s, %s, %s);
+    """
+    sql_update = """
+    UPDATE mm_events
+    SET ts=%s,
+        symbol=%s,
+        payload_json=%s
+    WHERE event_type='report_sent' AND tf=%s;
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql_insert, (ts, tf, "BTC-USDT", "report_sent", Jsonb(payload)))
+    except psycopg.errors.UniqueViolation:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(sql_update, (ts, "BTC-USDT", Jsonb(payload), tf))
 
 
 def _get_seen_map(app: Application) -> Dict[str, str]:
@@ -515,7 +527,7 @@ async def _mm_auto_tick(app: Application) -> None:
         else:
             log.info("mm_action_engine table not ready (need payload_json), skipping action persistence")
 
-        # 5) REPORTS — только на новых свечах, плюс защита report_sent (single row per TF)
+        # 5) REPORTS — только на новых свечах + single-row report_sent per TF
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
