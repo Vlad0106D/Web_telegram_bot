@@ -216,10 +216,10 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
 
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
     """
-    Сохраняет liq_levels в mm_events как "последнее состояние" на TF.
-    Так как в БД уникальность по (event_type, tf), используем UPSERT.
-    ✅ True  — записали (изменился ts или уровни)
-    ❌ False — пропустили (тот же ts и те же уровни)
+    liq_levels хранится в mm_events как "последнее состояние" на TF.
+    В mm_events стоит partial unique index ux_mm_events_state:
+      UNIQUE (event_type, tf) WHERE event_type IN ('mm_state','report_sent','liq_levels')
+    Поэтому UPSERT должен повторять WHERE-предикат.
     """
     payload = {
         "tf": levels.tf,
@@ -233,13 +233,11 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Надёжнее всего конфликтовать по имени constraint,
-    # потому что схема у тебя уже точно содержит ux_mm_events_state
-    # (видно по логу UniqueViolation).
     sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
     VALUES (%s, %s, %s, %s, %s)
-    ON CONFLICT ON CONSTRAINT ux_mm_events_state
+    ON CONFLICT (event_type, tf)
+    WHERE event_type IN ('mm_state','report_sent','liq_levels')
     DO UPDATE SET
         ts = EXCLUDED.ts,
         symbol = EXCLUDED.symbol,
@@ -291,16 +289,11 @@ def _has_targets(payload: Optional[Dict[str, Any]]) -> bool:
 
 
 async def update_liquidity_memory(tfs: List[str]) -> List[str]:
-    """
-    Пересчитывает уровни и сохраняет.
-    Важно: НЕ перезаписываем "последние хорошие уровни" пустыми значениями.
-    """
     out: List[str] = []
 
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
 
-        # если новый расчёт пустой, но в БД уже есть непустой — пропускаем сохранение
         if (not lv.up_targets and not lv.dn_targets) and ("insufficient_history" in (lv.notes or [])):
             prev = load_last_liquidity_levels(tf)
             if _has_targets(prev):
