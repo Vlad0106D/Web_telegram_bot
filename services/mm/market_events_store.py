@@ -53,15 +53,17 @@ def insert_market_event(
     payload: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Пишет рыночное событие в mm_market_events
-    ТОЛЬКО если состояние изменилось.
+    Пишет рыночное событие в mm_market_events:
+    - не пишет если состояние не изменилось (event_type/side/zone)
+    - не падает на дублях по uq_mm_market_events_key:
+      ON CONFLICT ON CONSTRAINT uq_mm_market_events_key DO NOTHING
 
-    Возвращает True если вставили, False если пропустили.
+    Возвращает True если вставили, False если пропустили/конфликт.
     """
 
     payload = payload or {}
 
-    # 1️⃣ Проверяем последнее состояние
+    # 1) Проверяем последнее состояние (анти-спам одинаковых состояний подряд)
     last = get_last_market_event(tf=tf, symbol=symbol)
     if last:
         same_state = (
@@ -70,10 +72,9 @@ def insert_market_event(
             and last.get("zone") == zone
         )
         if same_state:
-            # состояние не изменилось — НЕ пишем
             return False
 
-    # 2️⃣ Вставляем новое состояние
+    # 2) Вставка + защита от дублей по UNIQUE(symbol, tf, ts, event_type)
     sql = """
     INSERT INTO mm_market_events (
         ts, tf, symbol,
@@ -81,6 +82,8 @@ def insert_market_event(
         payload_json
     )
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT ON CONSTRAINT uq_mm_market_events_key
+    DO NOTHING
     RETURNING id;
     """
 
