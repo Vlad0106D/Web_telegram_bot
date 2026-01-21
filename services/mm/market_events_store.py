@@ -53,17 +53,15 @@ def insert_market_event(
     payload: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Пишет рыночное событие в mm_market_events:
-    - не пишет если состояние не изменилось (event_type/side/zone)
-    - не падает на дублях по uq_mm_market_events_key:
-      ON CONFLICT ON CONSTRAINT uq_mm_market_events_key DO NOTHING
+    Пишет рыночное событие в mm_market_events.
 
-    Возвращает True если вставили, False если пропустили/конфликт.
+    ✅ Не зависит от имени constraint в БД (никаких ON CONSTRAINT ...).
+    ✅ Не пишет если "состояние" не изменилось (event_type+side+zone).
+    ✅ Не пишет дубль по ключу (symbol, tf, ts, event_type).
     """
-
     payload = payload or {}
 
-    # 1) Проверяем последнее состояние (анти-спам одинаковых состояний подряд)
+    # 1) Не пишем если состояние не изменилось
     last = get_last_market_event(tf=tf, symbol=symbol)
     if last:
         same_state = (
@@ -74,24 +72,34 @@ def insert_market_event(
         if same_state:
             return False
 
-    # 2) Вставка + защита от дублей по UNIQUE(symbol, tf, ts, event_type)
-    sql = """
+    sql_exists = """
+    SELECT 1
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s AND ts=%s AND event_type=%s
+    LIMIT 1;
+    """
+
+    sql_insert = """
     INSERT INTO mm_market_events (
         ts, tf, symbol,
         event_type, side, level, zone, confidence,
         payload_json
     )
     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    ON CONFLICT ON CONSTRAINT uq_mm_market_events_key
-    DO NOTHING
     RETURNING id;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
         with conn.cursor() as cur:
+            # 2) Дубль-guard по ключу
+            cur.execute(sql_exists, (symbol, tf, ts, event_type))
+            if cur.fetchone():
+                return False
+
+            # 3) Вставка
             cur.execute(
-                sql,
+                sql_insert,
                 (
                     ts,
                     tf,
