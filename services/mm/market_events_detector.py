@@ -136,29 +136,6 @@ def _close_pos_to_high(c: Candle) -> float:
     return (c.high - c.close) / r
 
 
-# -----------------------------------------------------------------------------
-# HELPERS: кандидаты уровней для sweep/decision
-# -----------------------------------------------------------------------------
-
-def _uniq_levels(levels: List[Optional[float]], tol: float) -> List[float]:
-    """
-    Убираем почти-одинаковые уровни (в пределах tol).
-    """
-    out: List[float] = []
-    for x in levels:
-        if x is None:
-            continue
-        v = float(x)
-        found = False
-        for y in out:
-            if y != 0 and abs(v / y - 1.0) <= tol:
-                found = True
-                break
-        if not found:
-            out.append(v)
-    return out
-
-
 def _label_level(zone_prefix: str, kind: str) -> str:
     return f"{zone_prefix} {kind}"
 
@@ -250,6 +227,7 @@ def detect_and_store_market_events(tf: str) -> List[str]:
 
     # -------------------------------------------------------------------------
     # 1) DECISION ZONES + SWEEPS по уровням (H1: H4+H1)
+    #    ✅ FIX: SWEEP ТОЛЬКО от range_high / range_low (никаких EQH/EQL/targets)
     # -------------------------------------------------------------------------
     level_sets = _get_levels_sets(tf)
 
@@ -259,13 +237,8 @@ def detect_and_store_market_events(tf: str) -> List[str]:
 
         rh = lv.get("range_high")
         rl = lv.get("range_low")
-        eqh = lv.get("eqh")
-        eql = lv.get("eql")
-        up_tg = lv.get("up_targets") or []
-        dn_tg = lv.get("dn_targets") or []
 
         # --- DECISION ZONE (range high/low) ---
-        # (если уже был decision_zone на этом ts — не пытаемся писать ещё раз)
         if "decision_zone" not in inserted_types_this_ts:
             if rh is not None and _rel_dist(px, rh) <= dz_tol:
                 ok = insert_market_event(
@@ -299,77 +272,59 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                 if ok:
                     inserted_types_this_ts.add("decision_zone")
 
-        # --- SWEEPS ---
-        # Кандидаты уровней:
-        #   HIGH: EQH -> RANGE_HIGH -> up_targets
-        #   LOW : EQL -> RANGE_LOW  -> dn_targets
-        # Убираем дубли близких уровней
-        high_candidates = _uniq_levels([eqh, rh] + list(up_tg), tol=0.0008 if tf in ("H1", "H4") else 0.0015)
-        low_candidates = _uniq_levels([eql, rl] + list(dn_tg), tol=0.0008 if tf in ("H1", "H4") else 0.0015)
+        # --- SWEEP HIGH: только range_high ---
+        if "sweep_high" not in inserted_types_this_ts and rh is not None:
+            lvl = float(rh)
+            was_below = (prev.high <= lvl) or (prev.close <= lvl)
+            swept = was_below and (last.high > lvl * (1.0 + sweep_tol))
+            if swept:
+                ok = insert_market_event(
+                    ts=last.ts,
+                    tf=tf,
+                    event_type="sweep_high",
+                    side="up",
+                    level=lvl,
+                    zone=_label_level(zpref, "RANGE_HIGH"),
+                    confidence=75,
+                    payload={
+                        "source_tf": source_tf,
+                        "prev_close": float(prev.close),
+                        "prev_high": float(prev.high),
+                        "last_high": float(last.high),
+                        "tol": sweep_tol,
+                    },
+                )
+                out.append(f"{tf} sweep_high({zpref}) {'+1' if ok else 'skip'}")
+                wrote_any = wrote_any or ok
+                if ok:
+                    inserted_types_this_ts.add("sweep_high")
 
-        # sweep_high: фиксируем факт снятия по last.high
-        # условие "до этого были ниже/на уровне" — через prev.high/prev.close
-        if "sweep_high" not in inserted_types_this_ts:
-            for lvl in high_candidates:
-                was_below = (prev.high <= lvl) or (prev.close <= lvl)
-                swept = was_below and (last.high > lvl * (1.0 + sweep_tol))
-                if swept:
-                    zone_kind = "EQH" if eqh is not None and abs(lvl / float(eqh) - 1.0) <= 0.0008 else (
-                        "RANGE_HIGH" if rh is not None and abs(lvl / float(rh) - 1.0) <= 0.0008 else "TARGET"
-                    )
-                    ok = insert_market_event(
-                        ts=last.ts,
-                        tf=tf,
-                        event_type="sweep_high",
-                        side="up",
-                        level=float(lvl),
-                        zone=_label_level(zpref, zone_kind),
-                        confidence=75,
-                        payload={
-                            "source_tf": source_tf,
-                            "prev_close": float(prev.close),
-                            "prev_high": float(prev.high),
-                            "last_high": float(last.high),
-                            "tol": sweep_tol,
-                        },
-                    )
-                    out.append(f"{tf} sweep_high({zpref}) {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
-                    if ok:
-                        inserted_types_this_ts.add("sweep_high")
-                    break  # не пишем несколько sweep_high за свечу
-
-        # sweep_low: фиксируем факт снятия по last.low
-        # условие "до этого были выше/на уровне" — через prev.low/prev.close
-        if "sweep_low" not in inserted_types_this_ts:
-            for lvl in low_candidates:
-                was_above = (prev.low >= lvl) or (prev.close >= lvl)
-                swept = was_above and (last.low < lvl * (1.0 - sweep_tol))
-                if swept:
-                    zone_kind = "EQL" if eql is not None and abs(lvl / float(eql) - 1.0) <= 0.0008 else (
-                        "RANGE_LOW" if rl is not None and abs(lvl / float(rl) - 1.0) <= 0.0008 else "TARGET"
-                    )
-                    ok = insert_market_event(
-                        ts=last.ts,
-                        tf=tf,
-                        event_type="sweep_low",
-                        side="down",
-                        level=float(lvl),
-                        zone=_label_level(zpref, zone_kind),
-                        confidence=75,
-                        payload={
-                            "source_tf": source_tf,
-                            "prev_close": float(prev.close),
-                            "prev_low": float(prev.low),
-                            "last_low": float(last.low),
-                            "tol": sweep_tol,
-                        },
-                    )
-                    out.append(f"{tf} sweep_low({zpref}) {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
-                    if ok:
-                        inserted_types_this_ts.add("sweep_low")
-                    break  # не пишем несколько sweep_low за свечу
+        # --- SWEEP LOW: только range_low ---
+        if "sweep_low" not in inserted_types_this_ts and rl is not None:
+            lvl = float(rl)
+            was_above = (prev.low >= lvl) or (prev.close >= lvl)
+            swept = was_above and (last.low < lvl * (1.0 - sweep_tol))
+            if swept:
+                ok = insert_market_event(
+                    ts=last.ts,
+                    tf=tf,
+                    event_type="sweep_low",
+                    side="down",
+                    level=lvl,
+                    zone=_label_level(zpref, "RANGE_LOW"),
+                    confidence=75,
+                    payload={
+                        "source_tf": source_tf,
+                        "prev_close": float(prev.close),
+                        "prev_low": float(prev.low),
+                        "last_low": float(last.low),
+                        "tol": sweep_tol,
+                    },
+                )
+                out.append(f"{tf} sweep_low({zpref}) {'+1' if ok else 'skip'}")
+                wrote_any = wrote_any or ok
+                if ok:
+                    inserted_types_this_ts.add("sweep_low")
 
     # -------------------------------------------------------------------------
     # 2) PRESSURE (на всех TF) — минимально + фильтры
