@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 # ---------------- DB helpers ----------------
@@ -22,35 +23,25 @@ def _now_utc() -> datetime:
 
 
 # ---------------- Event selection policy ----------------
-# Приоритет: чем больше, тем "сильнее" событие.
+# Приоритет: чем больше, тем "сильнее" событие (для выбора состояния).
 _EVENT_PRIORITY: Dict[str, int] = {
     # strongest / actionable
     "reclaim_up": 100,
     "reclaim_down": 100,
-
     "sweep_high": 90,
     "sweep_low": 90,
-
     "decision_zone": 80,
-
-    # "context / bias"
+    # context / bias
     "pressure_up": 70,
     "pressure_down": 70,
-
-    # heartbeat / fallback only
+    # heartbeat
     "wait": 0,
 }
 
-# Окно поиска "валидного состояния" (чтобы wait не забивал ленту).
-# Можно переопределить env:
-#   MM_EVENT_LOOKBACK_MIN_H1=720  (12h)
-#   MM_EVENT_LOOKBACK_MIN_H4=2880 (48h)
-#   MM_EVENT_LOOKBACK_MIN_D1=10080 (7d)
-#   MM_EVENT_LOOKBACK_MIN_W1=40320 (28d)
 _DEFAULT_LOOKBACK_MIN = {
-    "H1": 12 * 60,     # 12 часов
-    "H4": 48 * 60,     # 2 суток
-    "D1": 10 * 24 * 60,  # 10 дней
+    "H1": 12 * 60,          # 12 часов
+    "H4": 48 * 60,          # 2 суток
+    "D1": 10 * 24 * 60,     # 10 дней
     "W1": 6 * 7 * 24 * 60,  # ~6 недель
 }
 
@@ -70,17 +61,11 @@ def _lookback_minutes(tf: str) -> int:
 def _priority(event_type: Optional[str]) -> int:
     if not event_type:
         return -1
-    return _EVENT_PRIORITY.get(event_type, 10)  # неизвестные события считаем "слабыми", но не wait
-
-
-def _is_wait(ev: Dict[str, Any]) -> bool:
-    return (ev.get("event_type") or "").strip() == "wait"
+    return _EVENT_PRIORITY.get(event_type, 10)
 
 
 def _normalize_event_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    # Приводим к единому виду, чтобы report_engine/action_engine было удобно
     out = dict(row or {})
-    # Некоторые поля могут отсутствовать в таблице, но report_engine ожидает их "мягко"
     out.setdefault("event_type", None)
     out.setdefault("side", None)
     out.setdefault("zone", None)
@@ -97,15 +82,15 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
     """
     Возвращает "последнее валидное событие состояния" для отчёта/ActionEngine.
 
-    Ключевая правка:
+    Ключевая логика:
     - wait НЕ перебивает давление/sweep/reclaim/decision_zone.
-    - wait используется только как fallback, если в lookback окне нет "сильных" событий.
+    - wait используется только как fallback, если в окне lookback нет "сильных" событий.
     """
     lb_min = _lookback_minutes(tf)
     since = _now_utc() - timedelta(minutes=lb_min)
 
     sql = """
-    SELECT ts, tf, symbol, event_type, side, zone, level, payload_json
+    SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
     FROM mm_market_events
     WHERE symbol=%s
       AND tf=%s
@@ -123,49 +108,94 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
     if not rows:
         return None
 
-    # 1) Берём самое свежее "не-wait" событие с максимальным приоритетом.
-    #    Если есть reclaim/sweep/decision_zone/pressure — вернём его, даже если после него писался wait.
     best: Optional[Dict[str, Any]] = None
     best_score = -10
-
-    # Запомним самый свежий wait (на случай, если сильных вообще нет)
     latest_wait: Optional[Dict[str, Any]] = None
 
     for r in rows:
         ev = _normalize_event_row(r)
-
         et = (ev.get("event_type") or "").strip() or None
+
         if et == "wait":
             if latest_wait is None:
                 latest_wait = ev
             continue
 
         score = _priority(et)
-
-        # score tie-breaker: более поздний ts выигрывает (rows уже desc, но на всякий)
         if score > best_score:
             best = ev
             best_score = score
 
     if best is not None:
         return best
-
-    # 2) Если сильных событий не было — отдаём wait (heartbeat), если он есть
     if latest_wait is not None:
         return latest_wait
 
-    # 3) На всякий случай — отдаём самый свежий ряд как fallback
     return _normalize_event_row(rows[0])
 
 
-# ---------------- Optional: diagnostics helpers ----------------
-def debug_last_events(*, tf: str, symbol: str = "BTC-USDT", limit: int = 30) -> List[Dict[str, Any]]:
+def insert_market_event(
+    *,
+    ts: datetime,
+    tf: str,
+    event_type: str,
+    symbol: str = "BTC-USDT",
+    side: Optional[str] = None,          # "up" / "down" / None
+    level: Optional[float] = None,
+    zone: Optional[str] = None,
+    confidence: Optional[int] = None,    # 0..100
+    payload: Optional[Dict[str, Any]] = None,
+) -> bool:
     """
-    Утилита для дебага: последние события как есть.
-    Можно дергать локально или через команду/скрипт.
+    Пишет рыночное событие в mm_market_events.
+    Антидубль: ON CONFLICT (symbol, tf, ts, event_type) DO NOTHING.
+
+    Возвращает True если вставили, False если дубль/не вставили.
     """
+    payload = payload or {}
+
     sql = """
-    SELECT ts, tf, symbol, event_type, side, zone, level, payload_json
+    INSERT INTO mm_market_events (
+        ts, tf, symbol,
+        event_type, side, level, zone, confidence,
+        payload_json
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (symbol, tf, ts, event_type) DO NOTHING
+    RETURNING id;
+    """
+
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    ts,
+                    tf,
+                    symbol,
+                    event_type,
+                    side,
+                    level,
+                    zone,
+                    confidence,
+                    Jsonb(payload),
+                ),
+            )
+            row = cur.fetchone()
+        conn.commit()
+
+    return bool(row)
+
+
+def list_market_events(
+    *,
+    tf: str,
+    symbol: str = "BTC-USDT",
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
     FROM mm_market_events
     WHERE symbol=%s AND tf=%s
     ORDER BY ts DESC, id DESC
@@ -177,3 +207,7 @@ def debug_last_events(*, tf: str, symbol: str = "BTC-USDT", limit: int = 30) -> 
             cur.execute(sql, (symbol, tf, int(limit)))
             rows = cur.fetchall() or []
     return [_normalize_event_row(r) for r in rows]
+
+
+def debug_last_events(*, tf: str, symbol: str = "BTC-USDT", limit: int = 30) -> List[Dict[str, Any]]:
+    return list_market_events(tf=tf, symbol=symbol, limit=limit)
