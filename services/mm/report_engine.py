@@ -199,7 +199,7 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
     zone = ev.get("zone")
     key_zone = None
 
-    # ✅ NEW: pressure events (это то, что у тебя в БД)
+    # ✅ pressure events
     if et == "pressure_down":
         return {
             "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
@@ -446,6 +446,31 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
+        # ✅ IMPORTANT FIX:
+        # compute_action() читает load_last_state().
+        # Чтобы Action Engine не видел "старый WAIT" (если только что пришёл pressure/sweep),
+        # сначала сохраняем текущее состояние отчёта в mm_events (mm_state),
+        # а уже потом считаем action.
+        try:
+            save_state(
+                tf=tf,
+                ts=ts,
+                payload={
+                    "state_title": state_title,
+                    "state_icon": state_icon,
+                    "phase": phase,
+                    "prob_down": int(prob_down),
+                    "prob_up": int(prob_up),
+                    "btc_down_targets": down_t,
+                    "btc_up_targets": up_t,
+                    "key_zone": key_zone,
+                    "eth_confirmation": eth_conf,
+                    "event_type": st.get("event_type"),
+                },
+            )
+        except Exception:
+            pass
+
         # ✅ Action Engine (real)
         act = compute_action(tf=tf)
 
@@ -477,27 +502,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             action_reason=str(act.reason),
             action_event_type=act.event_type,
         )
-
-        # persist state for stability
-        try:
-            save_state(
-                tf=tf,
-                ts=ts,
-                payload={
-                    "state_title": view.state_title,
-                    "state_icon": view.state_icon,
-                    "phase": view.phase,
-                    "prob_down": view.prob_down,
-                    "prob_up": view.prob_up,
-                    "btc_down_targets": view.btc_down_targets,
-                    "btc_up_targets": view.btc_up_targets,
-                    "key_zone": view.key_zone,
-                    "eth_confirmation": view.eth_confirmation,
-                    "event_type": st.get("event_type"),
-                },
-            )
-        except Exception:
-            pass
 
         return view
 
