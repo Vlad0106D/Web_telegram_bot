@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 import psycopg
@@ -57,6 +57,10 @@ def _mm_is_enabled(app: Application) -> bool:
         app.bot_data["mm_enabled"] = True
         return True
     return bool(v)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _get_latest_snapshot_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
@@ -114,10 +118,12 @@ def _get_seen_map(app: Application) -> Dict[str, str]:
 # =============================================================================
 
 def _load_last_report_sent_ts(conn: psycopg.Connection, tf: str) -> Optional[datetime]:
+    # ✅ FIX: обязательно ORDER BY, иначе LIMIT 1 может вернуть "случайную" строку
     sql = """
     SELECT ts
     FROM mm_events
     WHERE event_type='report_sent' AND tf=%s
+    ORDER BY ts DESC, id DESC
     LIMIT 1;
     """
     with conn.cursor() as cur:
@@ -148,9 +154,40 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 
 # =============================================================================
+# CLOSE-TIME POLICY (D1/W1) — чтобы не слать "догоняющие" отчёты после рестарта
+# =============================================================================
+
+def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
+    """
+    Возвращает ожидаемый timestamp "закрытой свечи" в UTC для данного tf.
+    Важно: у тебя ts в снапшотах выглядит как boundary (например D1 = 00:00 UTC).
+    """
+    now = now.astimezone(timezone.utc).replace(microsecond=0)
+
+    if tf == "D1":
+        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+
+    if tf == "W1":
+        # начало недели (понедельник 00:00 UTC)
+        monday = (now.date() - timedelta(days=now.weekday()))
+        return datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
+
+    return None
+
+
+def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bool:
+    """
+    Для D1/W1: шлём отчёт только если latest_ts == ожидаемому close-ts.
+    Это предотвращает ситуацию "воркер перезапустился и шлёт вчерашний D1 через 17 часов".
+    """
+    exp = _expected_close_ts(tf, now)
+    if exp is None:
+        return True  # для H1/H4 и прочего не ограничиваем
+    return latest_ts == exp
+
+
+# =============================================================================
 # ACTION ENGINE persistence + confirmation (под твою таблицу mm_action_engine)
-# ВАЖНО: action_direction и action_ts NOT NULL, + CHECK (скорее всего UP/DOWN)
-# => решения NONE/WAIT в mm_action_engine НЕ пишем (они уже есть в market_events).
 # =============================================================================
 
 def _table_columns(conn: psycopg.Connection, table: str) -> Set[str]:
@@ -380,6 +417,8 @@ async def _mm_auto_tick(app: Application) -> None:
         log.warning("MM auto enabled but ALERT_CHAT_ID is not set — skipping")
         return
 
+    now = _now_utc()
+
     try:
         await run_snapshots_once()
     except Exception:
@@ -451,6 +490,17 @@ async def _mm_auto_tick(app: Application) -> None:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
                 if latest_ts is None:
+                    continue
+
+                # ✅ FIX: D1/W1 отчёт отправляем только если это "правильный close ts"
+                if tf in ("D1", "W1") and not _should_send_close_report(tf, latest_ts, now):
+                    exp = _expected_close_ts(tf, now)
+                    log.info(
+                        "MM report skipped(tf=%s): latest_ts=%s is not close_ts=%s",
+                        tf,
+                        latest_ts,
+                        exp,
+                    )
                     continue
 
                 if _report_already_sent(conn, tf, latest_ts):
