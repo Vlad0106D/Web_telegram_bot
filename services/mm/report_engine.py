@@ -12,8 +12,8 @@ from psycopg.rows import dict_row
 
 from services.mm.state_store import save_state, load_last_state
 from services.mm.liquidity import load_last_liquidity_levels
-from services.mm.market_events_store import get_last_market_event  # event-driven
-from services.mm.action_engine import compute_action  # ✅ NEW: real Action Engine
+from services.mm.market_events_store import get_last_market_event  # fallback
+from services.mm.action_engine import compute_action  # real Action Engine
 
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
@@ -175,11 +175,53 @@ def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone:
     return _flt_list(down), _flt_list(up), (str(key_zone) if key_zone else None)
 
 
-def _event_driven_state(tf: str) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# FIX: берём события ИМЕННО НА ts текущей свечи и выбираем главное по приоритету
+# -----------------------------------------------------------------------------
+
+_EVENT_PRIORITY = [
+    "reclaim_up",
+    "reclaim_down",
+    "sweep_high",
+    "sweep_low",
+    "decision_zone",
+    "pressure_up",
+    "pressure_down",
+    "wait",
+]
+
+
+def _pick_primary_event(events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not events:
+        return None
+    # выбираем первое по приоритету
+    by_type: Dict[str, Dict[str, Any]] = {}
+    for e in events:
+        et = (e.get("event_type") or "").strip()
+        if et and et not in by_type:
+            by_type[et] = e
+    for et in _EVENT_PRIORITY:
+        if et in by_type:
+            return by_type[et]
+    return events[0]
+
+
+def _fetch_events_for_ts(conn: psycopg.Connection, *, tf: str, symbol: str, ts: datetime) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT ts, tf, event_type, side, level, zone, confidence, payload_json
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s AND ts=%s
+    ORDER BY id DESC;
     """
-    Берём последнее событие из mm_market_events и мапим в состояние отчёта.
+    with conn.cursor() as cur:
+        cur.execute(sql, (symbol, tf, ts))
+        return cur.fetchall() or []
+
+
+def _event_driven_state_from_event(ev: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
+    Мапим выбранное (главное) событие в состояние отчёта.
+    """
     if not ev:
         return {
             "state_title": "ОЖИДАНИЕ",
@@ -270,6 +312,35 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
             "event_type": et,
         }
 
+    # ✅ ВАЖНО: pressure_* теперь тоже попадает в состояние, а не превращается в WAIT
+    if et == "pressure_down":
+        return {
+            "state_title": "ДАВЛЕНИЕ ВНИЗ",
+            "state_icon": "🟠",
+            "phase": "Импульсная свеча",
+            "prob_up": 45,
+            "prob_down": 55,
+            "execution": "есть давление вниз — это ещё не sweep/reclaim, но игнорировать нельзя; ждём подтверждение (зоны/свип).",
+            "whats_next": ["Следим за RANGE LOW / EQL и реакцией", "Если будет sweep_low — ждём reclaim_up"],
+            "invalidation": "Смена импульса и закрепление выше ближайшей зоны сверху",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "pressure_up":
+        return {
+            "state_title": "ДАВЛЕНИЕ ВВЕРХ",
+            "state_icon": "🟠",
+            "phase": "Импульсная свеча",
+            "prob_up": 55,
+            "prob_down": 45,
+            "execution": "есть давление вверх — это ещё не sweep/reclaim, но сигнал силы; ждём подтверждение (зоны/свип).",
+            "whats_next": ["Следим за RANGE HIGH / EQH и реакцией", "Если будет sweep_high — ждём reclaim_down"],
+            "invalidation": "Смена импульса и закрепление ниже ближайшей зоны снизу",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
     return {
         "state_title": "ОЖИДАНИЕ",
         "state_icon": "🟡",
@@ -316,11 +387,14 @@ class MarketView:
 
     eth_confirmation: str
 
-    # ✅ Action Engine (real)
+    # Action Engine (real)
     action: str
     action_confidence: int
     action_reason: str
     action_event_type: Optional[str]
+
+    # ✅ Главное событие “на этой свече” (для отчёта/кейсов)
+    primary_event_type: Optional[str]
 
 
 def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
@@ -356,14 +430,21 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        # Фильтрация целей относительно текущей цены (чтобы "Вниз" не показывался выше цены)
+        # Фильтрация целей относительно текущей цены
         down_filtered = [x for x in down_t if x < btc_close]
         up_filtered = [x for x in up_t if x > btc_close]
         down_t = down_filtered or down_t
         up_t = up_filtered or up_t
 
-        # event-driven state
-        st = _event_driven_state(tf)
+        # ✅ state: events on this ts
+        events_this_ts = _fetch_events_for_ts(conn, tf=tf, symbol="BTC-USDT", ts=ts)
+        primary_ev = _pick_primary_event(events_this_ts)
+
+        # fallback если по какой-то причине на ts нет ничего (редко)
+        if not primary_ev:
+            primary_ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
+
+        st = _event_driven_state_from_event(primary_ev)
         state_title = st["state_title"]
         state_icon = st["state_icon"]
         phase = st["phase"]
@@ -373,6 +454,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         whats_next = st["whats_next"]
         invalidation = st["invalidation"]
         key_zone = st.get("key_zone") or key_zone0
+        primary_event_type = st.get("event_type")
 
         # ETH confirmation: funding confirms / diverges
         eth_conf = "нейтрален 🟡"
@@ -403,8 +485,14 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
-        # ✅ Action Engine (real)
+        # Action Engine (real)
         act = compute_action(tf=tf)
+
+        # ✅ FIX: если Action Engine пишет wait/NONE, но на свече есть pressure_*,
+        # в отчёте показываем реальное primary_event_type как "Event".
+        action_event_type = act.event_type
+        if primary_event_type and (not action_event_type or str(action_event_type).strip() in ("wait", "")):
+            action_event_type = primary_event_type
 
         view = MarketView(
             tf=("MANUAL" if manual else tf),
@@ -432,7 +520,8 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             action=act.action,
             action_confidence=int(act.confidence),
             action_reason=str(act.reason),
-            action_event_type=act.event_type,
+            action_event_type=action_event_type,
+            primary_event_type=primary_event_type,
         )
 
         # persist state for stability
@@ -450,7 +539,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                     "btc_up_targets": view.btc_up_targets,
                     "key_zone": view.key_zone,
                     "eth_confirmation": view.eth_confirmation,
-                    "event_type": st.get("event_type"),
+                    "event_type": view.primary_event_type,
                 },
             )
         except Exception:
@@ -472,7 +561,7 @@ def render_report(view: MarketView) -> str:
     lines.append(f"Вероятность: ↓ {view.prob_down}% | ↑ {view.prob_up}%")
     lines.append("")
 
-    # ✅ Action Engine block
+    # Action Engine block
     lines.append("ACTION ENGINE (v0):")
     lines.append(f"• Decision: {view.action} | confidence: {view.action_confidence}%")
     if view.action_event_type:
