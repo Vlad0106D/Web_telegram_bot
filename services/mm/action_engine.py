@@ -172,7 +172,6 @@ def compute_action(tf: str) -> ActionDecision:
         event_type=ev_type,
     )
 
-
 def _thresholds(tf: str) -> Tuple[float, float, int]:
     """
     Возвращает:
