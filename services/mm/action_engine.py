@@ -302,7 +302,7 @@ def _calc_delta_pct(curr_close: float, action_close: float) -> float:
         return 0.0
     return (curr_close / action_close - 1.0) * 100.0
     
-    def _insert_action_row(
+def _insert_action_row(
     conn: psycopg.Connection,
     *,
     tf: str,
