@@ -14,7 +14,6 @@ from services.mm.state_store import load_last_state
 
 
 ActionType = Literal["NONE", "LONG_ALLOWED", "SHORT_ALLOWED"]
-
 EvalStatus = Literal["pending", "confirmed", "failed", "need_more_time"]
 
 
@@ -27,112 +26,70 @@ class ActionDecision:
     event_type: Optional[str]
 
 
-# ---------------- DB helpers ----------------
-def _db_url() -> str:
-    url = (os.getenv("DATABASE_URL") or "").strip()
-    if not url:
-        raise RuntimeError("DATABASE_URL is empty")
-    return url
+# ---------------- MTF helpers ----------------
 
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def _get_table_columns(conn: psycopg.Connection, table: str) -> List[str]:
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema='public' AND table_name=%s
-    ORDER BY ordinal_position;
+def _mtf_stack(tf: str) -> List[str]:
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (table,))
-        rows = cur.fetchall() or []
-    return [r["column_name"] for r in rows]
-
-
-def _fetch_latest_btc_snapshot(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
-    sql = """
-    SELECT ts, close, meta_json
-    FROM mm_snapshots
-    WHERE symbol='BTC-USDT' AND tf=%s
-    ORDER BY ts DESC
-    LIMIT 1;
+    Какие ТФ должны подтверждать текущий.
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (tf,))
-        return cur.fetchone()
+    if tf == "H1":
+        return ["H4", "D1"]
+    if tf == "H4":
+        return ["D1"]
+    return []  # D1, W1
 
 
-def _fetch_pending_actions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
-    # максимально “мягко”: если в таблице нет колонки status — fallback через payload_json
-    cols = set(_get_table_columns(conn, "mm_action_engine"))
-    if "status" in cols:
-        sql = """
-        SELECT *
-        FROM mm_action_engine
-        WHERE symbol='BTC-USDT' AND tf=%s AND status='pending'
-        ORDER BY action_ts ASC, id ASC;
-        """
-        params = (tf,)
-    else:
-        # fallback: считаем pending, если payload_json->>'status'='pending'
-        sql = """
-        SELECT *
-        FROM mm_action_engine
-        WHERE symbol='BTC-USDT'
-          AND tf=%s
-          AND COALESCE(payload_json->>'status','')='pending'
-        ORDER BY (payload_json->>'action_ts') ASC, id ASC;
-        """
-        params = (tf,)
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        return cur.fetchall() or []
+def _state_allows_long(st: Dict[str, Any]) -> bool:
+    if not st:
+        return True
+    if st.get("state_icon") == "🔴":
+        return False
+    if int(st.get("prob_down", 0)) >= 60:
+        return False
+    return True
 
 
-def _get_latest_action_row(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
-    sql = """
-    SELECT *
-    FROM mm_action_engine
-    WHERE symbol='BTC-USDT' AND tf=%s
-    ORDER BY id DESC
-    LIMIT 1;
+def _state_allows_short(st: Dict[str, Any]) -> bool:
+    if not st:
+        return True
+    if st.get("state_icon") == "🟢":
+        return False
+    if int(st.get("prob_up", 0)) >= 60:
+        return False
+    return True
+
+
+def _mtf_filter(
+    *,
+    tf: str,
+    desired_action: ActionType,
+) -> Tuple[bool, str]:
     """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (tf,))
-        return cur.fetchone()
+    Проверяет, не конфликтует ли action со старшими ТФ.
+    """
+    stack = _mtf_stack(tf)
+    if not stack or desired_action == "NONE":
+        return True, "no_mtf_required"
 
+    for htf in stack:
+        st = load_last_state(tf=htf)
+        if desired_action == "LONG_ALLOWED" and not _state_allows_long(st):
+            return False, f"MTF conflict: {htf} против LONG"
+        if desired_action == "SHORT_ALLOWED" and not _state_allows_short(st):
+            return False, f"MTF conflict: {htf} против SHORT"
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-
-def _safe_int(x) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
+    return True, "mtf_confirmed"
 
 
 # ---------------- Core logic ----------------
+
 def compute_action(tf: str) -> ActionDecision:
     """
-    Action Mode v0
+    Action Mode v1 (MTF-aware)
     НЕ открывает сделки.
     Возвращает разрешение направления или NONE.
     """
 
-    # --- читаем последнее агрегированное состояние ---
     st = load_last_state(tf=tf)
     if not st:
         return ActionDecision(
@@ -148,7 +105,6 @@ def compute_action(tf: str) -> ActionDecision:
     state_title = st.get("state_title", "")
     last_event = st.get("event_type")
 
-    # --- если рынок в WAIT ---
     if state_title == "ОЖИДАНИЕ":
         return ActionDecision(
             tf=tf,
@@ -158,40 +114,56 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=last_event,
         )
 
-    # --- читаем последнее рыночное событие ---
     ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
     ev_type = ev.get("event_type") if ev else None
     side = ev.get("side") if ev else None
 
-    # --- LONG логика ---
+    # --- LONG candidate ---
     if (
         prob_up >= 55
         and ev_type in ("reclaim_up", "decision_zone")
         and side in ("up", None)
     ):
+        ok, why = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+        if ok:
+            return ActionDecision(
+                tf=tf,
+                action="LONG_ALLOWED",
+                confidence=min(90, prob_up),
+                reason=f"{ev_type} + prob_up={prob_up} | {why}",
+                event_type=ev_type,
+            )
         return ActionDecision(
             tf=tf,
-            action="LONG_ALLOWED",
-            confidence=min(90, prob_up),
-            reason=f"{ev_type} + prob_up={prob_up}",
+            action="NONE",
+            confidence=prob_up,
+            reason=why,
             event_type=ev_type,
         )
 
-    # --- SHORT логика ---
+    # --- SHORT candidate ---
     if (
         prob_down >= 55
         and ev_type in ("reclaim_down", "decision_zone")
         and side in ("down", None)
     ):
+        ok, why = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+        if ok:
+            return ActionDecision(
+                tf=tf,
+                action="SHORT_ALLOWED",
+                confidence=min(90, prob_down),
+                reason=f"{ev_type} + prob_down={prob_down} | {why}",
+                event_type=ev_type,
+            )
         return ActionDecision(
             tf=tf,
-            action="SHORT_ALLOWED",
-            confidence=min(90, prob_down),
-            reason=f"{ev_type} + prob_down={prob_down}",
+            action="NONE",
+            confidence=prob_down,
+            reason=why,
             event_type=ev_type,
         )
 
-    # --- fallback ---
     return ActionDecision(
         tf=tf,
         action="NONE",
