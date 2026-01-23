@@ -1,4 +1,3 @@
-# services/mm/report_engine.py
 from __future__ import annotations
 
 import os
@@ -523,9 +522,11 @@ class MarketView:
     action_reason: str
     action_event_type: Optional[str]
 
-    # ✅ MTF context
+    # ✅ MTF context (report-only)
     mtf_context: List[Dict[str, Any]]
-    def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
+
+
+def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
@@ -554,17 +555,21 @@ class MarketView:
         btc_fr, btc_fr_lbl = _extract_funding(btc_meta)
         eth_fr, eth_fr_lbl = _extract_funding(eth_meta)
 
-        # targets from liquidity memory first (PRIMARY TF)
+        # ─────────────────────────────────────────
+        # 🔹 LIQUIDITY TARGETS (PRIMARY TF)
+        # ─────────────────────────────────────────
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        # Фильтр целей относительно текущей цены (но не теряем 2 цели вообще)
+        # фильтр целей относительно цены (но не теряем цели полностью)
         down_filtered = [x for x in down_t if x < btc_close]
         up_filtered = [x for x in up_t if x > btc_close]
         down_t = (down_filtered[:2] if down_filtered else down_t[:2])
         up_t = (up_filtered[:2] if up_filtered else up_t[:2])
 
-        # event-driven state + context-aware phase/probs (PRIMARY TF)
+        # ─────────────────────────────────────────
+        # 🔹 EVENT → STATE (PRIMARY TF)
+        # ─────────────────────────────────────────
         st = _event_driven_state(tf, btc_close=btc_close, dn_targets=down_t, up_targets=up_t)
 
         state_title = st["state_title"]
@@ -577,7 +582,9 @@ class MarketView:
         invalidation = st["invalidation"]
         key_zone = st.get("key_zone") or key_zone0
 
-        # ETH confirmation: funding confirms / diverges
+        # ─────────────────────────────────────────
+        # 🔹 ETH CONFIRMATION
+        # ─────────────────────────────────────────
         eth_conf = "нейтрален 🟡"
         if state_icon in ("🟢", "⚠️"):
             if eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
@@ -595,14 +602,15 @@ class MarketView:
             if state_icon == "🟢":
                 prob_up = min(85, prob_up + 5)
                 prob_down = 100 - prob_up
-            if state_icon == "🔴":
+            elif state_icon == "🔴":
                 prob_down = min(85, prob_down + 5)
                 prob_up = 100 - prob_down
+
         if "расходится" in eth_conf:
             if state_icon == "🟢":
                 prob_up = max(55, prob_up - 8)
                 prob_down = 100 - prob_up
-            if state_icon == "🔴":
+            elif state_icon == "🔴":
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
@@ -627,10 +635,12 @@ class MarketView:
         except Exception:
             pass
 
+        # ✅ Action Engine (MTF-aware)
         act = compute_action(tf=tf)
 
-        # ✅ MTF context (report-only)
-        mtf_context = _build_mtf_context(("MANUAL" if manual else tf), btc_close_for_dist=btc_close)
+        # ✅ MTF context (report-only). Для MANUAL используем его "родительский" tf как ключ.
+        primary_tf_for_context = tf  # tf сюда приходит уже как "H1/H4/D1/MANUAL"
+        mtf_context = _build_mtf_context(primary_tf_for_context, btc_close_for_dist=btc_close)
 
         return MarketView(
             tf=("MANUAL" if manual else tf),
@@ -677,8 +687,8 @@ def render_report(view: MarketView) -> str:
     lines.append(f"Вероятность: ↓ {view.prob_down}% | ↑ {view.prob_up}%")
     lines.append("")
 
-    # Action Engine block
-    lines.append("ACTION ENGINE (v0):")
+    # ✅ Action Engine block
+    lines.append("ACTION ENGINE (v1):")
     lines.append(f"• Decision: {view.action} | confidence: {view.action_confidence}%")
     if view.action_event_type:
         lines.append(f"• Event: {view.action_event_type}")
@@ -705,8 +715,8 @@ def render_report(view: MarketView) -> str:
         lines.append("")
         lines.append("MTF контекст (старшие ТФ):")
         for c in view.mtf_context:
-            tf = str(c.get("tf") or "")
-            title2 = str(c.get("title") or tf)
+            tf2 = str(c.get("tf") or "")
+            title2 = str(c.get("title") or tf2)
             st_title = str(c.get("state_title") or "—")
             st_icon = str(c.get("state_icon") or "")
             prob_dn = int(c.get("prob_down") or 0)
