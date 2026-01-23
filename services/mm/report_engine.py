@@ -32,7 +32,7 @@ MTF_CONTEXT = {
     "H4": ["D1"],
     "D1": [],
     "W1": [],
-    "MANUAL": ["H4", "D1"],  # ручной снимок — тоже полезно видеть старшие
+    "MANUAL": ["H4", "D1"],
 }
 
 FUNDING_BIAS_LONG = 0.008
@@ -156,7 +156,7 @@ def _targets_from_liq_levels(tf: str) -> Tuple[List[float], List[float], Optiona
 
     dn = _flt_list(liq.get("dn_targets"))
     up = _flt_list(liq.get("up_targets"))
-    key_zone = liq.get("key_zone")  # optional
+    key_zone = liq.get("key_zone")
     return dn[:2], up[:2], (str(key_zone) if key_zone else None)
 
 
@@ -206,15 +206,20 @@ def _nearest_dist_pct(price: float, level: Optional[float]) -> Optional[float]:
         return None
 
 
-def _phase_from_context(et: str, *, price: float, zone: Optional[float], dn_targets: List[float], up_targets: List[float]) -> str:
+def _phase_from_context(
+    et: str,
+    *,
+    price: float,
+    zone: Optional[float],
+    dn_targets: List[float],
+    up_targets: List[float],
+) -> str:
     et = (et or "").strip()
 
     if et in ("reclaim_up", "reclaim_down"):
         return "Возврат цены подтверждён"
-
     if et in ("sweep_high", "sweep_low"):
         return "Ликвидность снята"
-
     if et == "decision_zone":
         return "Ожидается возврат цены (reclaim)"
 
@@ -261,8 +266,9 @@ def _probs_from_context(et: str, *, price: float, dn_targets: List[float], up_ta
     elif et == "decision_zone":
         down = 50
     else:
-        down = 52  # wait/unknown
+        down = 52
 
+    # чем ближе к цели — тем меньше “уверенность” (это зона реакции)
     if et in ("pressure_down", "sweep_low", "reclaim_down"):
         nearest_dn = dn_targets[0] if dn_targets else None
         d = _nearest_dist_pct(price, nearest_dn)
@@ -444,12 +450,6 @@ def _tf_rank(tf: str) -> int:
 
 
 def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Dict[str, Any]]:
-    """
-    Контекст старших ТФ:
-    - берём их liq levels (dn/up/key_zone)
-    - берём их последнее market_event
-    - прогоняем через _event_driven_state (но НЕ персистим)
-    """
     tfs = MTF_CONTEXT.get(primary_tf, [])
     out: List[Dict[str, Any]] = []
 
@@ -458,7 +458,6 @@ def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Di
             down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
             down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-            # не режем "по текущей цене" жёстко — контекст должен показывать уровни, даже если цена выше/ниже
             down_t = down_t[:2]
             up_t = up_t[:2]
 
@@ -480,10 +479,8 @@ def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Di
                 }
             )
         except Exception:
-            # контекст не должен ломать основной отчёт
             continue
 
-    # порядок: H4 -> D1 -> W1
     out.sort(key=lambda x: _tf_rank(str(x.get("tf"))))
     return out
 
@@ -528,9 +525,7 @@ class MarketView:
 
     # ✅ MTF context
     mtf_context: List[Dict[str, Any]]
-
-
-def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
+    def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
@@ -563,8 +558,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        # Фильтрация целей относительно текущей цены
-        # (чтобы "Вниз" не показывался выше цены, но при этом не терять 2 цели вообще)
+        # Фильтр целей относительно текущей цены (но не теряем 2 цели вообще)
         down_filtered = [x for x in down_t if x < btc_close]
         up_filtered = [x for x in up_t if x > btc_close]
         down_t = (down_filtered[:2] if down_filtered else down_t[:2])
@@ -612,9 +606,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
-        # ✅ IMPORTANT FIX:
-        # compute_action() читает load_last_state().
-        # Сначала сохраняем текущее состояние, затем считаем action.
+        # ✅ Save state BEFORE compute_action()
         try:
             save_state(
                 tf=tf,
@@ -635,13 +627,12 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         except Exception:
             pass
 
-        # ✅ Action Engine (real)
         act = compute_action(tf=tf)
 
-        # ✅ MTF context (H1 sees H4+D1; H4 sees D1)
-        mtf_context = _build_mtf_context(tf, btc_close_for_dist=btc_close)
+        # ✅ MTF context (report-only)
+        mtf_context = _build_mtf_context(("MANUAL" if manual else tf), btc_close_for_dist=btc_close)
 
-        view = MarketView(
+        return MarketView(
             tf=("MANUAL" if manual else tf),
             ts=ts,
             state_title=state_title,
@@ -671,157 +662,8 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             mtf_context=mtf_context,
         )
 
-        return view
-        def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
-    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-        conn.execute("SET TIME ZONE 'UTC';")
 
-        btc = _fetch_latest_snapshot(conn, "BTC-USDT", tf)
-        eth = _fetch_latest_snapshot(conn, "ETH-USDT", tf)
-        if not btc or not eth:
-            raise RuntimeError(f"Not enough snapshots for tf={tf}. Run /mm_snapshots a few times.")
-
-        ts = btc["ts"]
-        btc_close = float(btc["close"])
-
-        btc_prev = _fetch_prev_snapshot(conn, "BTC-USDT", tf, ts)
-        eth_prev = _fetch_prev_snapshot(conn, "ETH-USDT", tf, ts)
-
-        btc_meta = btc.get("meta_json") or {}
-        eth_meta = eth.get("meta_json") or {}
-
-        btc_oi = _extract_oi(btc_meta)
-        eth_oi = _extract_oi(eth_meta)
-        btc_prev_oi = _extract_oi(btc_prev.get("meta_json") or {}) if btc_prev else None
-        eth_prev_oi = _extract_oi(eth_prev.get("meta_json") or {}) if eth_prev else None
-
-        btc_oi_d = _oi_delta_pct(btc_oi, btc_prev_oi)
-        eth_oi_d = _oi_delta_pct(eth_oi, eth_prev_oi)
-
-        btc_fr, btc_fr_lbl = _extract_funding(btc_meta)
-        eth_fr, eth_fr_lbl = _extract_funding(eth_meta)
-
-        # ─────────────────────────────────────────
-        # 🔹 LIQUIDITY TARGETS (current TF only)
-        # ─────────────────────────────────────────
-        down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
-        down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
-
-        # фильтр по цене (но не теряем цели полностью)
-        down_filtered = [x for x in down_t if x < btc_close]
-        up_filtered = [x for x in up_t if x > btc_close]
-
-        down_t = down_filtered[:2] if down_filtered else down_t[:2]
-        up_t = up_filtered[:2] if up_filtered else up_t[:2]
-
-        # ─────────────────────────────────────────
-        # 🔹 EVENT → STATE (context-aware)
-        # ─────────────────────────────────────────
-        st = _event_driven_state(
-            tf,
-            btc_close=btc_close,
-            dn_targets=down_t,
-            up_targets=up_t,
-        )
-
-        state_title = st["state_title"]
-        state_icon = st["state_icon"]
-        phase = st["phase"]
-        prob_up = int(st["prob_up"])
-        prob_down = int(st["prob_down"])
-        execution = st["execution"]
-        whats_next = st["whats_next"]
-        invalidation = st["invalidation"]
-        key_zone = st.get("key_zone") or key_zone0
-
-        # ─────────────────────────────────────────
-        # 🔹 ETH CONFIRMATION
-        # ─────────────────────────────────────────
-        eth_conf = "нейтрален 🟡"
-
-        if state_icon in ("🟢", "⚠️"):
-            if eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
-                eth_conf = "подтверждает сценарий ✅"
-            elif eth_fr is not None and eth_fr <= FUNDING_BIAS_SHORT:
-                eth_conf = "расходится ⚠️ (снижает уверенность)"
-
-        elif state_icon == "🔴":
-            if eth_fr is not None and eth_fr <= FUNDING_BIAS_SHORT:
-                eth_conf = "подтверждает сценарий ✅"
-            elif eth_fr is not None and eth_fr >= FUNDING_BIAS_LONG:
-                eth_conf = "расходится ⚠️ (снижает уверенность)"
-
-        # корректировка вероятностей от ETH
-        if "подтверждает" in eth_conf:
-            if state_icon == "🟢":
-                prob_up = min(85, prob_up + 5)
-                prob_down = 100 - prob_up
-            elif state_icon == "🔴":
-                prob_down = min(85, prob_down + 5)
-                prob_up = 100 - prob_down
-
-        if "расходится" in eth_conf:
-            if state_icon == "🟢":
-                prob_up = max(55, prob_up - 8)
-                prob_down = 100 - prob_up
-            elif state_icon == "🔴":
-                prob_down = max(55, prob_down - 8)
-                prob_up = 100 - prob_down
-
-        # ─────────────────────────────────────────
-        # 🔹 SAVE STATE → ACTION ENGINE
-        # ─────────────────────────────────────────
-        try:
-            save_state(
-                tf=tf,
-                ts=ts,
-                payload={
-                    "state_title": state_title,
-                    "state_icon": state_icon,
-                    "phase": phase,
-                    "prob_down": int(prob_down),
-                    "prob_up": int(prob_up),
-                    "btc_down_targets": down_t,
-                    "btc_up_targets": up_t,
-                    "key_zone": key_zone,
-                    "eth_confirmation": eth_conf,
-                    "event_type": st.get("event_type"),
-                },
-            )
-        except Exception:
-            pass
-
-        act = compute_action(tf=tf)
-
-        return MarketView(
-            tf=("MANUAL" if manual else tf),
-            ts=ts,
-            state_title=state_title,
-            state_icon=state_icon,
-            phase=phase,
-            prob_down=int(prob_down),
-            prob_up=int(prob_up),
-            btc_down_targets=down_t,
-            btc_up_targets=up_t,
-            key_zone=key_zone,
-            btc_oi=btc_oi,
-            btc_oi_delta=btc_oi_d,
-            btc_funding=btc_fr,
-            btc_funding_label=btc_fr_lbl,
-            eth_oi=eth_oi,
-            eth_oi_delta=eth_oi_d,
-            eth_funding=eth_fr,
-            eth_funding_label=eth_fr_lbl,
-            execution=execution,
-            whats_next=whats_next,
-            invalidation=invalidation,
-            eth_confirmation=eth_conf,
-            action=act.action,
-            action_confidence=int(act.confidence),
-            action_reason=str(act.reason),
-            action_event_type=act.event_type,
-        )
-        def render_report(view: MarketView) -> str:
+def render_report(view: MarketView) -> str:
     title = TF_LABELS.get(view.tf, view.tf)
     lines: List[str] = []
 
@@ -835,6 +677,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
     lines.append(f"Вероятность: ↓ {view.prob_down}% | ↑ {view.prob_up}%")
     lines.append("")
 
+    # Action Engine block
     lines.append("ACTION ENGINE (v0):")
     lines.append(f"• Decision: {view.action} | confidence: {view.action_confidence}%")
     if view.action_event_type:
@@ -856,6 +699,31 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
     if view.key_zone:
         lines.append("")
         lines.append(f"Ключевая зона: {view.key_zone}")
+
+    # ✅ MTF Context block
+    if view.mtf_context:
+        lines.append("")
+        lines.append("MTF контекст (старшие ТФ):")
+        for c in view.mtf_context:
+            tf = str(c.get("tf") or "")
+            title2 = str(c.get("title") or tf)
+            st_title = str(c.get("state_title") or "—")
+            st_icon = str(c.get("state_icon") or "")
+            prob_dn = int(c.get("prob_down") or 0)
+            prob_up = int(c.get("prob_up") or 0)
+            kz = c.get("key_zone")
+            dn = c.get("down_targets") or []
+            up = c.get("up_targets") or []
+
+            line = f"• {title2}: {st_title} {st_icon} | ↓{prob_dn}% ↑{prob_up}%"
+            if kz:
+                line += f" | zone: {kz}"
+            lines.append(line)
+
+            if dn:
+                lines.append("  - DN: " + " → ".join(_fmt_price(x) for x in dn[:2]))
+            if up:
+                lines.append("  - UP: " + " → ".join(_fmt_price(x) for x in up[:2]))
 
     lines.append("")
     lines.append("Деривативы (OKX SWAP):")
