@@ -147,7 +147,7 @@ def _targets_from_liq_levels(tf: str) -> Tuple[List[float], List[float], Optiona
 
     dn = _flt_list(liq.get("dn_targets"))
     up = _flt_list(liq.get("up_targets"))
-    key_zone = liq.get("key_zone")  # на будущее
+    key_zone = liq.get("key_zone")  # optional
     return dn[:2], up[:2], (str(key_zone) if key_zone else None)
 
 
@@ -175,18 +175,145 @@ def _merge_with_persisted(tf: str, down: List[float], up: List[float], key_zone:
     return _flt_list(down), _flt_list(up), (str(key_zone) if key_zone else None)
 
 
-def _event_driven_state(tf: str) -> Dict[str, Any]:
+# ---------------------------
+# Context helpers for report
+# ---------------------------
+
+def _clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(x)))
+
+
+def _pct_to_int(down: int) -> Tuple[int, int]:
+    down = _clamp_int(down, 0, 100)
+    return down, 100 - down
+
+
+def _nearest_dist_pct(price: float, level: Optional[float]) -> Optional[float]:
+    if level is None or level == 0:
+        return None
+    try:
+        return abs(price / float(level) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _phase_from_context(et: str, *, price: float, zone: Optional[float], dn_targets: List[float], up_targets: List[float]) -> str:
+    """
+    Более "живой" этап, который меняется в зависимости от того,
+    насколько цена близко к целям/зоне и был ли sweep/reclaim.
+    """
+    et = (et or "").strip()
+
+    if et in ("reclaim_up", "reclaim_down"):
+        return "Возврат цены подтверждён"
+
+    if et in ("sweep_high", "sweep_low"):
+        return "Ликвидность снята"
+
+    if et == "decision_zone":
+        return "Ожидается возврат цены (reclaim)"
+
+    # pressure_* и wait — контекстные фазы
+    # Если цена уже рядом с ближайшей целью в сторону давления — это "подход к цели"
+    if et in ("pressure_down", "wait"):
+        nearest_dn = dn_targets[0] if dn_targets else None
+        d = _nearest_dist_pct(price, nearest_dn)
+        if d is not None and d <= 0.20:
+            return "Подход к цели снизу (ждём sweep_low)"
+        if zone is not None:
+            dz = _nearest_dist_pct(price, float(zone)) if zone else None
+            if dz is not None and dz <= 0.20:
+                return "У ключевой зоны (ждём реакцию)"
+        return "Давление без реакции (WAIT)"
+
+    if et == "pressure_up":
+        nearest_up = up_targets[0] if up_targets else None
+        d = _nearest_dist_pct(price, nearest_up)
+        if d is not None and d <= 0.20:
+            return "Подход к цели сверху (ждём sweep_high)"
+        if zone is not None:
+            dz = _nearest_dist_pct(price, float(zone)) if zone else None
+            if dz is not None and dz <= 0.20:
+                return "У ключевой зоны (ждём реакцию)"
+        return "Давление без реакции (WAIT)"
+
+    return "—"
+
+
+def _probs_from_context(et: str, *, price: float, dn_targets: List[float], up_targets: List[float]) -> Tuple[int, int]:
+    """
+    Вероятности больше не "железобетонные" по одному событию.
+    Они слегка реагируют на то, насколько цена близко к ближайшей цели.
+    """
+    et = (et or "").strip()
+
+    # базовые (как было), но дальше будет контекстная поправка
+    if et == "pressure_down":
+        down = 60
+    elif et == "pressure_up":
+        down = 40
+    elif et == "sweep_low":
+        down = 66
+    elif et == "sweep_high":
+        down = 32
+    elif et == "reclaim_down":
+        down = 66
+    elif et == "reclaim_up":
+        down = 34
+    elif et == "decision_zone":
+        # decision_zone без side тут нейтральный — side учтём выше в state
+        down = 50
+    else:
+        down = 52  # wait/unknown
+
+    # контекст: если цена уже почти у ближайшей цели в сторону движения,
+    # уверенность чуть снижаем (часто это зона реакции/контрдвижения)
+    # Если далеко — оставляем базу.
+    if et in ("pressure_down", "sweep_low", "reclaim_down"):
+        nearest_dn = dn_targets[0] if dn_targets else None
+        d = _nearest_dist_pct(price, nearest_dn)
+        if d is not None:
+            if d <= 0.20:
+                down -= 6
+            elif d <= 0.50:
+                down -= 3
+
+    if et in ("pressure_up", "sweep_high", "reclaim_up"):
+        nearest_up = up_targets[0] if up_targets else None
+        d = _nearest_dist_pct(price, nearest_up)
+        if d is not None:
+            if d <= 0.20:
+                down += 6
+            elif d <= 0.50:
+                down += 3
+
+    down = _clamp_int(down, 45, 75) if et.startswith("pressure_") else _clamp_int(down, 25, 85)
+    return _pct_to_int(down)
+
+
+def _event_driven_state(
+    tf: str,
+    *,
+    btc_close: float,
+    dn_targets: List[float],
+    up_targets: List[float],
+) -> Dict[str, Any]:
     """
     Берём последнее событие из mm_market_events и мапим в состояние отчёта.
+    + Улучшены:
+      - этап (phase) — зависит от контекста
+      - вероятности — слегка зависят от расстояния до ближайшей цели
+      - тексты pressure_* стали менее "агрессивными" (это всё равно режим WAIT)
     """
     ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
     if not ev:
+        prob_down, prob_up = _probs_from_context("wait", price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
         return {
             "state_title": "ОЖИДАНИЕ",
             "state_icon": "🟡",
             "phase": "—",
-            "prob_up": 48,
-            "prob_down": 52,
+            "prob_up": prob_up,
+            "prob_down": prob_down,
             "execution": "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона.",
             "whats_next": ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"],
             "invalidation": "—",
@@ -199,57 +326,21 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
     zone = ev.get("zone")
     key_zone = None
 
-    # ✅ pressure events
-    if et == "pressure_down":
-        return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
-            "state_icon": "🔴",
-            "phase": "Давление подтверждено",
-            "prob_up": 40,
-            "prob_down": 60,
-            "execution": "есть давление вниз — режим внимательного WAIT: ждём снятие ликвидности снизу (sweep_low) и затем reclaim.",
-            "whats_next": ["Следим за sweep_low в районе целей", "После sweep — ждём reclaim (возврат над уровнем)"],
-            "invalidation": "Сильный возврат/закреп выше ключевых уровней (смена давления)",
-            "key_zone": zone,
-            "event_type": et,
-        }
-
-    if et == "pressure_up":
-        return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
-            "state_icon": "🟢",
-            "phase": "Давление подтверждено",
-            "prob_up": 60,
-            "prob_down": 40,
-            "execution": "есть давление вверх — режим внимательного WAIT: ждём снятие ликвидности сверху (sweep_high) и затем reclaim.",
-            "whats_next": ["Следим за sweep_high в районе целей", "После sweep — ждём reclaim (возврат под уровень)"],
-            "invalidation": "Сильный возврат/закреп ниже ключевых уровней (смена давления)",
-            "key_zone": zone,
-            "event_type": et,
-        }
-
-    if et == "wait":
-        return {
-            "state_title": "ОЖИДАНИЕ",
-            "state_icon": "🟡",
-            "phase": "—",
-            "prob_up": 48,
-            "prob_down": 52,
-            "execution": "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона.",
-            "whats_next": ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"],
-            "invalidation": "—",
-            "key_zone": zone,
-            "event_type": et,
-        }
-
+    # decision_zone с side может быть направленным
     if et == "decision_zone":
         key_zone = zone or ("H4 RANGE HIGH" if side == "up" else "H4 RANGE LOW")
+        if side == "up":
+            prob_down, prob_up = 20, 80
+        elif side == "down":
+            prob_down, prob_up = 80, 20
+        else:
+            prob_down, prob_up = 50, 50
         return {
             "state_title": "ЗОНА ПРИНЯТИЯ РЕШЕНИЯ",
             "state_icon": "⚠️",
-            "phase": "Ожидается возврат цены (reclaim)",
-            "prob_up": 80 if side == "up" else 20,
-            "prob_down": 20 if side == "up" else 80,
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": int(prob_up),
+            "prob_down": int(prob_down),
             "execution": "зона решения — вход только после реакции/удержания; без подтверждения лучше WAIT.",
             "whats_next": ["Ждём подтверждение реакции (возврат/удержание)", "Затем ретест зоны без обновления экстремума"],
             "invalidation": "Принятие цены за зоной (H4 закрытие) без возврата",
@@ -257,14 +348,46 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
             "event_type": et,
         }
 
-    if et == "sweep_high":
+    # pressure events
+    if et == "pressure_down":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
         return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
+            "state_title": "ДАВЛЕНИЕ ВНИЗ",
+            "state_icon": "🔴",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "есть давление вниз — режим внимательного WAIT: ждём sweep_low и затем reclaim.",
+            "whats_next": ["Следим за sweep_low в районе целей", "После sweep — ждём reclaim (возврат над уровнем)"],
+            "invalidation": "Сильный возврат/закреп выше ключевых уровней (смена давления)",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "pressure_up":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
+        return {
+            "state_title": "ДАВЛЕНИЕ ВВЕРХ",
             "state_icon": "🟢",
-            "phase": "Ликвидность снята",
-            "prob_up": 68,
-            "prob_down": 32,
-            "execution": "ждать sweep вверх → reclaim; шорт/контртрейд — только после возврата под зону, иначе не спешить.",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "есть давление вверх — режим внимательного WAIT: ждём sweep_high и затем reclaim.",
+            "whats_next": ["Следим за sweep_high в районе целей", "После sweep — ждём reclaim (возврат под уровень)"],
+            "invalidation": "Сильный возврат/закреп ниже ключевых уровней (смена давления)",
+            "key_zone": zone,
+            "event_type": et,
+        }
+
+    if et == "sweep_high":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
+        return {
+            "state_title": "СНЯТИЕ ЛИКВИДНОСТИ СВЕРХУ",
+            "state_icon": "🟢",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "sweep сверху → ждём reclaim; контртрейд — только после возврата под зону.",
             "whats_next": ["Ликвидность по хаям снята", "Теперь ждём возврат (reclaim) под уровнем"],
             "invalidation": "H4 закрытие ниже ближайшей цели снизу",
             "key_zone": zone,
@@ -272,13 +395,14 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
         }
 
     if et == "sweep_low":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
         return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
+            "state_title": "СНЯТИЕ ЛИКВИДНОСТИ СНИЗУ",
             "state_icon": "🔴",
-            "phase": "Ликвидность снята",
-            "prob_up": 34,
-            "prob_down": 66,
-            "execution": "ждать sweep вниз → reclaim; лимитный набор — ближе к цели вниз, подтверждение — возврат над зоной.",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "sweep снизу → ждём reclaim; агрессия только после подтверждения возврата.",
             "whats_next": ["Ликвидность по лоям снята", "Теперь ждём возврат (reclaim) над уровнем"],
             "invalidation": "H4 закрытие выше ближайшей цели сверху",
             "key_zone": zone,
@@ -286,13 +410,14 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
         }
 
     if et == "reclaim_down":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
         return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВНИЗ",
+            "state_title": "RECLAIM ВНИЗ ПОДТВЕРЖДЁН",
             "state_icon": "🔴",
-            "phase": "Возврат цены подтверждён",
-            "prob_up": 34,
-            "prob_down": 66,
-            "execution": "ждать ретест зоны без обновления лоя; агрессия только после подтверждения.",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "reclaim вниз подтверждён: ждём ретест зоны без обновления экстремума.",
             "whats_next": ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления лоя"],
             "invalidation": "H4 закрытие выше ближайшей цели сверху",
             "key_zone": zone,
@@ -300,25 +425,28 @@ def _event_driven_state(tf: str) -> Dict[str, Any]:
         }
 
     if et == "reclaim_up":
+        prob_down, prob_up = _probs_from_context(et, price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
         return {
-            "state_title": "АКТИВНОЕ ДАВЛЕНИЕ ВВЕРХ",
+            "state_title": "RECLAIM ВВЕРХ ПОДТВЕРЖДЁН",
             "state_icon": "🟢",
-            "phase": "Возврат цены подтверждён",
-            "prob_up": 66,
-            "prob_down": 34,
-            "execution": "ждать ретест зоны без обновления хая; агрессия только после подтверждения.",
+            "phase": _phase_from_context(et, price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+            "prob_up": prob_up,
+            "prob_down": prob_down,
+            "execution": "reclaim вверх подтверждён: ждём ретест зоны без обновления экстремума.",
             "whats_next": ["Reclaim подтверждён", "Дальше: ждём ретест зоны без обновления хая"],
             "invalidation": "H4 закрытие ниже ближайшей цели снизу",
             "key_zone": zone,
             "event_type": et,
         }
 
+    # wait / unknown
+    prob_down, prob_up = _probs_from_context(et or "wait", price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
     return {
         "state_title": "ОЖИДАНИЕ",
         "state_icon": "🟡",
-        "phase": "—",
-        "prob_up": 48,
-        "prob_down": 52,
+        "phase": _phase_from_context("wait", price=btc_close, zone=zone, dn_targets=dn_targets, up_targets=up_targets),
+        "prob_up": prob_up,
+        "prob_down": prob_down,
         "execution": "явного перекоса нет — режим WAIT, следим за EQH/EQL и выходом из диапазона.",
         "whats_next": ["Ждём появления перекоса/выхода из диапазона", "Следим за EQH/EQL поблизости"],
         "invalidation": "—",
@@ -399,14 +527,16 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        # Фильтрация целей относительно текущей цены (чтобы "Вниз" не показывался выше цены)
+        # Фильтрация целей относительно текущей цены
+        # (чтобы "Вниз" не показывался выше цены, но при этом не терять 2 цели вообще)
         down_filtered = [x for x in down_t if x < btc_close]
         up_filtered = [x for x in up_t if x > btc_close]
-        down_t = down_filtered or down_t
-        up_t = up_filtered or up_t
+        down_t = (down_filtered[:2] if down_filtered else down_t[:2])
+        up_t = (up_filtered[:2] if up_filtered else up_t[:2])
 
-        # event-driven state
-        st = _event_driven_state(tf)
+        # event-driven state + context-aware phase/probs
+        st = _event_driven_state(tf, btc_close=btc_close, dn_targets=down_t, up_targets=up_t)
+
         state_title = st["state_title"]
         state_icon = st["state_icon"]
         phase = st["phase"]
@@ -448,9 +578,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
 
         # ✅ IMPORTANT FIX:
         # compute_action() читает load_last_state().
-        # Чтобы Action Engine не видел "старый WAIT" (если только что пришёл pressure/sweep),
-        # сначала сохраняем текущее состояние отчёта в mm_events (mm_state),
-        # а уже потом считаем action.
+        # Сначала сохраняем текущее состояние, затем считаем action.
         try:
             save_state(
                 tf=tf,
