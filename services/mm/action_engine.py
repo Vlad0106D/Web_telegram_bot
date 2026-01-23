@@ -26,11 +26,110 @@ class ActionDecision:
     event_type: Optional[str]
 
 
-# ---------------- MTF helpers ----------------
+# ---------------- DB helpers ----------------
+def _db_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is empty")
+    return url
 
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _get_table_columns(conn: psycopg.Connection, table: str) -> List[str]:
+    sql = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema='public' AND table_name=%s
+    ORDER BY ordinal_position;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (table,))
+        rows = cur.fetchall() or []
+    return [r["column_name"] for r in rows]
+
+
+def _fetch_latest_btc_snapshot(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
+    sql = """
+    SELECT ts, close, meta_json
+    FROM mm_snapshots
+    WHERE symbol='BTC-USDT' AND tf=%s
+    ORDER BY ts DESC
+    LIMIT 1;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (tf,))
+        return cur.fetchone()
+
+
+def _fetch_pending_actions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
+    # максимально “мягко”: если в таблице нет колонки status — fallback через payload_json
+    cols = set(_get_table_columns(conn, "mm_action_engine"))
+    if "status" in cols:
+        sql = """
+        SELECT *
+        FROM mm_action_engine
+        WHERE symbol='BTC-USDT' AND tf=%s AND status='pending'
+        ORDER BY action_ts ASC, id ASC;
+        """
+        params = (tf,)
+    else:
+        sql = """
+        SELECT *
+        FROM mm_action_engine
+        WHERE symbol='BTC-USDT'
+          AND tf=%s
+          AND COALESCE(payload_json->>'status','')='pending'
+        ORDER BY (payload_json->>'action_ts') ASC, id ASC;
+        """
+        params = (tf,)
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall() or []
+
+
+def _get_latest_action_row(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
+    sql = """
+    SELECT *
+    FROM mm_action_engine
+    WHERE symbol='BTC-USDT' AND tf=%s
+    ORDER BY id DESC
+    LIMIT 1;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (tf,))
+        return cur.fetchone()
+
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _safe_int(x) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+# ---------------- MTF helpers ----------------
 def _mtf_stack(tf: str) -> List[str]:
     """
     Какие ТФ должны подтверждать текущий.
+    По договорённости:
+      H1 смотрит H4 + D1
+      H4 смотрит D1
+      D1 (позже) будет смотреть W1, но пока нет
     """
     if tf == "H1":
         return ["H4", "D1"]
@@ -40,6 +139,10 @@ def _mtf_stack(tf: str) -> List[str]:
 
 
 def _state_allows_long(st: Dict[str, Any]) -> bool:
+    """
+    Блокирует LONG, если HTF явно медвежий/перекос вниз.
+    Мягкий режим: если состояния нет — не блокируем.
+    """
     if not st:
         return True
     if st.get("state_icon") == "🔴":
@@ -50,6 +153,10 @@ def _state_allows_long(st: Dict[str, Any]) -> bool:
 
 
 def _state_allows_short(st: Dict[str, Any]) -> bool:
+    """
+    Блокирует SHORT, если HTF явно бычий/перекос вверх.
+    Мягкий режим: если состояния нет — не блокируем.
+    """
     if not st:
         return True
     if st.get("state_icon") == "🟢":
@@ -59,11 +166,7 @@ def _state_allows_short(st: Dict[str, Any]) -> bool:
     return True
 
 
-def _mtf_filter(
-    *,
-    tf: str,
-    desired_action: ActionType,
-) -> Tuple[bool, str]:
+def _mtf_filter(*, tf: str, desired_action: ActionType) -> Tuple[bool, str]:
     """
     Проверяет, не конфликтует ли action со старшими ТФ.
     """
@@ -73,16 +176,15 @@ def _mtf_filter(
 
     for htf in stack:
         st = load_last_state(tf=htf)
-        if desired_action == "LONG_ALLOWED" and not _state_allows_long(st):
+        if desired_action == "LONG_ALLOWED" and not _state_allows_long(st or {}):
             return False, f"MTF conflict: {htf} против LONG"
-        if desired_action == "SHORT_ALLOWED" and not _state_allows_short(st):
+        if desired_action == "SHORT_ALLOWED" and not _state_allows_short(st or {}):
             return False, f"MTF conflict: {htf} против SHORT"
 
     return True, "mtf_confirmed"
 
 
 # ---------------- Core logic ----------------
-
 def compute_action(tf: str) -> ActionDecision:
     """
     Action Mode v1 (MTF-aware)
@@ -90,6 +192,7 @@ def compute_action(tf: str) -> ActionDecision:
     Возвращает разрешение направления или NONE.
     """
 
+    # --- читаем последнее агрегированное состояние (его пишет report_engine через save_state) ---
     st = load_last_state(tf=tf)
     if not st:
         return ActionDecision(
@@ -105,6 +208,7 @@ def compute_action(tf: str) -> ActionDecision:
     state_title = st.get("state_title", "")
     last_event = st.get("event_type")
 
+    # --- если рынок в WAIT ---
     if state_title == "ОЖИДАНИЕ":
         return ActionDecision(
             tf=tf,
@@ -114,16 +218,13 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=last_event,
         )
 
+    # --- читаем последнее рыночное событие ---
     ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
     ev_type = ev.get("event_type") if ev else None
     side = ev.get("side") if ev else None
 
     # --- LONG candidate ---
-    if (
-        prob_up >= 55
-        and ev_type in ("reclaim_up", "decision_zone")
-        and side in ("up", None)
-    ):
+    if prob_up >= 55 and ev_type in ("reclaim_up", "decision_zone") and side in ("up", None):
         ok, why = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
         if ok:
             return ActionDecision(
@@ -142,11 +243,7 @@ def compute_action(tf: str) -> ActionDecision:
         )
 
     # --- SHORT candidate ---
-    if (
-        prob_down >= 55
-        and ev_type in ("reclaim_down", "decision_zone")
-        and side in ("down", None)
-    ):
+    if prob_down >= 55 and ev_type in ("reclaim_down", "decision_zone") and side in ("down", None):
         ok, why = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
         if ok:
             return ActionDecision(
@@ -164,6 +261,7 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=ev_type,
         )
 
+    # --- fallback ---
     return ActionDecision(
         tf=tf,
         action="NONE",
@@ -171,6 +269,7 @@ def compute_action(tf: str) -> ActionDecision:
         reason="Условия не выполнены",
         event_type=ev_type,
     )
+
 
 def _thresholds(tf: str) -> Tuple[float, float, int]:
     """
@@ -202,9 +301,7 @@ def _calc_delta_pct(curr_close: float, action_close: float) -> float:
     if action_close == 0:
         return 0.0
     return (curr_close / action_close - 1.0) * 100.0
-
-
-def _insert_action_row(
+    def _insert_action_row(
     conn: psycopg.Connection,
     *,
     tf: str,
@@ -250,7 +347,6 @@ def _insert_action_row(
         "created_at": _now_utc().isoformat(),
     }
 
-    # формируем insert по существующим колонкам
     values: Dict[str, Any] = {}
     if "ts" in cols:
         values["ts"] = action_ts
@@ -275,13 +371,7 @@ def _insert_action_row(
     if "payload_json" in cols:
         values["payload_json"] = Jsonb(payload)
 
-    # если payload_json нет — попробуем хотя бы reason/status через meta_json-подобную колонку
-    if "payload_json" not in cols:
-        # безопасный fallback: не падаем, просто не пишем “лишнее”
-        pass
-
     if not values:
-        # если таблица вообще “другая” — лучше явно упасть, чтобы ты увидел и мы подстроились
         raise RuntimeError("mm_action_engine: no compatible columns found to insert")
 
     keys = list(values.keys())
@@ -352,7 +442,6 @@ def _update_action_eval(
         params.append(Jsonb(payload))
 
     if not sets:
-        # нечего апдейтить — но хотя бы не падаем
         return
 
     sql = f"UPDATE mm_action_engine SET {', '.join(sets)} WHERE id=%s;"
@@ -388,7 +477,7 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
 
         out["latest_ts"] = ts.isoformat()
 
-        # --- 3) insert action if any ---
+        # --- insert action if any ---
         decision = compute_action(tf)
         if decision.action != "NONE":
             inserted = _insert_action_row(
@@ -410,7 +499,7 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
             out["reason"] = decision.reason
             out["event_type"] = decision.event_type
 
-        # --- 4) evaluate pending ---
+        # --- evaluate pending ---
         pend = _fetch_pending_actions(conn, tf)
         evaluated = 0
 
@@ -418,7 +507,6 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
             # пропускаем “свеже-созданный” pending на этой же свече
             action_ts = r.get("action_ts")
             if action_ts is None:
-                # fallback из payload_json
                 pj = r.get("payload_json") or {}
                 if isinstance(pj, dict) and pj.get("action_ts"):
                     try:
@@ -439,12 +527,13 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
             if action_close_f is None:
                 continue
 
-            act = r.get("action") or ((r.get("payload_json") or {}) if isinstance(r.get("payload_json"), dict) else {}).get("action")
+            act = r.get("action") or (
+                ((r.get("payload_json") or {}) if isinstance(r.get("payload_json"), dict) else {}).get("action")
+            )
             if act not in ("LONG_ALLOWED", "SHORT_ALLOWED"):
                 continue
 
-            # bars_passed: считаем по количеству закрытых свечей после action_ts
-            # (точно и без “тиков”): count snapshots between (action_ts, ts]
+            # bars_passed: count snapshots between (action_ts, ts]
             sql_bars = """
             SELECT COUNT(*) AS n
             FROM mm_snapshots
@@ -467,7 +556,6 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
                     status = "failed" if delta_pct < 0 else "need_more_time"
 
             if act == "SHORT_ALLOWED":
-                # для шорта подтверждение — движение вниз (delta отрицательная)
                 if delta_pct <= -confirm_pct:
                     status = "confirmed"
                 elif delta_pct >= fail_pct:
@@ -475,8 +563,7 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
                 elif bars_passed >= max_bars:
                     status = "failed" if delta_pct > 0 else "need_more_time"
 
-            # если всё ещё “need_more_time” — оставляем pending, чтобы не засорять
-            # но фиксируем метрики в payload (и в колонках, если есть)
+            # если всё ещё need_more_time — оставляем pending
             write_status: EvalStatus = status
             if status == "need_more_time":
                 write_status = "pending"
