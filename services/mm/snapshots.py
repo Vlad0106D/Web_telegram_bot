@@ -26,10 +26,28 @@ def _db_url() -> str:
 
 
 def _tf_to_okx(tf: str) -> str:
-    m = {"H1": "1H", "H4": "4H", "D1": "1D", "W1": "1W"}
+    # ВАЖНО: для D1/W1 используем UTC бары, иначе OKX может отдавать "не то закрытие"
+    m = {
+        "H1": "1H",
+        "H4": "4H",
+        "D1": "1Dutc",
+        "W1": "1Wutc",
+    }
     if tf not in m:
         raise ValueError(f"Unsupported tf: {tf}")
     return m[tf]
+
+
+def _tf_seconds(tf: str) -> int:
+    if tf == "H1":
+        return 3600
+    if tf == "H4":
+        return 4 * 3600
+    if tf == "D1":
+        return 24 * 3600
+    if tf == "W1":
+        return 7 * 24 * 3600
+    raise ValueError(tf)
 
 
 def _swap_inst_id(spot_symbol: str) -> str:
@@ -92,7 +110,18 @@ def _safe_int(x) -> Optional[int]:
         return None
 
 
-async def fetch_last_closed_candle(client: httpx.AsyncClient, symbol: str, tf: str) -> Tuple[datetime, Dict]:
+async def fetch_last_closed_candle(
+    client: httpx.AsyncClient,
+    symbol: str,
+    tf: str,
+) -> Tuple[datetime, Dict]:
+    """
+    OKX отдаёт 2 последних бара. Важно выбрать именно ЗАКРЫТЫЙ.
+    Логика:
+      - берём data[0] (самый свежий бар) и проверяем, "должен ли он уже быть закрыт"
+      - если уже закрыт — используем его
+      - иначе — берём data[1] (предыдущий бар, гарантированно закрыт)
+    """
     params = {"instId": symbol, "bar": _tf_to_okx(tf), "limit": "2"}
     r = await client.get(OKX_CANDLES, params=params)
     r.raise_for_status()
@@ -100,10 +129,20 @@ async def fetch_last_closed_candle(client: httpx.AsyncClient, symbol: str, tf: s
     if len(data) < 2:
         raise RuntimeError(f"Not enough candles for {symbol} {tf}")
 
-    row = data[1]  # закрытая свеча
-    cndl = _parse_okx_candle(row)
+    c0 = _parse_okx_candle(data[0])
+    c1 = _parse_okx_candle(data[1])
 
-    ts = datetime.fromtimestamp(cndl["ts_ms"] / 1000, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    ts0 = datetime.fromtimestamp(c0["ts_ms"] / 1000, tz=timezone.utc)
+
+    # если бар уже перешёл свою длительность — считаем закрытым
+    if now >= ts0 + timedelta(seconds=_tf_seconds(tf)):
+        cndl = c0
+        ts = ts0
+    else:
+        cndl = c1
+        ts = datetime.fromtimestamp(c1["ts_ms"] / 1000, tz=timezone.utc)
+
     ts = _floor_ts(tf, ts)
     return ts, cndl
 
@@ -152,8 +191,8 @@ def _load_last_snapshot_ts(
     tfs: List[str],
 ) -> Dict[Tuple[str, str], Optional[datetime]]:
     """
-    Возвращает map[(symbol, tf)] = max(ts) из mm_snapshots.
-    Нужно, чтобы НЕ дергать цепочку дальше, если новая закрытая свеча еще не появилась.
+    map[(symbol, tf)] = max(ts) из mm_snapshots.
+    Нужно, чтобы НЕ писать каждый тик, если закрытая свеча ещё не появилась.
     """
     out: Dict[Tuple[str, str], Optional[datetime]] = {(s, tf): None for s in symbols for tf in tfs}
 
@@ -225,7 +264,7 @@ async def run_snapshots_once(
         with psycopg.connect(_db_url()) as conn:
             conn.execute("SET TIME ZONE 'UTC';")
 
-            # 1) Смотрим, что уже записано (чтобы НЕ писать каждый тик)
+            # 1) смотрим, что уже записано (чтобы НЕ писать каждый тик)
             last_ts_map = _load_last_snapshot_ts(conn, symbols=symbols, tfs=tfs)
 
             for symbol in symbols:
@@ -233,7 +272,7 @@ async def run_snapshots_once(
                     ts, cndl = await fetch_last_closed_candle(client, symbol, tf)
 
                     last_ts = last_ts_map.get((symbol, tf))
-                    # Если закрытая свеча уже есть в БД — ничего не делаем (и не триггерим downstream)
+                    # Если закрытая свеча уже есть в БД — ничего не делаем
                     if last_ts is not None and last_ts >= ts:
                         continue
 
