@@ -65,7 +65,6 @@ def _fetch_latest_btc_snapshot(conn: psycopg.Connection, tf: str) -> Optional[Di
 
 
 def _fetch_pending_actions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
-    # максимально “мягко”: если в таблице нет колонки status — fallback через payload_json
     cols = set(_get_table_columns(conn, "mm_action_engine"))
     if "status" in cols:
         sql = """
@@ -190,9 +189,12 @@ def compute_action(tf: str) -> ActionDecision:
     Action Mode v1 (MTF-aware)
     НЕ открывает сделки.
     Возвращает разрешение направления или NONE.
+
+    ✅ NEW:
+      LONG можно не только на reclaim_up, но и на accept_above
+      SHORT можно не только на reclaim_down, но и на accept_below
     """
 
-    # --- читаем последнее агрегированное состояние (его пишет report_engine через save_state) ---
     st = load_last_state(tf=tf)
     if not st:
         return ActionDecision(
@@ -208,7 +210,6 @@ def compute_action(tf: str) -> ActionDecision:
     state_title = st.get("state_title", "")
     last_event = st.get("event_type")
 
-    # --- если рынок в WAIT ---
     if state_title == "ОЖИДАНИЕ":
         return ActionDecision(
             tf=tf,
@@ -218,13 +219,15 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=last_event,
         )
 
-    # --- читаем последнее рыночное событие ---
     ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
-    ev_type = ev.get("event_type") if ev else None
-    side = ev.get("side") if ev else None
+    ev_type = (ev.get("event_type") if ev else None)
+    side = (ev.get("side") if ev else None)
+
+    long_events = ("reclaim_up", "accept_above", "decision_zone")
+    short_events = ("reclaim_down", "accept_below", "decision_zone")
 
     # --- LONG candidate ---
-    if prob_up >= 55 and ev_type in ("reclaim_up", "decision_zone") and side in ("up", None):
+    if prob_up >= 55 and ev_type in long_events and side in ("up", None):
         ok, why = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
         if ok:
             return ActionDecision(
@@ -243,7 +246,7 @@ def compute_action(tf: str) -> ActionDecision:
         )
 
     # --- SHORT candidate ---
-    if prob_down >= 55 and ev_type in ("reclaim_down", "decision_zone") and side in ("down", None):
+    if prob_down >= 55 and ev_type in short_events and side in ("down", None):
         ok, why = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
         if ok:
             return ActionDecision(
@@ -261,7 +264,6 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=ev_type,
         )
 
-    # --- fallback ---
     return ActionDecision(
         tf=tf,
         action="NONE",
@@ -269,8 +271,7 @@ def compute_action(tf: str) -> ActionDecision:
         reason="Условия не выполнены",
         event_type=ev_type,
     )
-
-
+    
 def _thresholds(tf: str) -> Tuple[float, float, int]:
     """
     Возвращает:
@@ -301,7 +302,8 @@ def _calc_delta_pct(curr_close: float, action_close: float) -> float:
     if action_close == 0:
         return 0.0
     return (curr_close / action_close - 1.0) * 100.0
-    
+
+
 def _insert_action_row(
     conn: psycopg.Connection,
     *,
@@ -317,7 +319,6 @@ def _insert_action_row(
     """
     cols = set(_get_table_columns(conn, "mm_action_engine"))
 
-    # антидубль: если последняя запись уже на этот action_ts (и тот же action) — не пишем
     last = _get_latest_action_row(conn, tf)
     if last:
         last_ts = (
@@ -332,7 +333,6 @@ def _insert_action_row(
         last_status = last.get("status") or (last.get("payload_json", {}) or {}).get("status")
         if last_ts == action_ts and last_action == decision.action:
             return False
-        # если action тот же и ещё pending — тоже не спамим
         if last_action == decision.action and str(last_status) == "pending":
             return False
 
@@ -478,7 +478,6 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
 
         out["latest_ts"] = ts.isoformat()
 
-        # --- insert action if any ---
         decision = compute_action(tf)
         if decision.action != "NONE":
             inserted = _insert_action_row(
@@ -500,12 +499,10 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
             out["reason"] = decision.reason
             out["event_type"] = decision.event_type
 
-        # --- evaluate pending ---
         pend = _fetch_pending_actions(conn, tf)
         evaluated = 0
 
         for r in pend:
-            # пропускаем “свеже-созданный” pending на этой же свече
             action_ts = r.get("action_ts")
             if action_ts is None:
                 pj = r.get("payload_json") or {}
@@ -534,7 +531,6 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
             if act not in ("LONG_ALLOWED", "SHORT_ALLOWED"):
                 continue
 
-            # bars_passed: count snapshots between (action_ts, ts]
             sql_bars = """
             SELECT COUNT(*) AS n
             FROM mm_snapshots
@@ -564,7 +560,6 @@ def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
                 elif bars_passed >= max_bars:
                     status = "failed" if delta_pct > 0 else "need_more_time"
 
-            # если всё ещё need_more_time — оставляем pending
             write_status: EvalStatus = status
             if status == "need_more_time":
                 write_status = "pending"
