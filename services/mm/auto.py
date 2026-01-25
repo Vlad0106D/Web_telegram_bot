@@ -1,3 +1,4 @@
+
 # services/mm/auto.py
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
 from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
-from services.mm.action_engine import update_action_engine_for_tf  # ✅ актуальный Action Engine
+from services.mm.action_engine import update_action_engine_for_tf  # ✅ актуальная логика записи/оценки
 
 log = logging.getLogger(__name__)
 
@@ -190,10 +191,11 @@ async def _mm_auto_tick(app: Application) -> None:
         if not tfs_to_process:
             return
 
+        # сразу отмечаем как seen, чтобы при исключениях не зациклиться на одном tf
         for tf, ts in tfs_to_process:
             seen[tf] = _iso(ts)
 
-        # 2) LIQUIDITY
+        # 2) LIQUIDITY MEMORY
         try:
             await update_liquidity_memory([tf for tf, _ in tfs_to_process])
         except Exception:
@@ -208,15 +210,7 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("MM auto: market events failed for tf=%s", tf)
 
-        # 4) BUILD VIEW (✅ важно: build_market_view() делает save_state() ДО Action Engine)
-        views: Dict[str, Any] = {}
-        for tf, _ in tfs_to_process:
-            try:
-                views[tf] = build_market_view(tf, manual=False)
-            except Exception:
-                log.exception("MM auto: build_market_view failed tf=%s", tf)
-
-        # 5) REPORTS (теперь view уже готов и state сохранён)
+        # 4) REPORTS + (важно) SAVE mm_state внутри build_market_view()
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
@@ -237,15 +231,21 @@ async def _mm_auto_tick(app: Application) -> None:
                 if _report_already_sent(conn, tf, latest_ts):
                     continue
 
-                view = views.get(tf)
-                if view is None:
-                    # fallback: если не получилось построить выше
-                    view = build_market_view(tf, manual=False)
+                # строим view -> внутри сохранится mm_state (save_state)
+                view = build_market_view(tf, manual=False)
 
+                # 5) ACTION ENGINE (после save_state!) — запись/оценка outcome
+                try:
+                    res = update_action_engine_for_tf(tf)
+                    log.info("MM action_engine %s: %s", tf, res)
+                except Exception:
+                    log.exception("MM auto: action engine failed tf=%s", tf)
+
+                # генерим текст и отправляем
                 text = render_report(view)
-
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
+                # отмечаем report_sent
                 payload = {
                     "kind": "auto",
                     "tf": tf,
@@ -260,14 +260,6 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 conn.rollback()
                 log.exception("MM auto: report failed tf=%s", tf)
-
-        # 6) ACTION ENGINE (✅ теперь state уже обновлён → запись в mm_action_engine пойдёт)
-        for tf, _ in tfs_to_process:
-            try:
-                res = update_action_engine_for_tf(tf)
-                log.info("MM action_engine %s: %s", tf, res)
-            except Exception:
-                log.exception("MM auto: action engine failed tf=%s", tf)
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
@@ -288,6 +280,7 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("JobQueue unavailable — cannot schedule MM auto")
         return created
 
+    # remove previous mm_auto jobs
     for job in list(jq.jobs()):
         if job and job.name and job.name.startswith("mm_auto"):
             try:
