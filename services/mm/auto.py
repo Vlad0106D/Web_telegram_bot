@@ -16,7 +16,7 @@ from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
 from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
-from services.mm.action_engine import update_action_engine_for_tf  # ✅ используем актуальный Action Engine
+from services.mm.action_engine import update_action_engine_for_tf  # ✅ актуальный Action Engine
 
 log = logging.getLogger(__name__)
 
@@ -208,15 +208,15 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("MM auto: market events failed for tf=%s", tf)
 
-        # 4) ACTION ENGINE (✅ актуальная логика из services/mm/action_engine.py)
+        # 4) BUILD VIEW (✅ важно: build_market_view() делает save_state() ДО Action Engine)
+        views: Dict[str, Any] = {}
         for tf, _ in tfs_to_process:
             try:
-                res = update_action_engine_for_tf(tf)
-                log.info("MM action_engine %s: %s", tf, res)
+                views[tf] = build_market_view(tf, manual=False)
             except Exception:
-                log.exception("MM auto: action engine failed tf=%s", tf)
+                log.exception("MM auto: build_market_view failed tf=%s", tf)
 
-        # 5) REPORTS
+        # 5) REPORTS (теперь view уже готов и state сохранён)
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
@@ -237,7 +237,11 @@ async def _mm_auto_tick(app: Application) -> None:
                 if _report_already_sent(conn, tf, latest_ts):
                     continue
 
-                view = build_market_view(tf, manual=False)
+                view = views.get(tf)
+                if view is None:
+                    # fallback: если не получилось построить выше
+                    view = build_market_view(tf, manual=False)
+
                 text = render_report(view)
 
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
@@ -256,6 +260,14 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 conn.rollback()
                 log.exception("MM auto: report failed tf=%s", tf)
+
+        # 6) ACTION ENGINE (✅ теперь state уже обновлён → запись в mm_action_engine пойдёт)
+        for tf, _ in tfs_to_process:
+            try:
+                res = update_action_engine_for_tf(tf)
+                log.info("MM action_engine %s: %s", tf, res)
+            except Exception:
+                log.exception("MM auto: action engine failed tf=%s", tf)
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
