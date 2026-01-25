@@ -28,12 +28,20 @@ _EVENT_PRIORITY: Dict[str, int] = {
     # strongest / actionable
     "reclaim_up": 100,
     "reclaim_down": 100,
+
+    # ✅ acceptance после sweep (закрепление за уровнем)
+    # ниже reclaim, но выше sweep (потому что это уже "развязка")
+    "accept_above": 98,
+    "accept_below": 98,
+
     "sweep_high": 90,
     "sweep_low": 90,
     "decision_zone": 80,
+
     # context / bias
     "pressure_up": 70,
     "pressure_down": 70,
+
     # heartbeat
     "wait": 0,
 }
@@ -83,8 +91,9 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
     Возвращает "последнее валидное событие состояния" для отчёта/ActionEngine.
 
     Ключевая логика:
-    - wait НЕ перебивает давление/sweep/reclaim/decision_zone.
+    - wait НЕ перебивает давление/sweep/reclaim/accept/decision_zone.
     - wait используется только как fallback, если в окне lookback нет "сильных" событий.
+    - выбор делаем по приоритету (а не просто самое последнее), чтобы "wait" не затирал контекст.
     """
     lb_min = _lookback_minutes(tf)
     since = _now_utc() - timedelta(minutes=lb_min)
@@ -112,6 +121,8 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
     best_score = -10
     latest_wait: Optional[Dict[str, Any]] = None
 
+    # rows уже отсортированы по ts DESC, id DESC:
+    # при равном приоритете останется более свежее (первое встретившееся)
     for r in rows:
         ev = _normalize_event_row(r)
         et = (ev.get("event_type") or "").strip() or None
