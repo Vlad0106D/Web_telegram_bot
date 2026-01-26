@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List, Tuple
@@ -22,6 +23,9 @@ log = logging.getLogger(__name__)
 
 MM_AUTO_ENABLED_ENV = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
 MM_AUTO_CHECK_SEC = int((os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60"))
+
+# ✅ single-flight lock для MM auto tick (чтобы не было параллельных запусков)
+_mm_auto_lock = asyncio.Lock()
 
 
 def _read_chat_id() -> Optional[int]:
@@ -554,6 +558,26 @@ async def _mm_auto_tick(app: Application) -> None:
                 log.exception("MM auto: report failed tf=%s", tf)
 
 
+async def _mm_auto_tick_locked(app: Application) -> None:
+    """
+    ✅ single-flight wrapper:
+    - если прошлый тик ещё идёт — выходим без параллельного запуска
+    """
+    if _mm_auto_lock.locked():
+        log.info("MM auto tick skipped (lock busy)")
+        return
+
+    async with _mm_auto_lock:
+        await _mm_auto_tick(app)
+
+
+async def _mm_auto_job_callback(ctx) -> None:
+    """
+    JobQueue callback (PTB): сюда приходит context, из него достаём application.
+    """
+    await _mm_auto_tick_locked(ctx.application)
+
+
 def schedule_mm_auto(app: Application) -> List[str]:
     created: List[str] = []
 
@@ -572,6 +596,7 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("JobQueue unavailable — cannot schedule MM auto")
         return created
 
+    # cleanup старых mm_auto jobs
     for job in list(jq.jobs()):
         if job and job.name and job.name.startswith("mm_auto"):
             try:
@@ -580,11 +605,19 @@ def schedule_mm_auto(app: Application) -> List[str]:
                 pass
 
     name = "mm_auto_tick"
+
+    # ✅ ключевое место: APScheduler job_kwargs
+    # max_instances=2 -> APScheduler не будет ругаться, а параллелизм всё равно режет lock
     jq.run_repeating(
-        callback=lambda ctx: _mm_auto_tick(ctx.application),
+        callback=_mm_auto_job_callback,
         interval=MM_AUTO_CHECK_SEC,
         first=10,
         name=name,
+        job_kwargs={
+            "max_instances": 2,
+            "coalesce": True,
+            "misfire_grace_time": 30,
+        },
     )
     created.append(name)
 
