@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List
 
 import psycopg
 from psycopg.rows import dict_row
@@ -23,24 +23,33 @@ def _now_utc() -> datetime:
 
 
 # ---------------- Event selection policy ----------------
+# Приоритет: чем больше, тем "сильнее" событие (для выбора состояния).
 _EVENT_PRIORITY: Dict[str, int] = {
+    # strongest / actionable
     "reclaim_up": 100,
     "reclaim_down": 100,
+
+    # acceptance после sweep (закрепление за уровнем)
     "accept_above": 98,
     "accept_below": 98,
+
     "sweep_high": 90,
     "sweep_low": 90,
     "decision_zone": 80,
+
+    # context / bias
     "pressure_up": 70,
     "pressure_down": 70,
+
+    # heartbeat
     "wait": 0,
 }
 
 _DEFAULT_LOOKBACK_MIN = {
-    "H1": 12 * 60,
-    "H4": 48 * 60,
-    "D1": 10 * 24 * 60,
-    "W1": 6 * 7 * 24 * 60,
+    "H1": 12 * 60,          # 12 часов
+    "H4": 48 * 60,          # 2 суток
+    "D1": 10 * 24 * 60,     # 10 дней
+    "W1": 6 * 7 * 24 * 60,  # ~6 недель
 }
 
 
@@ -54,10 +63,6 @@ def _lookback_minutes(tf: str) -> int:
         except Exception:
             pass
     return _DEFAULT_LOOKBACK_MIN.get(tf, 12 * 60)
-
-
-def _tf_minutes(tf: str) -> int:
-    return {"H1": 60, "H4": 240, "D1": 1440, "W1": 10080}.get(tf, 60)
 
 
 def _priority(event_type: Optional[str]) -> int:
@@ -79,41 +84,24 @@ def _normalize_event_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _pick_best_within_same_ts(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    rows должны относиться к ОДНОМУ и тому же ts.
-    Выбираем по приоритету, wait — только если ничего другого нет.
-    """
-    if not rows:
-        return None
-
-    best = None
-    best_score = -10
-    latest_wait = None
-
-    for r in rows:
-        ev = _normalize_event_row(r)
-        et = (ev.get("event_type") or "").strip() or None
-
-        if et == "wait":
-            if latest_wait is None:
-                latest_wait = ev
-            continue
-
-        score = _priority(et)
-        if score > best_score:
-            best = ev
-            best_score = score
-
-    return best or latest_wait or _normalize_event_row(rows[0])
+def _tf_seconds(tf: str) -> int:
+    return {
+        "H1": 3600,
+        "H4": 4 * 3600,
+        "D1": 24 * 3600,
+        "W1": 7 * 24 * 3600,
+    }.get(tf, 3600)
 
 
 # ---------------- Public API ----------------
 def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict[str, Any]]:
     """
-    Старое поведение: best-of-window по приоритету.
-    Оставляем как есть (может быть полезно для “контекста”),
-    но для отчёта/ActionEngine теперь используем get_market_event_for_ts().
+    Возвращает "последнее валидное событие состояния" для отчёта/ActionEngine.
+
+    Ключевая логика:
+    - wait НЕ перебивает давление/sweep/reclaim/accept/decision_zone.
+    - wait используется только как fallback, если в окне lookback нет "сильных" событий.
+    - выбор делаем по приоритету (а не просто самое последнее), чтобы "wait" не затирал контекст.
     """
     lb_min = _lookback_minutes(tf)
     since = _now_utc() - timedelta(minutes=lb_min)
@@ -171,61 +159,68 @@ def get_market_event_for_ts(
     max_age_bars: int = 2,
 ) -> Optional[Dict[str, Any]]:
     """
-    ✅ НОВОЕ: событие ДЛЯ конкретного ts свечи.
+    ✅ NEW: Возвращает событие, релевантное КОНКРЕТНОЙ свече ts.
 
-    Алгоритм:
-    1) ищем события с ts == заданному -> берём самое приоритетное внутри этого ts
-    2) если нет — fallback: смотрим назад максимум на max_age_bars баров (по времени),
-       но выбираем НЕ “самое сильное в окне”, а:
-         - берём самое свежее ts, где есть хоть что-то
-         - внутри этого ts выбираем самое приоритетное
+    Зачем:
+      - репорт строится на конкретной закрытой свече ts
+      - action должен опираться на событие этой же свечи (или ближайших, но в пределах max_age_bars)
 
-    Это убирает “залипание” на старом accept_* в lookback окне.
+    Логика:
+      1) Берём все события в окне [ts - max_age_bars*bar, ts]
+      2) Среди них выбираем best по приоритету (как в get_last_market_event)
+      3) wait используется только как fallback
     """
-    # 1) exact ts
-    sql_exact = """
+    if ts is None:
+        return None
+
+    bar_sec = _tf_seconds(tf)
+    lookback_sec = max(1, int(max_age_bars)) * bar_sec
+    since = ts - timedelta(seconds=lookback_sec)
+
+    sql = """
     SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
     FROM mm_market_events
-    WHERE symbol=%s AND tf=%s AND ts=%s
-    ORDER BY id DESC
-    LIMIT 200;
+    WHERE symbol=%s
+      AND tf=%s
+      AND ts >= %s
+      AND ts <= %s
+    ORDER BY ts DESC, id DESC
+    LIMIT 300;
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
         with conn.cursor() as cur:
-            cur.execute(sql_exact, (symbol, tf, ts))
-            exact = cur.fetchall() or []
-
-        best_exact = _pick_best_within_same_ts(exact)
-        if best_exact is not None:
-            return best_exact
-
-        # 2) fallback by bars (time-based)
-        if max_age_bars is None or max_age_bars <= 0:
-            return None
-
-        tf_min = _tf_minutes(tf)
-        since = ts - timedelta(minutes=tf_min * int(max_age_bars))
-
-        sql_fb = """
-        SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
-        FROM mm_market_events
-        WHERE symbol=%s AND tf=%s AND ts <= %s AND ts >= %s
-        ORDER BY ts DESC, id DESC
-        LIMIT 300;
-        """
-        with conn.cursor() as cur:
-            cur.execute(sql_fb, (symbol, tf, ts, since))
+            cur.execute(sql, (symbol, tf, since, ts))
             rows = cur.fetchall() or []
 
     if not rows:
         return None
 
-    # rows sorted by ts DESC; берём группу первого (самого свежего) ts
-    newest_ts = rows[0].get("ts")
-    same_ts = [r for r in rows if r.get("ts") == newest_ts]
-    return _pick_best_within_same_ts(same_ts)
+    best: Optional[Dict[str, Any]] = None
+    best_score = -10
+    latest_wait: Optional[Dict[str, Any]] = None
+
+    for r in rows:
+        ev = _normalize_event_row(r)
+        et = (ev.get("event_type") or "").strip() or None
+
+        if et == "wait":
+            if latest_wait is None:
+                latest_wait = ev
+            continue
+
+        score = _priority(et)
+        if score > best_score:
+            best = ev
+            best_score = score
+
+    if best is not None:
+        return best
+    if latest_wait is not None:
+        return latest_wait
+
+    return _normalize_event_row(rows[0])
 
 
 def insert_market_event(
@@ -234,12 +229,18 @@ def insert_market_event(
     tf: str,
     event_type: str,
     symbol: str = "BTC-USDT",
-    side: Optional[str] = None,
+    side: Optional[str] = None,          # "up" / "down" / None
     level: Optional[float] = None,
     zone: Optional[str] = None,
-    confidence: Optional[int] = None,
+    confidence: Optional[int] = None,    # 0..100
     payload: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    """
+    Пишет рыночное событие в mm_market_events.
+    Антидубль: ON CONFLICT (symbol, tf, ts, event_type) DO NOTHING.
+
+    Возвращает True если вставили, False если дубль/не вставили.
+    """
     payload = payload or {}
 
     sql = """
