@@ -14,6 +14,9 @@ from services.mm.liquidity import load_last_liquidity_levels
 from services.mm.market_events_store import get_market_event_for_ts  # ✅ ts-aligned event
 from services.mm.action_engine import compute_action  # ✅ real Action Engine
 
+# ✅ NEW: Range Engine (zones + acceptance-only)
+from services.mm.range_engine import apply_range_engine, RangeResult
+
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
 
@@ -300,7 +303,7 @@ def _event_driven_state(
     btc_close: float,
     dn_targets: List[float],
     up_targets: List[float],
-    ev: Optional[Dict[str, Any]] = None,   # ✅ NEW: event injected (ts-aligned)
+    ev: Optional[Dict[str, Any]] = None,   # ✅ event injected (ts-aligned)
 ) -> Dict[str, Any]:
     if not ev:
         prob_down, prob_up = _probs_from_context("wait", price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
@@ -512,7 +515,6 @@ def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Di
             down_t = down_t[:2]
             up_t = up_t[:2]
 
-            # ✅ берем event по сохранённому state_ts данного TF (чтобы HTF контекст не “лип”)
             st_saved = load_last_state(tf=tf) or {}
             st_ts = st_saved.get("_state_ts")
 
@@ -559,6 +561,12 @@ class MarketView:
     btc_down_targets: List[float]
     btc_up_targets: List[float]
     key_zone: Optional[str]
+
+    # ✅ NEW: Range (decision only)
+    range_state: str
+    range_rh_zone: Dict[str, float]   # {"lo":..., "hi":...}
+    range_rl_zone: Dict[str, float]   # {"lo":..., "hi":...}
+    range_width: float
 
     btc_oi: Optional[float]
     btc_oi_delta: Optional[float]
@@ -641,6 +649,19 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         key_zone = st.get("key_zone") or key_zone0
 
         # ─────────────────────────────────────────
+        # ✅ RANGE ENGINE (zones + acceptance-only, stateful)
+        # ─────────────────────────────────────────
+        saved_payload = load_last_state(tf=tf) or {}
+        rr: RangeResult
+        rr, range_patch = apply_range_engine(
+            conn,
+            tf,
+            ts=ts,
+            close=btc_close,
+            saved_state_payload=saved_payload,
+        )
+
+        # ─────────────────────────────────────────
         # ETH CONFIRMATION
         # ─────────────────────────────────────────
         eth_conf = "нейтрален 🟡"
@@ -673,21 +694,25 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
 
         # Save state BEFORE compute_action()
         try:
+            payload = {
+                "state_title": state_title,
+                "state_icon": state_icon,
+                "phase": phase,
+                "prob_down": int(prob_down),
+                "prob_up": int(prob_up),
+                "btc_down_targets": down_t,
+                "btc_up_targets": up_t,
+                "key_zone": key_zone,
+                "eth_confirmation": eth_conf,
+                "event_type": st.get("event_type"),
+            }
+            # ✅ inject range patch into payload
+            payload.update(range_patch)
+
             save_state(
                 tf=tf,
                 ts=ts,
-                payload={
-                    "state_title": state_title,
-                    "state_icon": state_icon,
-                    "phase": phase,
-                    "prob_down": int(prob_down),
-                    "prob_up": int(prob_up),
-                    "btc_down_targets": down_t,
-                    "btc_up_targets": up_t,
-                    "key_zone": key_zone,
-                    "eth_confirmation": eth_conf,
-                    "event_type": st.get("event_type"),
-                },
+                payload=payload,
             )
         except Exception:
             pass
@@ -709,6 +734,13 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             btc_down_targets=down_t,
             btc_up_targets=up_t,
             key_zone=key_zone,
+
+            # ✅ range fields
+            range_state=rr.state,
+            range_rh_zone=rr.rh.to_dict(),
+            range_rl_zone=rr.rl.to_dict(),
+            range_width=float(rr.width),
+
             btc_oi=btc_oi,
             btc_oi_delta=btc_oi_d,
             btc_funding=btc_fr,
@@ -748,6 +780,38 @@ def render_report(view: MarketView) -> str:
     if view.action_event_type:
         lines.append(f"• Event: {view.action_event_type}")
     lines.append(f"• Reason: {view.action_reason}")
+    lines.append("")
+
+    # ✅ RANGE как отдельная сущность (decision only)
+    lines.append("RANGE (decision only):")
+    rh_lo = view.range_rh_zone.get("lo")
+    rh_hi = view.range_rh_zone.get("hi")
+    rl_lo = view.range_rl_zone.get("lo")
+    rl_hi = view.range_rl_zone.get("hi")
+
+    # короткие статусы, чтобы было читабельно в телеге
+    rs = view.range_state
+    if rs == "HOLDING":
+        rs_txt = "HOLDING (внутри диапазона)"
+    elif rs == "TESTING_UP":
+        rs_txt = "TESTING_UP (тест сверху)"
+    elif rs == "TESTING_DOWN":
+        rs_txt = "TESTING_DOWN (тест снизу)"
+    elif rs == "PENDING_ACCEPT_UP":
+        rs_txt = "PENDING_ACCEPT_UP (ждём закреп)"
+    elif rs == "PENDING_ACCEPT_DOWN":
+        rs_txt = "PENDING_ACCEPT_DOWN (ждём закреп)"
+    elif rs == "ACCEPT_UP":
+        rs_txt = "ACCEPT_UP ✅ (режим сменился вверх)"
+    elif rs == "ACCEPT_DOWN":
+        rs_txt = "ACCEPT_DOWN ✅ (режим сменился вниз)"
+    else:
+        rs_txt = rs
+
+    lines.append(f"• State: {rs_txt}")
+    lines.append(f"• RH zone: {_fmt_price(rh_lo)} → {_fmt_price(rh_hi)}")
+    lines.append(f"• RL zone: {_fmt_price(rl_lo)} → {_fmt_price(rl_hi)}")
+    lines.append(f"• Zone width: ~{_fmt_price(view.range_width)}")
     lines.append("")
 
     lines.append("Цели ликвидности (BTC):")
