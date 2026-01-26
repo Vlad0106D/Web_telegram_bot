@@ -1018,4 +1018,6 @@ def render_report(view: MarketView) -> str:
     lines.append("")
     lines.append(f"ETH: {view.eth_confirmation}")
 
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    text = text.replace("%", "%%")  # ✅ FIX: защита от '%' placeholder ошибки при отправке
+    return text
