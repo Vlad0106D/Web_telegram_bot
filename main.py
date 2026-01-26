@@ -15,10 +15,32 @@ from bot.watcher import schedule_watcher_jobs
 # === MM AUTO ===
 from services.mm.auto import schedule_mm_auto
 
+
+class RedactTelegramTokenFilter(logging.Filter):
+    """
+    Маскируем токен бота в логах (например, когда httpx логирует URL вида
+    https://api.telegram.org/bot<TOKEN>/getUpdates).
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "api.telegram.org/bot" in msg and TOKEN in msg:
+                record.msg = record.msg.replace(TOKEN, "***REDACTED***")
+        except Exception:
+            # никогда не ломаем логирование из-за фильтра
+            pass
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+# применяем фильтр к httpx и корневому логгеру
+logging.getLogger().addFilter(RedactTelegramTokenFilter())
+logging.getLogger("httpx").addFilter(RedactTelegramTokenFilter())
+
 log = logging.getLogger("main")
 
 
