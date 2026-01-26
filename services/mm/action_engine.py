@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from services.mm.market_events_store import get_last_market_event
+from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event
 from services.mm.state_store import load_last_state
 
 
@@ -190,9 +190,9 @@ def compute_action(tf: str) -> ActionDecision:
     НЕ открывает сделки.
     Возвращает разрешение направления или NONE.
 
-    ✅ NEW:
-      LONG можно не только на reclaim_up, но и на accept_above
-      SHORT можно не только на reclaim_down, но и на accept_below
+    ✅ TS-aligned:
+      market event берётся по ts сохранённого mm_state (st['_state_ts'])
+      чтобы action совпадал с отчётом на этой свече, и не “лип” к старому событию.
     """
 
     st = load_last_state(tf=tf)
@@ -208,7 +208,6 @@ def compute_action(tf: str) -> ActionDecision:
     prob_up = int(st.get("prob_up", 0))
     prob_down = int(st.get("prob_down", 0))
     state_title = st.get("state_title", "")
-    last_event = st.get("event_type")
 
     if state_title == "ОЖИДАНИЕ":
         return ActionDecision(
@@ -216,10 +215,18 @@ def compute_action(tf: str) -> ActionDecision:
             action="NONE",
             confidence=0,
             reason="Состояние WAIT",
-            event_type=last_event,
+            event_type=st.get("event_type"),
         )
 
-    ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
+    # ✅ event strictly for this state_ts
+    state_ts = st.get("_state_ts")
+    ev = None
+    if state_ts is not None:
+        try:
+            ev = get_market_event_for_ts(tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2)
+        except Exception:
+            ev = None
+
     ev_type = (ev.get("event_type") if ev else None)
     side = (ev.get("side") if ev else None)
 
@@ -271,7 +278,8 @@ def compute_action(tf: str) -> ActionDecision:
         reason="Условия не выполнены",
         event_type=ev_type,
     )
-    
+
+
 def _thresholds(tf: str) -> Tuple[float, float, int]:
     """
     Возвращает:
