@@ -183,16 +183,129 @@ def _mtf_filter(*, tf: str, desired_action: ActionType) -> Tuple[bool, str]:
     return True, "mtf_confirmed"
 
 
+# ---------------- Range gating (mode) ----------------
+def _range_state(st: Dict[str, Any]) -> str:
+    rs = (st or {}).get("range_state")
+    return str(rs).strip() if rs is not None else ""
+
+
+def _range_blocks_long(st: Dict[str, Any]) -> bool:
+    """
+    RANGE — главный режим.
+    Если мы в ACCEPT_DOWN или ждём закреп вниз — не даём контртренд LONG.
+    """
+    rs = _range_state(st)
+    return rs in ("PENDING_ACCEPT_DOWN", "ACCEPT_DOWN")
+
+
+def _range_blocks_short(st: Dict[str, Any]) -> bool:
+    """
+    Если мы в ACCEPT_UP или ждём закреп вверх — не даём контртренд SHORT.
+    """
+    rs = _range_state(st)
+    return rs in ("PENDING_ACCEPT_UP", "ACCEPT_UP")
+
+
+def _range_filter(*, st: Dict[str, Any], desired_action: ActionType) -> Tuple[bool, str]:
+    if desired_action == "LONG_ALLOWED" and _range_blocks_long(st):
+        return False, f"RANGE blocks LONG ({_range_state(st)})"
+    if desired_action == "SHORT_ALLOWED" and _range_blocks_short(st):
+        return False, f"RANGE blocks SHORT ({_range_state(st)})"
+    return True, "range_ok"
+
+
+# ---------------- LIQ events (local sweeps) ----------------
+def _recent_snapshot_window_min_ts(
+    conn: psycopg.Connection, *, tf: str, ts: datetime, max_age_bars: int
+) -> Optional[datetime]:
+    """
+    Находим минимальный ts окна из последних (max_age_bars+1) закрытых свечей до state_ts.
+    """
+    sql = """
+    SELECT ts
+    FROM mm_snapshots
+    WHERE symbol='BTC-USDT' AND tf=%s AND ts <= %s
+    ORDER BY ts DESC
+    LIMIT %s;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (tf, ts, int(max_age_bars) + 1))
+        rows = cur.fetchall() or []
+    if not rows:
+        return None
+    return rows[-1]["ts"]
+
+
+def _get_event_for_ts_filtered(
+    conn: psycopg.Connection,
+    *,
+    tf: str,
+    ts: datetime,
+    symbol: str,
+    max_age_bars: int,
+    include_types: Optional[Tuple[str, ...]] = None,
+    include_prefix: Optional[str] = None,
+    exclude_prefix: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Достаём event в окне state_ts (по свечам), но с фильтрами:
+      - include_types (точное совпадение)
+      - include_prefix (например "liq_")
+      - exclude_prefix (например "liq_")
+    """
+    min_ts = _recent_snapshot_window_min_ts(conn, tf=tf, ts=ts, max_age_bars=max_age_bars)
+    if min_ts is None:
+        min_ts = ts
+
+    sql = """
+    SELECT *
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s AND ts >= %s AND ts <= %s
+    ORDER BY ts DESC, id DESC
+    LIMIT 50;
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, (symbol, tf, min_ts, ts))
+        rows = cur.fetchall() or []
+
+    for r in rows:
+        et = str(r.get("event_type") or "").strip()
+        if exclude_prefix and et.startswith(exclude_prefix):
+            continue
+        if include_prefix and not et.startswith(include_prefix):
+            continue
+        if include_types and et not in include_types:
+            continue
+        return r
+    return None
+
+
+def _liq_bias_from_event(liq_ev: Optional[Dict[str, Any]]) -> Tuple[int, int, Optional[str]]:
+    """
+    Возвращает (bias_up, bias_down, liq_event_type)
+    bias_* в процентах (прибавка/убавка к вероятности/уверенности).
+    """
+    if not liq_ev:
+        return 0, 0, None
+
+    et = str(liq_ev.get("event_type") or "").strip()
+    if et == "liq_sweep_low":
+        return +6, -6, et
+    if et == "liq_sweep_high":
+        return -6, +6, et
+    return 0, 0, et
+
+
 # ---------------- Core logic ----------------
 def compute_action(tf: str) -> ActionDecision:
     """
-    Action Mode v1 (MTF-aware)
+    Action Mode v1.1 (MTF-aware + RANGE gate + LIQ local sweeps)
     НЕ открывает сделки.
     Возвращает разрешение направления или NONE.
 
     ✅ TS-aligned:
       market event берётся по ts сохранённого mm_state (st['_state_ts'])
-      чтобы action совпадал с отчётом на этой свече, и не “лип” к старому событию.
+      чтобы action совпадал с отчётом на этой свече.
     """
 
     st = load_last_state(tf=tf)
@@ -207,76 +320,225 @@ def compute_action(tf: str) -> ActionDecision:
 
     prob_up = int(st.get("prob_up", 0))
     prob_down = int(st.get("prob_down", 0))
-    state_title = st.get("state_title", "")
+    state_title = str(st.get("state_title", "") or "")
 
+    # ✅ state_ts for strict alignment
+    state_ts = st.get("_state_ts")
+    if state_ts is None:
+        return ActionDecision(
+            tf=tf,
+            action="NONE",
+            confidence=max(prob_up, prob_down),
+            reason="Нет _state_ts в mm_state (не могу TS-align)",
+            event_type=st.get("event_type"),
+        )
+
+    # Pull events: market (exclude liq_) + liq (include liq_*)
+    market_ev = None
+    liq_ev = None
+    try:
+        # market event через store-хелпер (как раньше)
+        market_ev = get_market_event_for_ts(tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2)
+    except Exception:
+        market_ev = None
+
+    # liq event — напрямую из mm_market_events (окно по свечам)
+    try:
+        with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+            conn.execute("SET TIME ZONE 'UTC';")
+            liq_ev = _get_event_for_ts_filtered(
+                conn,
+                tf=tf,
+                ts=state_ts,
+                symbol="BTC-USDT",
+                max_age_bars=2,
+                include_prefix="liq_",
+            )
+            # если get_market_event_for_ts вдруг вернул liq_* как "главное событие" — не проблема,
+            # но нам всё равно нужен "не-liq" event для логики v1
+            if market_ev and str(market_ev.get("event_type") or "").startswith("liq_"):
+                market_ev = _get_event_for_ts_filtered(
+                    conn,
+                    tf=tf,
+                    ts=state_ts,
+                    symbol="BTC-USDT",
+                    max_age_bars=2,
+                    exclude_prefix="liq_",
+                )
+    except Exception:
+        liq_ev = None
+
+    ev_type = (market_ev.get("event_type") if market_ev else None)
+    side = (market_ev.get("side") if market_ev else None)
+
+    # LIQ bias
+    bias_up, bias_down, liq_type = _liq_bias_from_event(liq_ev)
+    prob_up_eff = max(0, min(100, prob_up + bias_up))
+    prob_down_eff = max(0, min(100, prob_down + bias_down))
+
+    # RANGE gate always applies
+    ok_r_long, why_r_long = _range_filter(st=st, desired_action="LONG_ALLOWED")
+    ok_r_short, why_r_short = _range_filter(st=st, desired_action="SHORT_ALLOWED")
+
+    # базовые события (range/accept/reclaim/decision)
+    long_events = ("reclaim_up", "accept_above", "decision_zone")
+    short_events = ("reclaim_down", "accept_below", "decision_zone")
+
+    # 0) Если WAIT — обычно NONE, но LIQ sweep может дать "спекулятивное разрешение"
     if state_title == "ОЖИДАНИЕ":
+        if liq_type == "liq_sweep_low":
+            if ok_r_long:
+                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+                if ok_mtf:
+                    conf = max(55, min(75, prob_up_eff))
+                    return ActionDecision(
+                        tf=tf,
+                        action="LONG_ALLOWED",
+                        confidence=conf,
+                        reason=f"WAIT + {liq_type} (local) | {why_r_long} | {why_mtf}",
+                        event_type=liq_type,
+                    )
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=max(prob_up_eff, prob_down_eff),
+                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
+                    event_type=liq_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"WAIT + {liq_type} blocked | {why_r_long}",
+                event_type=liq_type,
+            )
+
+        if liq_type == "liq_sweep_high":
+            if ok_r_short:
+                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+                if ok_mtf:
+                    conf = max(55, min(75, prob_down_eff))
+                    return ActionDecision(
+                        tf=tf,
+                        action="SHORT_ALLOWED",
+                        confidence=conf,
+                        reason=f"WAIT + {liq_type} (local) | {why_r_short} | {why_mtf}",
+                        event_type=liq_type,
+                    )
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=max(prob_up_eff, prob_down_eff),
+                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
+                    event_type=liq_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"WAIT + {liq_type} blocked | {why_r_short}",
+                event_type=liq_type,
+            )
+
         return ActionDecision(
             tf=tf,
             action="NONE",
             confidence=0,
             reason="Состояние WAIT",
-            event_type=st.get("event_type"),
+            event_type=ev_type,
         )
 
-    # ✅ event strictly for this state_ts
-    state_ts = st.get("_state_ts")
-    ev = None
-    if state_ts is not None:
-        try:
-            ev = get_market_event_for_ts(tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2)
-        except Exception:
-            ev = None
-
-    ev_type = (ev.get("event_type") if ev else None)
-    side = (ev.get("side") if ev else None)
-
-    long_events = ("reclaim_up", "accept_above", "decision_zone")
-    short_events = ("reclaim_down", "accept_below", "decision_zone")
-
-    # --- LONG candidate ---
-    if prob_up >= 55 and ev_type in long_events and side in ("up", None):
-        ok, why = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-        if ok:
+    # 1) LONG candidate from market events
+    if prob_up_eff >= 55 and ev_type in long_events and side in ("up", None):
+        if not ok_r_long:
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=prob_up_eff,
+                reason=why_r_long,
+                event_type=ev_type,
+            )
+        ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+        if ok_mtf:
+            extra = f" | liq={liq_type}" if liq_type else ""
             return ActionDecision(
                 tf=tf,
                 action="LONG_ALLOWED",
-                confidence=min(90, prob_up),
-                reason=f"{ev_type} + prob_up={prob_up} | {why}",
+                confidence=min(90, prob_up_eff),
+                reason=f"{ev_type} + prob_up={prob_up_eff}{extra} | {why_r_long} | {why_mtf}",
                 event_type=ev_type,
             )
         return ActionDecision(
             tf=tf,
             action="NONE",
-            confidence=prob_up,
-            reason=why,
+            confidence=prob_up_eff,
+            reason=why_mtf,
             event_type=ev_type,
         )
 
-    # --- SHORT candidate ---
-    if prob_down >= 55 and ev_type in short_events and side in ("down", None):
-        ok, why = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-        if ok:
+    # 2) SHORT candidate from market events
+    if prob_down_eff >= 55 and ev_type in short_events and side in ("down", None):
+        if not ok_r_short:
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=prob_down_eff,
+                reason=why_r_short,
+                event_type=ev_type,
+            )
+        ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+        if ok_mtf:
+            extra = f" | liq={liq_type}" if liq_type else ""
             return ActionDecision(
                 tf=tf,
                 action="SHORT_ALLOWED",
-                confidence=min(90, prob_down),
-                reason=f"{ev_type} + prob_down={prob_down} | {why}",
+                confidence=min(90, prob_down_eff),
+                reason=f"{ev_type} + prob_down={prob_down_eff}{extra} | {why_r_short} | {why_mtf}",
                 event_type=ev_type,
             )
         return ActionDecision(
             tf=tf,
             action="NONE",
-            confidence=prob_down,
-            reason=why,
+            confidence=prob_down_eff,
+            reason=why_mtf,
             event_type=ev_type,
         )
 
+    # 3) Если market-событие не “сигнальное”, но был LIQ sweep — мягко повышаем шанс
+    #    (не превращаем в источник режима, но можем дать early разрешение при сильном перекосе)
+    if liq_type == "liq_sweep_low" and prob_up_eff >= 60:
+        if ok_r_long:
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+            if ok_mtf:
+                return ActionDecision(
+                    tf=tf,
+                    action="LONG_ALLOWED",
+                    confidence=min(85, prob_up_eff),
+                    reason=f"{liq_type} + strong_up={prob_up_eff} | {why_r_long} | {why_mtf}",
+                    event_type=liq_type,
+                )
+
+    if liq_type == "liq_sweep_high" and prob_down_eff >= 60:
+        if ok_r_short:
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+            if ok_mtf:
+                return ActionDecision(
+                    tf=tf,
+                    action="SHORT_ALLOWED",
+                    confidence=min(85, prob_down_eff),
+                    reason=f"{liq_type} + strong_down={prob_down_eff} | {why_r_short} | {why_mtf}",
+                    event_type=liq_type,
+                )
+
+    # default
+    best = max(prob_up_eff, prob_down_eff)
+    extra = f" | liq={liq_type}" if liq_type else ""
     return ActionDecision(
         tf=tf,
         action="NONE",
-        confidence=max(prob_up, prob_down),
-        reason="Условия не выполнены",
-        event_type=ev_type,
+        confidence=best,
+        reason=f"Условия не выполнены{extra}",
+        event_type=(ev_type or liq_type),
     )
 
 
