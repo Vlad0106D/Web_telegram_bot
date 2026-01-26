@@ -55,16 +55,11 @@ def _as_float(x: Any) -> Optional[float]:
 
 
 def _sweep_tol(tf: str) -> float:
-    """
-    Толеранс прокола ликвидности (доли, не проценты).
-    Можно переопределить через env:
-      MM_LIQ_SWEEP_TOL_H1/H4/D1/W1
-    """
     default = {
-        "H1": 0.0004,  # 0.04%
-        "H4": 0.0005,  # 0.05%
-        "D1": 0.0008,  # 0.08%
-        "W1": 0.0012,  # 0.12%
+        "H1": 0.0004,
+        "H4": 0.0005,
+        "D1": 0.0008,
+        "W1": 0.0012,
     }.get(tf, 0.0005)
 
     key = f"MM_LIQ_SWEEP_TOL_{tf}"
@@ -75,86 +70,59 @@ def _sweep_tol(tf: str) -> float:
 
 
 def _uniq_keep_order(vals: List[float], tol: float) -> List[float]:
-    """
-    Удаляем дубликаты/почти-дубликаты, сохраняя порядок.
-    tol — относительный, например 0.0006 = 0.06%
-    """
     out: List[float] = []
     for v in vals:
         if not out:
             out.append(v)
             continue
-        dup = False
-        for u in out:
-            if u != 0 and abs(v / u - 1.0) <= tol:
-                dup = True
-                break
-        if not dup:
-            out.append(v)
+        if any(u != 0 and abs(v / u - 1.0) <= tol for u in out):
+            continue
+        out.append(v)
     return out
 
 
 def _pick_liq_levels(tf: str) -> Tuple[List[Tuple[str, float]], List[Tuple[str, float]], Dict[str, Any]]:
-    """
-    Возвращаем списки локальных уровней:
-      highs: [("eqh", lvl), ("up_target_1", lvl), ...]
-      lows:  [("eql", lvl), ("dn_target_1", lvl), ...]
-
-    ВАЖНО:
-      - Это слой LIQUIDITY ZONES (уровень 2), НЕ RANGE.
-      - Поэтому range_high/range_low сюда НЕ добавляем.
-    """
     liq = load_last_liquidity_levels(tf) or {}
 
     eqh = _as_float(liq.get("eqh"))
     eql = _as_float(liq.get("eql"))
 
-    ups_raw = liq.get("up_targets") or []
-    dns_raw = liq.get("dn_targets") or []
+    ups = [float(v) for v in (liq.get("up_targets") or []) if _as_float(v) is not None]
+    dns = [float(v) for v in (liq.get("dn_targets") or []) if _as_float(v) is not None]
 
-    ups = [float(v) for v in ups_raw if _as_float(v) is not None]
-    dns = [float(v) for v in dns_raw if _as_float(v) is not None]
-
-    # чистим near-dup, чтобы не стрелять по одному и тому же
     near_tol = 0.0006 if tf in ("H1", "H4") else 0.0012
-    ups = _uniq_keep_order(ups, tol=near_tol)
-    dns = _uniq_keep_order(dns, tol=near_tol)
+    ups = _uniq_keep_order(ups, near_tol)
+    dns = _uniq_keep_order(dns, near_tol)
 
     highs: List[Tuple[str, float]] = []
     lows: List[Tuple[str, float]] = []
 
     if eqh is not None:
-        highs.append(("eqh", float(eqh)))
+        highs.append(("eqh", eqh))
     if eql is not None:
-        lows.append(("eql", float(eql)))
+        lows.append(("eql", eql))
 
-    # добавляем up/dn targets (не больше 2, чтобы не шуметь)
     for i, v in enumerate(ups[:2], start=1):
-        # если совпадает с eqh — пропускаем
-        if eqh is not None and eqh != 0 and abs(v / float(eqh) - 1.0) <= near_tol:
+        if eqh and abs(v / eqh - 1.0) <= near_tol:
             continue
-        highs.append((f"up_target_{i}", float(v)))
+        highs.append((f"up_target_{i}", v))
 
     for i, v in enumerate(dns[:2], start=1):
-        if eql is not None and eql != 0 and abs(v / float(eql) - 1.0) <= near_tol:
+        if eql and abs(v / eql - 1.0) <= near_tol:
             continue
-        lows.append((f"dn_target_{i}", float(v)))
+        lows.append((f"dn_target_{i}", v))
 
     return highs, lows, liq
 
 
-def detect_and_store_liquidity_events(tf: str) -> List[str]:
-    """
-    Слой событий LIQUIDITY ZONES (уровень 2):
-      - liq_sweep_high: снятие сверху по локальному уровню (EQH / up_target)
-      - liq_sweep_low : снятие снизу по локальному уровню (EQL / dn_target)
+def _safe_iso(ts: Any) -> Optional[str]:
+    """Безопасно превращает datetime → ISO string"""
+    if isinstance(ts, datetime):
+        return ts.isoformat()
+    return None
 
-    ❗️Это НЕ RANGE и НЕ меняет режим.
-    Поэтому здесь:
-      - нет decision_zone
-      - нет reclaim/accept
-      - нет wait-heartbeat
-    """
+
+def detect_and_store_liquidity_events(tf: str) -> List[str]:
     out: List[str] = []
     sweep_tol = _sweep_tol(tf)
 
@@ -169,31 +137,20 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
     if not highs and not lows:
         return out
 
-    wrote_any = False
     inserted_types_this_ts: set[str] = set()
 
-    # микро-фильтр: если уже был liq_* на этом ts — не мешаемся
     last_ev = get_last_market_event(tf=tf, symbol="BTC-USDT") or {}
-    last_ev_ts = last_ev.get("ts")
-    last_ev_type = (last_ev.get("event_type") or "").strip()
-    if last_ev_ts is not None and last_ev_ts == last.ts and last_ev_type.startswith("liq_"):
+    if last_ev.get("ts") == last.ts and str(last_ev.get("event_type", "")).startswith("liq_"):
         return out
 
-    # -------------------------
-    # LIQ SWEEP HIGH (local)
-    # -------------------------
-    for level_name, lvl0 in highs:
-        lvl = float(lvl0)
+    liq_ts_iso = _safe_iso(liq_payload.get("_liq_ts"))
+
+    # ---- HIGH ----
+    for level_name, lvl in highs:
         if lvl <= 0:
             continue
-
-        was_below = (prev.high <= lvl) or (prev.close <= lvl)
-        swept = was_below and (last.high > lvl * (1.0 + sweep_tol))
-
-        if not swept:
+        if not ((prev.high <= lvl or prev.close <= lvl) and last.high > lvl * (1 + sweep_tol)):
             continue
-
-        # чтобы в одну свечу не писать несколько liq_sweep_high (шум)
         if "liq_sweep_high" in inserted_types_this_ts:
             continue
 
@@ -203,44 +160,32 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
             event_type="liq_sweep_high",
             side="up",
             level=lvl,
-            # ✅ zone — только маркировка, без RANGE
             zone=f"{tf} LIQ {level_name.upper()}",
             confidence=78,
             payload={
-                # ✅ каноничная маркировка слоя
                 "layer": "liquidity",
                 "scope": "local",
                 "level_source_tf": tf,
-                "level_name": level_name,  # eqh / up_target_1 / up_target_2
+                "level_name": level_name,
                 "level": lvl,
                 "sweep_tol": sweep_tol,
                 "prev_close": float(prev.close),
                 "prev_high": float(prev.high),
                 "last_high": float(last.high),
-                # связь с liq_levels snapshot
-                "liq_ts": liq_payload.get("_liq_ts"),
+                "liq_ts": liq_ts_iso,
                 "liq_notes": liq_payload.get("notes"),
             },
         )
         out.append(f"{tf} liq_sweep_high({level_name}) {'+1' if ok else 'skip'}")
-        wrote_any = wrote_any or ok
         if ok:
             inserted_types_this_ts.add("liq_sweep_high")
 
-    # -------------------------
-    # LIQ SWEEP LOW (local)
-    # -------------------------
-    for level_name, lvl0 in lows:
-        lvl = float(lvl0)
+    # ---- LOW ----
+    for level_name, lvl in lows:
         if lvl <= 0:
             continue
-
-        was_above = (prev.low >= lvl) or (prev.close >= lvl)
-        swept = was_above and (last.low < lvl * (1.0 - sweep_tol))
-
-        if not swept:
+        if not ((prev.low >= lvl or prev.close >= lvl) and last.low < lvl * (1 - sweep_tol)):
             continue
-
         if "liq_sweep_low" in inserted_types_this_ts:
             continue
 
@@ -256,22 +201,21 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                 "layer": "liquidity",
                 "scope": "local",
                 "level_source_tf": tf,
-                "level_name": level_name,  # eql / dn_target_1 / dn_target_2
+                "level_name": level_name,
                 "level": lvl,
                 "sweep_tol": sweep_tol,
                 "prev_close": float(prev.close),
                 "prev_low": float(prev.low),
                 "last_low": float(last.low),
-                "liq_ts": liq_payload.get("_liq_ts"),
+                "liq_ts": liq_ts_iso,
                 "liq_notes": liq_payload.get("notes"),
             },
         )
         out.append(f"{tf} liq_sweep_low({level_name}) {'+1' if ok else 'skip'}")
-        wrote_any = wrote_any or ok
         if ok:
             inserted_types_this_ts.add("liq_sweep_low")
 
-    if not wrote_any:
+    if not inserted_types_this_ts:
         out.append(f"{tf} liq: no_sweep")
 
     return out
