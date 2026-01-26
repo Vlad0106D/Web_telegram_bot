@@ -227,7 +227,7 @@ def _insert_action_decision(conn: psycopg.Connection, *, tf: str, action_ts: dat
     if dec.action not in ("LONG_ALLOWED", "SHORT_ALLOWED"):
         return False
 
-    # антидубль на всякий случай
+    # антидубль
     if _action_row_exists(conn, tf=tf, action_ts=action_ts):
         return False
 
@@ -364,7 +364,6 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
         if action_ts is None or action_close is None:
             continue
         if action_ts == latest_ts:
-            # не оцениваем в той же свече
             continue
 
         try:
@@ -451,18 +450,23 @@ async def _mm_auto_tick(app: Application) -> None:
             latest_ts = _get_latest_snapshot_ts(conn, tf)
             if latest_ts is None:
                 continue
-            if seen.get(tf) == _iso(latest_ts):
-                continue
+
+            # ✅ FIX: D1/W1 НЕ зависят от seen-map (иначе отчёт может “залипнуть” навсегда)
+            if tf not in ("D1", "W1"):
+                if seen.get(tf) == _iso(latest_ts):
+                    continue
+
             tfs_to_process.append((tf, latest_ts))
 
         if not tfs_to_process:
             return
 
-        # сразу отмечаем как seen, чтобы при исключениях не зациклиться
+        # ✅ seen отмечаем только для H1/H4 (и прочих не-close tf)
         for tf, ts in tfs_to_process:
-            seen[tf] = _iso(ts)
+            if tf not in ("D1", "W1"):
+                seen[tf] = _iso(ts)
 
-        # 2) LIQUIDITY MEMORY
+        # 2) LIQUIDITY MEMORY (можно на всех tfs_to_process)
         try:
             await update_liquidity_memory([tf for tf, _ in tfs_to_process])
         except Exception:
@@ -477,7 +481,7 @@ async def _mm_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("MM auto: market events failed for tf=%s", tf)
 
-        # 4) REPORTS + SAVE mm_state внутри build_market_view()
+        # 4) REPORTS + ACTION ENGINE persistence/eval
         for tf, _ in tfs_to_process:
             try:
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
@@ -493,7 +497,7 @@ async def _mm_auto_tick(app: Application) -> None:
                         latest_ts,
                         exp,
                     )
-                    # даже если отчёт не шлём — action всё равно считаем/пишем
+                    # action считаем/пишем даже если close-report skip
                     latest_close = _get_latest_snapshot_close(conn, tf)
                     if latest_close is not None:
                         try:
@@ -507,10 +511,10 @@ async def _mm_auto_tick(app: Application) -> None:
                             log.exception("MM auto: action persistence failed tf=%s (close-report skipped)", tf)
                     continue
 
-                # строим view -> внутри сохранится mm_state (save_state)
+                # строим view -> внутри сохранится mm_state (save_state) + compute_action в отчёте
                 view = build_market_view(tf, manual=False)
 
-                # 5) ACTION persistence/eval (после save_state!)
+                # ACTION persistence/eval (по закрытой свече)
                 latest_close = _get_latest_snapshot_close(conn, tf)
                 if latest_close is not None:
                     try:
@@ -522,7 +526,7 @@ async def _mm_auto_tick(app: Application) -> None:
                         conn.rollback()
                         log.exception("MM auto: action persistence failed tf=%s", tf)
 
-                # отчёт уже слали?
+                # отчёт уже отправляли на этот ts?
                 if _report_already_sent(conn, tf, latest_ts):
                     continue
 
