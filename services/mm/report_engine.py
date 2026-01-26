@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
@@ -185,6 +185,93 @@ def _merge_with_persisted(
         return out
 
     return _flt_list(down), _flt_list(up), (str(key_zone) if key_zone else None)
+
+
+# ---------------------------
+# Event helpers (state vs liquidity-events separation)
+# ---------------------------
+
+def _tf_seconds(tf: str) -> int:
+    return {"H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800}.get(tf, 3600)
+
+
+def _is_liq_event_type(et: Optional[str]) -> bool:
+    et = (et or "").strip()
+    return et.startswith("liq_")
+
+
+def _fetch_event_filtered(
+    conn: psycopg.Connection,
+    *,
+    tf: str,
+    ts: datetime,
+    symbol: str,
+    max_age_bars: int,
+    want_liq: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Выбираем событие из mm_market_events в окне [ts - max_age_bars*bar, ts]
+    и фильтруем по типу:
+      want_liq=True  -> только liq_*
+      want_liq=False -> только НЕ liq_*
+    """
+    window_sec = _tf_seconds(tf) * max(1, int(max_age_bars))
+    min_ts = ts - timedelta(seconds=window_sec)
+
+    # NOTE: таблица событий у тебя через market_events_store (mm_market_events).
+    # Если имя таблицы другое — скажешь, поправим (но в проекте она именно mm_market_events).
+    if want_liq:
+        pred = "event_type LIKE 'liq\\_%' ESCAPE '\\'"
+    else:
+        pred = "event_type NOT LIKE 'liq\\_%' ESCAPE '\\'"
+
+    sql = f"""
+    SELECT *
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s
+      AND ts <= %s AND ts >= %s
+      AND {pred}
+    ORDER BY ts DESC, id DESC
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (symbol, tf, ts, min_ts))
+        return cur.fetchone()
+
+
+def _get_state_event_for_ts(
+    conn: psycopg.Connection,
+    *,
+    tf: str,
+    ts: datetime,
+    symbol: str,
+    max_age_bars: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """
+    Событие для STATE: только НЕ liq_*
+    """
+    # Сначала быстрый путь через store (если он вернёт liq_ — пере-фильтруем SQL’ом)
+    ev = get_market_event_for_ts(tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars)
+    if ev and not _is_liq_event_type(ev.get("event_type")):
+        return ev
+    return _fetch_event_filtered(conn, tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars, want_liq=False)
+
+
+def _get_liq_event_for_ts(
+    conn: psycopg.Connection,
+    *,
+    tf: str,
+    ts: datetime,
+    symbol: str,
+    max_age_bars: int = 2,
+) -> Optional[Dict[str, Any]]:
+    """
+    Событие LIQUIDITY EVENTS: только liq_*
+    """
+    ev = get_market_event_for_ts(tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars)
+    if ev and _is_liq_event_type(ev.get("event_type")):
+        return ev
+    return _fetch_event_filtered(conn, tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars, want_liq=True)
 
 
 # ---------------------------
@@ -503,7 +590,7 @@ def _tf_rank(tf: str) -> int:
     return {"H1": 1, "H4": 2, "D1": 3, "W1": 4}.get(tf, 99)
 
 
-def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Dict[str, Any]]:
+def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_for_dist: float) -> List[Dict[str, Any]]:
     tfs = MTF_CONTEXT.get(primary_tf, [])
     out: List[Dict[str, Any]] = []
 
@@ -520,7 +607,8 @@ def _build_mtf_context(primary_tf: str, *, btc_close_for_dist: float) -> List[Di
 
             ev = None
             if st_ts:
-                ev = get_market_event_for_ts(tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
+                # ✅ ВАЖНО: HTF state не должен "прилипать" к liq_ событиям
+                ev = _get_state_event_for_ts(conn, tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
 
             st = _event_driven_state(tf, btc_close=btc_close_for_dist, dn_targets=down_t, up_targets=up_t, ev=ev)
 
@@ -567,6 +655,12 @@ class MarketView:
     range_rh_zone: Dict[str, float]   # {"lo":..., "hi":...}
     range_rl_zone: Dict[str, float]   # {"lo":..., "hi":...}
     range_width: float
+
+    # ✅ NEW: Liquidity events (signal-layer; не влияет на state)
+    liq_event_type: Optional[str]
+    liq_event_side: Optional[str]
+    liq_event_level: Optional[float]
+    liq_event_zone: Optional[str]
 
     btc_oi: Optional[float]
     btc_oi_delta: Optional[float]
@@ -634,8 +728,9 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
 
         # ─────────────────────────────────────────
         # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned
+        # ✅ ВАЖНО: state берём только из НЕ liq_ событий
         # ─────────────────────────────────────────
-        ev = get_market_event_for_ts(tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
+        ev = _get_state_event_for_ts(conn, tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
         st = _event_driven_state(tf, btc_close=btc_close, dn_targets=down_t, up_targets=up_t, ev=ev)
 
         state_title = st["state_title"]
@@ -647,6 +742,19 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         whats_next = st["whats_next"]
         invalidation = st["invalidation"]
         key_zone = st.get("key_zone") or key_zone0
+
+        # ─────────────────────────────────────────
+        # ✅ LIQUIDITY EVENTS (signal-layer, report-only)
+        # ─────────────────────────────────────────
+        liq_ev = _get_liq_event_for_ts(conn, tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
+        liq_event_type = (liq_ev.get("event_type") if liq_ev else None)
+        liq_event_side = (liq_ev.get("side") if liq_ev else None)
+        liq_event_level = None
+        try:
+            liq_event_level = float(liq_ev.get("level")) if liq_ev and liq_ev.get("level") is not None else None
+        except Exception:
+            liq_event_level = None
+        liq_event_zone = (liq_ev.get("zone") if liq_ev else None)
 
         # ─────────────────────────────────────────
         # ✅ RANGE ENGINE (zones + acceptance-only, stateful)
@@ -706,14 +814,11 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 "eth_confirmation": eth_conf,
                 "event_type": st.get("event_type"),
             }
-            # ✅ inject range patch into payload
+            # ✅ inject range patch into payload (range — часть state/режима)
             payload.update(range_patch)
 
-            save_state(
-                tf=tf,
-                ts=ts,
-                payload=payload,
-            )
+            # ❗ liq_event_* НЕ сохраняем в state (чтобы не путать слои)
+            save_state(tf=tf, ts=ts, payload=payload)
         except Exception:
             pass
 
@@ -721,7 +826,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         act = compute_action(tf=tf)
 
         # MTF context (report-only)
-        mtf_context = _build_mtf_context(tf, btc_close_for_dist=btc_close)
+        mtf_context = _build_mtf_context(conn, tf, btc_close_for_dist=btc_close)
 
         return MarketView(
             tf=("MANUAL" if manual else tf),
@@ -740,6 +845,12 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             range_rh_zone=rr.rh.to_dict(),
             range_rl_zone=rr.rl.to_dict(),
             range_width=float(rr.width),
+
+            # ✅ liquidity events (report-only)
+            liq_event_type=liq_event_type,
+            liq_event_side=liq_event_side,
+            liq_event_level=liq_event_level,
+            liq_event_zone=liq_event_zone,
 
             btc_oi=btc_oi,
             btc_oi_delta=btc_oi_d,
@@ -789,7 +900,6 @@ def render_report(view: MarketView) -> str:
     rl_lo = view.range_rl_zone.get("lo")
     rl_hi = view.range_rl_zone.get("hi")
 
-    # короткие статусы, чтобы было читабельно в телеге
     rs = view.range_state
     if rs == "HOLDING":
         rs_txt = "HOLDING (внутри диапазона)"
@@ -812,6 +922,26 @@ def render_report(view: MarketView) -> str:
     lines.append(f"• RH zone: {_fmt_price(rh_lo)} → {_fmt_price(rh_hi)}")
     lines.append(f"• RL zone: {_fmt_price(rl_lo)} → {_fmt_price(rl_hi)}")
     lines.append(f"• Zone width: ~{_fmt_price(view.range_width)}")
+    lines.append("")
+
+    # ✅ LIQUIDITY EVENTS (signal-layer)
+    lines.append("LIQUIDITY EVENTS (signal only):")
+    if view.liq_event_type:
+        et = str(view.liq_event_type)
+        side = (str(view.liq_event_side) if view.liq_event_side else "—")
+        lvl = _fmt_price(view.liq_event_level)
+        zn = str(view.liq_event_zone) if view.liq_event_zone else "—"
+
+        if et == "liq_sweep_high":
+            et_txt = "LIQ SWEEP HIGH (локальная ликвидность снята сверху)"
+        elif et == "liq_sweep_low":
+            et_txt = "LIQ SWEEP LOW (локальная ликвидность снята снизу)"
+        else:
+            et_txt = et
+
+        lines.append(f"• {et_txt} | side: {side} | level: {lvl} | zone: {zn}")
+    else:
+        lines.append("• —")
     lines.append("")
 
     lines.append("Цели ликвидности (BTC):")
