@@ -31,9 +31,6 @@ class LiquidityLevels:
     tf: str
     ts: datetime
 
-    range_high: Optional[float]
-    range_low: Optional[float]
-
     eqh: Optional[float]
     eql: Optional[float]
 
@@ -45,7 +42,7 @@ class LiquidityLevels:
 
 def _fetch_history(conn: psycopg.Connection, tf: str, limit: int) -> List[Dict[str, Any]]:
     sql = """
-    SELECT ts, high, low, close
+    SELECT ts, high, low
     FROM mm_snapshots
     WHERE symbol='BTC-USDT' AND tf=%s
     ORDER BY ts DESC
@@ -90,8 +87,6 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
         return LiquidityLevels(
             tf=tf,
             ts=ts,
-            range_high=None,
-            range_low=None,
             eqh=None,
             eql=None,
             up_targets=[],
@@ -102,11 +97,10 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     highs = [float(r["high"]) for r in hist if r.get("high") is not None]
     lows = [float(r["low"]) for r in hist if r.get("low") is not None]
 
-    range_high = max(highs) if highs else None
-    range_low = min(lows) if lows else None
-
+    # Толеранс для кластеров
     tol = 0.0012 if tf in ("H1", "H4") else (0.0018 if tf == "D1" else 0.0025)
 
+    # Берём верхние/нижние хвосты для кластеризации
     top_highs = sorted(highs, reverse=True)[:40]
     bot_lows = sorted(lows)[:40]
 
@@ -117,31 +111,37 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     dn_targets: List[float] = []
     notes: List[str] = []
 
+    # EQH / EQL — это ликвидность
     if eqh is not None:
         up_targets.append(eqh)
-        notes.append("eqh")
-    if range_high is not None:
-        if not up_targets or not _near(up_targets[-1], range_high, tol):
-            up_targets.append(range_high)
-        notes.append("range_high")
+        notes.append("eqh_cluster")
 
     if eql is not None:
         dn_targets.append(eql)
-        notes.append("eql")
-    if range_low is not None:
-        if not dn_targets or not _near(dn_targets[-1], range_low, tol):
-            dn_targets.append(range_low)
-        notes.append("range_low")
+        notes.append("eql_cluster")
 
-    dn_targets = sorted(list(dict.fromkeys(dn_targets)), reverse=True)[:2]
+    # Дополнительно: вторые кластеры (если есть)
+    # Это даёт L2 ликвидность, но без экстремумов
+    alt_eqh = _cluster_level(top_highs[10:], tol=tol, min_hits=2)
+    alt_eql = _cluster_level(bot_lows[10:], tol=tol, min_hits=2)
+
+    if alt_eqh and (not eqh or not _near(alt_eqh, eqh, tol)):
+        up_targets.append(alt_eqh)
+        notes.append("eqh_alt")
+
+    if alt_eql and (not eql or not _near(alt_eql, eql, tol)):
+        dn_targets.append(alt_eql)
+        notes.append("eql_alt")
+
+    # Упорядочиваем
     up_targets = sorted(list(dict.fromkeys(up_targets)))[:2]
+    dn_targets = sorted(list(dict.fromkeys(dn_targets)), reverse=True)[:2]
 
     ts = hist[0]["ts"]
+
     return LiquidityLevels(
         tf=tf,
         ts=ts,
-        range_high=range_high,
-        range_low=range_low,
         eqh=eqh,
         eql=eql,
         up_targets=up_targets,
@@ -149,6 +149,10 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
         notes=notes[:8],
     )
 
+
+# ─────────────────────────────────────────────
+# Persistence (mm_events : liq_levels)
+# ─────────────────────────────────────────────
 
 def _load_last_liq_row(conn: psycopg.Connection, tf: str) -> Optional[Tuple[datetime, Dict[str, Any]]]:
     sql = """
@@ -171,8 +175,7 @@ def _nfloat(x: Any, ndigits: int = 8) -> Optional[float]:
     if x is None:
         return None
     try:
-        v = float(x)
-        return round(v, ndigits)
+        return round(float(x), ndigits)
     except Exception:
         return None
 
@@ -180,7 +183,7 @@ def _nfloat(x: Any, ndigits: int = 8) -> Optional[float]:
 def _nlist(xs: Any, ndigits: int = 8) -> List[float]:
     out: List[float] = []
     for v in (xs or []):
-        nv = _nfloat(v, ndigits=ndigits)
+        nv = _nfloat(v, ndigits)
         if nv is not None:
             out.append(nv)
     return out
@@ -190,41 +193,17 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
     if not prev_payload:
         return False
 
-    prev_range_high = _nfloat(prev_payload.get("range_high"))
-    prev_range_low = _nfloat(prev_payload.get("range_low"))
-    prev_eqh = _nfloat(prev_payload.get("eqh"))
-    prev_eql = _nfloat(prev_payload.get("eql"))
-    prev_up = _nlist(prev_payload.get("up_targets"))
-    prev_dn = _nlist(prev_payload.get("dn_targets"))
-
-    lv_range_high = _nfloat(lv.range_high)
-    lv_range_low = _nfloat(lv.range_low)
-    lv_eqh = _nfloat(lv.eqh)
-    lv_eql = _nfloat(lv.eql)
-    lv_up = _nlist(lv.up_targets)
-    lv_dn = _nlist(lv.dn_targets)
-
     return (
-        prev_range_high == lv_range_high
-        and prev_range_low == lv_range_low
-        and prev_eqh == lv_eqh
-        and prev_eql == lv_eql
-        and prev_up == lv_up
-        and prev_dn == lv_dn
+        _nfloat(prev_payload.get("eqh")) == _nfloat(lv.eqh)
+        and _nfloat(prev_payload.get("eql")) == _nfloat(lv.eql)
+        and _nlist(prev_payload.get("up_targets")) == _nlist(lv.up_targets)
+        and _nlist(prev_payload.get("dn_targets")) == _nlist(lv.dn_targets)
     )
 
 
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
-    """
-    liq_levels хранится в mm_events как "последнее состояние" на TF.
-    В mm_events стоит partial unique index ux_mm_events_state:
-      UNIQUE (event_type, tf) WHERE event_type IN ('mm_state','report_sent','liq_levels')
-    Поэтому UPSERT должен повторять WHERE-предикат.
-    """
     payload = {
         "tf": levels.tf,
-        "range_high": levels.range_high,
-        "range_low": levels.range_low,
         "eqh": levels.eqh,
         "eql": levels.eql,
         "up_targets": levels.up_targets,
@@ -254,7 +233,10 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
                 return False
 
         with conn.cursor() as cur:
-            cur.execute(sql_upsert, (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)))
+            cur.execute(
+                sql_upsert,
+                (levels.ts, levels.tf, "BTC-USDT", "liq_levels", Jsonb(payload)),
+            )
         conn.commit()
 
     return True
@@ -283,9 +265,7 @@ def load_last_liquidity_levels(tf: str) -> Optional[Dict[str, Any]]:
 def _has_targets(payload: Optional[Dict[str, Any]]) -> bool:
     if not payload:
         return False
-    up = payload.get("up_targets") or []
-    dn = payload.get("dn_targets") or []
-    return bool(up) or bool(dn)
+    return bool(payload.get("up_targets") or payload.get("dn_targets"))
 
 
 async def update_liquidity_memory(tfs: List[str]) -> List[str]:
@@ -294,7 +274,7 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
 
-        if (not lv.up_targets and not lv.dn_targets) and ("insufficient_history" in (lv.notes or [])):
+        if not lv.up_targets and not lv.dn_targets and "insufficient_history" in lv.notes:
             prev = load_last_liquidity_levels(tf)
             if _has_targets(prev):
                 out.append(f"{tf}: skip(empty) keep_prev up={prev.get('up_targets')} dn={prev.get('dn_targets')}")
@@ -302,8 +282,8 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
 
         wrote = save_liquidity_levels(lv)
         if wrote:
-            out.append(f"{tf}: wrote(ts_or_change) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+            out.append(f"{tf}: wrote up={lv.up_targets} dn={lv.dn_targets}")
         else:
-            out.append(f"{tf}: skip(no_change_same_ts) up={lv.up_targets} dn={lv.dn_targets} eqh={lv.eqh} eql={lv.eql}")
+            out.append(f"{tf}: skip(no_change) up={lv.up_targets} dn={lv.dn_targets}")
 
     return out
