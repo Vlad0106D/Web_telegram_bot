@@ -172,12 +172,13 @@ def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bo
     exp = _expected_close_ts(tf, now)
     if exp is None:
         return True
+    # ❗ политика "без бэкфилла": только если свеча закрылась именно на ожидаемой границе
     return latest_ts == exp
 
 
 # =============================================================================
 # ACTION ENGINE persistence (под твою таблицу mm_action_engine)
-# columns: action_ts, action_close, action_direction, action_reason, confidence, eval_status, ...
+# action_direction CHECK: ('up','down','wait')
 # =============================================================================
 
 def _thresholds(tf: str) -> Tuple[float, float, int]:
@@ -231,7 +232,8 @@ def _insert_action_decision(conn: psycopg.Connection, *, tf: str, action_ts: dat
     if _action_row_exists(conn, tf=tf, action_ts=action_ts):
         return False
 
-    direction = "UP" if dec.action == "LONG_ALLOWED" else "DOWN"
+    # ✅ ВАЖНО: constraint в БД = ('up','down','wait')
+    direction = "up" if dec.action == "LONG_ALLOWED" else "down"
 
     payload = {
         "status": "pending",
@@ -272,7 +274,7 @@ def _insert_action_decision(conn: psycopg.Connection, *, tf: str, action_ts: dat
                 action_ts,
                 float(action_close),
                 direction,
-                dec.reason,
+                dec.reason or "",
                 int(dec.confidence),
                 "pending",
                 Jsonb(meta),
@@ -359,7 +361,8 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
         row_id = int(r["id"])
         action_ts = r.get("action_ts")
         action_close = r.get("action_close")
-        direction = (r.get("action_direction") or "").upper().strip()
+        # ✅ ВАЖНО: direction в таблице = 'up'/'down'/'wait'
+        direction = (r.get("action_direction") or "").lower().strip()
 
         if action_ts is None or action_close is None:
             continue
@@ -378,7 +381,7 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
 
         status = "pending"
 
-        if direction == "UP":
+        if direction == "up":
             if delta_pct >= confirm_pct:
                 status = "confirmed"
             elif delta_pct <= -fail_pct:
@@ -386,7 +389,7 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
             elif bars_passed >= max_bars:
                 status = "failed" if delta_pct < 0 else "pending"
 
-        elif direction == "DOWN":
+        elif direction == "down":
             if delta_pct <= -confirm_pct:
                 status = "confirmed"
             elif delta_pct >= fail_pct:
@@ -394,6 +397,7 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
             elif bars_passed >= max_bars:
                 status = "failed" if delta_pct > 0 else "pending"
         else:
+            # wait/unknown — пропускаем
             continue
 
         patch = {
@@ -451,7 +455,7 @@ async def _mm_auto_tick(app: Application) -> None:
             if latest_ts is None:
                 continue
 
-            # ✅ FIX: D1/W1 НЕ зависят от seen-map (иначе отчёт может “залипнуть” навсегда)
+            # ✅ D1/W1 НЕ зависят от seen-map (иначе может “залипнуть”)
             if tf not in ("D1", "W1"):
                 if seen.get(tf) == _iso(latest_ts):
                     continue
@@ -461,12 +465,12 @@ async def _mm_auto_tick(app: Application) -> None:
         if not tfs_to_process:
             return
 
-        # ✅ seen отмечаем только для H1/H4 (и прочих не-close tf)
+        # ✅ seen отмечаем только для H1/H4 и прочих
         for tf, ts in tfs_to_process:
             if tf not in ("D1", "W1"):
                 seen[tf] = _iso(ts)
 
-        # 2) LIQUIDITY MEMORY (можно на всех tfs_to_process)
+        # 2) LIQUIDITY MEMORY
         try:
             await update_liquidity_memory([tf for tf, _ in tfs_to_process])
         except Exception:
@@ -488,7 +492,7 @@ async def _mm_auto_tick(app: Application) -> None:
                 if latest_ts is None:
                     continue
 
-                # D1/W1 — только “правильный close ts”
+                # D1/W1 — только “правильный close ts” (без бэкфилла)
                 if tf in ("D1", "W1") and not _should_send_close_report(tf, latest_ts, now):
                     exp = _expected_close_ts(tf, now)
                     log.info(
@@ -511,7 +515,7 @@ async def _mm_auto_tick(app: Application) -> None:
                             log.exception("MM auto: action persistence failed tf=%s (close-report skipped)", tf)
                     continue
 
-                # строим view -> внутри сохранится mm_state (save_state) + compute_action в отчёте
+                # строим view (внутри сохранится mm_state)
                 view = build_market_view(tf, manual=False)
 
                 # ACTION persistence/eval (по закрытой свече)
@@ -530,11 +534,10 @@ async def _mm_auto_tick(app: Application) -> None:
                 if _report_already_sent(conn, tf, latest_ts):
                     continue
 
-                # генерим текст и отправляем
+                # отправляем отчёт
                 text = render_report(view)
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
-                # отмечаем report_sent
                 payload = {
                     "kind": "auto",
                     "tf": tf,
@@ -569,7 +572,6 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("JobQueue unavailable — cannot schedule MM auto")
         return created
 
-    # remove previous mm_auto jobs
     for job in list(jq.jobs()):
         if job and job.name and job.name.startswith("mm_auto"):
             try:
