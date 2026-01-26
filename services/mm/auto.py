@@ -157,6 +157,8 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 # =============================================================================
 # CLOSE-TIME POLICY (D1/W1) — чтобы не слать "догоняющие" отчёты после рестарта
+# ВАЖНО: ts в mm_snapshots = open_ts свечи (как у OKX candles), а не close_ts
+# Поэтому для проверки close boundary считаем close_ts = latest_ts + period(tf)
 # =============================================================================
 
 def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
@@ -172,12 +174,28 @@ def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
     return None
 
 
+def _tf_period(tf: str) -> Optional[timedelta]:
+    if tf == "D1":
+        return timedelta(days=1)
+    if tf == "W1":
+        return timedelta(days=7)
+    return None
+
+
 def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bool:
     exp = _expected_close_ts(tf, now)
     if exp is None:
         return True
-    # ❗ политика "без бэкфилла": только если свеча закрылась именно на ожидаемой границе
-    return latest_ts == exp
+
+    period = _tf_period(tf)
+    if period is None:
+        return True
+
+    # latest_ts = open_ts закрытой свечи
+    close_ts = latest_ts + period
+
+    # ❗ политика "без бэкфилла": только если закрытие свечи попало ровно в ожидаемую границу
+    return close_ts == exp
 
 
 # =============================================================================
@@ -365,7 +383,6 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
         row_id = int(r["id"])
         action_ts = r.get("action_ts")
         action_close = r.get("action_close")
-        # ✅ ВАЖНО: direction в таблице = 'up'/'down'/'wait'
         direction = (r.get("action_direction") or "").lower().strip()
 
         if action_ts is None or action_close is None:
@@ -401,7 +418,6 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
             elif bars_passed >= max_bars:
                 status = "failed" if delta_pct > 0 else "pending"
         else:
-            # wait/unknown — пропускаем
             continue
 
         patch = {
@@ -496,24 +512,44 @@ async def _mm_auto_tick(app: Application) -> None:
                 if latest_ts is None:
                     continue
 
-                # D1/W1 — только “правильный close ts” (без бэкфилла)
+                # D1/W1 — только “правильный close boundary” (без бэкфилла)
                 if tf in ("D1", "W1") and not _should_send_close_report(tf, latest_ts, now):
                     exp = _expected_close_ts(tf, now)
+                    period = _tf_period(tf)
+                    close_ts = (latest_ts + period) if period else None
+
                     log.info(
-                        "MM report skipped(tf=%s): latest_ts=%s is not close_ts=%s",
+                        "MM report skipped(tf=%s): latest_open_ts=%s close_ts=%s is not expected_close_ts=%s",
                         tf,
                         latest_ts,
+                        close_ts,
                         exp,
                     )
+
                     # action считаем/пишем даже если close-report skip
                     latest_close = _get_latest_snapshot_close(conn, tf)
                     if latest_close is not None:
                         try:
-                            ins = _insert_action_decision(conn, tf=tf, action_ts=latest_ts, action_close=float(latest_close))
-                            evn = _evaluate_pending(conn, tf=tf, latest_ts=latest_ts, latest_close=float(latest_close))
+                            ins = _insert_action_decision(
+                                conn,
+                                tf=tf,
+                                action_ts=latest_ts,
+                                action_close=float(latest_close),
+                            )
+                            evn = _evaluate_pending(
+                                conn,
+                                tf=tf,
+                                latest_ts=latest_ts,
+                                latest_close=float(latest_close),
+                            )
                             if ins or evn:
                                 conn.commit()
-                            log.info("MM action_engine(%s) insert=%s eval=%s (close-report skipped)", tf, ins, evn)
+                            log.info(
+                                "MM action_engine(%s) insert=%s eval=%s (close-report skipped)",
+                                tf,
+                                ins,
+                                evn,
+                            )
                         except Exception:
                             conn.rollback()
                             log.exception("MM auto: action persistence failed tf=%s (close-report skipped)", tf)
@@ -526,8 +562,18 @@ async def _mm_auto_tick(app: Application) -> None:
                 latest_close = _get_latest_snapshot_close(conn, tf)
                 if latest_close is not None:
                     try:
-                        inserted = _insert_action_decision(conn, tf=tf, action_ts=view.ts, action_close=float(latest_close))
-                        evaluated = _evaluate_pending(conn, tf=tf, latest_ts=view.ts, latest_close=float(latest_close))
+                        inserted = _insert_action_decision(
+                            conn,
+                            tf=tf,
+                            action_ts=view.ts,
+                            action_close=float(latest_close),
+                        )
+                        evaluated = _evaluate_pending(
+                            conn,
+                            tf=tf,
+                            latest_ts=view.ts,
+                            latest_close=float(latest_close),
+                        )
                         conn.commit()
                         log.info("MM action_engine(%s) inserted=%s evaluated=%s", tf, inserted, evaluated)
                     except Exception:
@@ -606,8 +652,10 @@ def schedule_mm_auto(app: Application) -> List[str]:
 
     name = "mm_auto_tick"
 
-    # ✅ ключевое место: APScheduler job_kwargs
-    # max_instances=2 -> APScheduler не будет ругаться, а параллелизм всё равно режет lock
+    # ✅ APScheduler job_kwargs:
+    # max_instances=2 -> не будет warning'ов APScheduler
+    # coalesce=True -> если были пропуски, не будет "догонялок" пачкой
+    # misfire_grace_time=30 -> не исполнять слишком старые прогоны
     jq.run_repeating(
         callback=_mm_auto_job_callback,
         interval=MM_AUTO_CHECK_SEC,
