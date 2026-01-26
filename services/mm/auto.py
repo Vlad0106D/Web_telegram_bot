@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List, Tuple
@@ -17,15 +16,18 @@ from services.mm.snapshots import run_snapshots_once
 from services.mm.report_engine import build_market_view, render_report
 from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
-from services.mm.action_engine import compute_action  # ✅ берём решение отсюда (MTF-aware)
+from services.mm.liquidity_events_detector import detect_and_store_liquidity_events  # ✅ NEW
+from services.mm.action_engine import compute_action  # ✅ MTF-aware decision
 
 log = logging.getLogger(__name__)
 
 MM_AUTO_ENABLED_ENV = (os.getenv("MM_AUTO_ENABLED", "1").strip() == "1")
+
+# интервал из env (как раньше)
 MM_AUTO_CHECK_SEC = int((os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60"))
 
-# ✅ single-flight lock для MM auto tick (чтобы не было параллельных запусков)
-_mm_auto_lock = asyncio.Lock()
+# опционально: мягкая защита от overlap-логов (можно выключить MM_AUTO_MIN_INTERVAL_SEC=0)
+MM_AUTO_MIN_INTERVAL_SEC = int((os.getenv("MM_AUTO_MIN_INTERVAL_SEC", "0").strip() or "0"))
 
 
 def _read_chat_id() -> Optional[int]:
@@ -109,10 +111,12 @@ def _get_seen_map(app: Application) -> Dict[str, str]:
     if not isinstance(m, dict):
         m = {}
         app.bot_data["mm_last_seen_snapshot_ts"] = m
+
     out: Dict[str, str] = {}
     for k, v in m.items():
         if isinstance(k, str) and isinstance(v, str):
             out[k] = v
+
     app.bot_data["mm_last_seen_snapshot_ts"] = out
     return out
 
@@ -157,28 +161,20 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 # =============================================================================
 # CLOSE-TIME POLICY (D1/W1) — чтобы не слать "догоняющие" отчёты после рестарта
-# ВАЖНО: ts в mm_snapshots = open_ts свечи (как у OKX candles), а не close_ts
-# Поэтому для проверки close boundary считаем close_ts = latest_ts + period(tf)
 # =============================================================================
 
 def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
     now = now.astimezone(timezone.utc).replace(microsecond=0)
 
     if tf == "D1":
+        # D1 utc close -> ts = 00:00 текущего дня (свеча, закрывшаяся в 00:00)
         return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 
     if tf == "W1":
+        # W1 utc close -> ts = понедельник 00:00 текущей недели
         monday = (now.date() - timedelta(days=now.weekday()))
         return datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
 
-    return None
-
-
-def _tf_period(tf: str) -> Optional[timedelta]:
-    if tf == "D1":
-        return timedelta(days=1)
-    if tf == "W1":
-        return timedelta(days=7)
     return None
 
 
@@ -186,28 +182,16 @@ def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bo
     exp = _expected_close_ts(tf, now)
     if exp is None:
         return True
-
-    period = _tf_period(tf)
-    if period is None:
-        return True
-
-    # latest_ts = open_ts закрытой свечи
-    close_ts = latest_ts + period
-
-    # ❗ политика "без бэкфилла": только если закрытие свечи попало ровно в ожидаемую границу
-    return close_ts == exp
+    # политика "без бэкфилла": только если закрытие на ожидаемой границе
+    return latest_ts == exp
 
 
 # =============================================================================
-# ACTION ENGINE persistence (под твою таблицу mm_action_engine)
+# ACTION ENGINE persistence (под таблицу mm_action_engine)
 # action_direction CHECK: ('up','down','wait')
 # =============================================================================
 
 def _thresholds(tf: str) -> Tuple[float, float, int]:
-    """
-    confirm_pct / fail_pct в процентах (например 0.15 = 0.15%)
-    max_bars по tf
-    """
     confirm = float((os.getenv("MM_ACTION_CONFIRM_PCT") or "0.15").strip())
     fail = float((os.getenv("MM_ACTION_FAIL_PCT") or "0.15").strip())
 
@@ -243,18 +227,13 @@ def _action_row_exists(conn: psycopg.Connection, *, tf: str, action_ts: datetime
 
 
 def _insert_action_decision(conn: psycopg.Connection, *, tf: str, action_ts: datetime, action_close: float) -> bool:
-    """
-    Вставляем 1 решение на закрытую свечу, если action != NONE.
-    """
     dec = compute_action(tf=tf)
     if dec.action not in ("LONG_ALLOWED", "SHORT_ALLOWED"):
         return False
 
-    # антидубль
     if _action_row_exists(conn, tf=tf, action_ts=action_ts):
         return False
 
-    # ✅ ВАЖНО: constraint в БД = ('up','down','wait')
     direction = "up" if dec.action == "LONG_ALLOWED" else "down"
 
     payload = {
@@ -265,10 +244,7 @@ def _insert_action_decision(conn: psycopg.Connection, *, tf: str, action_ts: dat
         "created_at": _now_utc().isoformat(),
     }
 
-    meta = {
-        "engine": "v1",
-        "tf": tf,
-    }
+    meta = {"engine": "v1", "tf": tf}
 
     sql = """
     INSERT INTO mm_action_engine (
@@ -496,6 +472,15 @@ async def _mm_auto_tick(app: Application) -> None:
         except Exception:
             log.exception("MM auto: liquidity memory failed")
 
+        # 2.5) LIQUIDITY EVENTS (NEW LAYER)
+        for tf, _ in tfs_to_process:
+            try:
+                evs = detect_and_store_liquidity_events(tf)
+                if evs:
+                    log.info("MM liquidity events %s: %s", tf, "; ".join(evs))
+            except Exception:
+                log.exception("MM auto: liquidity events failed for tf=%s", tf)
+
         # 3) MARKET EVENTS
         for tf, _ in tfs_to_process:
             try:
@@ -512,17 +497,13 @@ async def _mm_auto_tick(app: Application) -> None:
                 if latest_ts is None:
                     continue
 
-                # D1/W1 — только “правильный close boundary” (без бэкфилла)
+                # D1/W1 — только “правильный close ts” (без бэкфилла)
                 if tf in ("D1", "W1") and not _should_send_close_report(tf, latest_ts, now):
                     exp = _expected_close_ts(tf, now)
-                    period = _tf_period(tf)
-                    close_ts = (latest_ts + period) if period else None
-
                     log.info(
-                        "MM report skipped(tf=%s): latest_open_ts=%s close_ts=%s is not expected_close_ts=%s",
+                        "MM report skipped(tf=%s): latest_ts=%s is not close_ts=%s",
                         tf,
                         latest_ts,
-                        close_ts,
                         exp,
                     )
 
@@ -531,16 +512,10 @@ async def _mm_auto_tick(app: Application) -> None:
                     if latest_close is not None:
                         try:
                             ins = _insert_action_decision(
-                                conn,
-                                tf=tf,
-                                action_ts=latest_ts,
-                                action_close=float(latest_close),
+                                conn, tf=tf, action_ts=latest_ts, action_close=float(latest_close)
                             )
                             evn = _evaluate_pending(
-                                conn,
-                                tf=tf,
-                                latest_ts=latest_ts,
-                                latest_close=float(latest_close),
+                                conn, tf=tf, latest_ts=latest_ts, latest_close=float(latest_close)
                             )
                             if ins or evn:
                                 conn.commit()
@@ -581,7 +556,7 @@ async def _mm_auto_tick(app: Application) -> None:
                         log.exception("MM auto: action persistence failed tf=%s", tf)
 
                 # отчёт уже отправляли на этот ts?
-                if _report_already_sent(conn, tf, latest_ts):
+                if _report_already_sent(conn, tf, view.ts):
                     continue
 
                 # отправляем отчёт
@@ -604,26 +579,6 @@ async def _mm_auto_tick(app: Application) -> None:
                 log.exception("MM auto: report failed tf=%s", tf)
 
 
-async def _mm_auto_tick_locked(app: Application) -> None:
-    """
-    ✅ single-flight wrapper:
-    - если прошлый тик ещё идёт — выходим без параллельного запуска
-    """
-    if _mm_auto_lock.locked():
-        log.info("MM auto tick skipped (lock busy)")
-        return
-
-    async with _mm_auto_lock:
-        await _mm_auto_tick(app)
-
-
-async def _mm_auto_job_callback(ctx) -> None:
-    """
-    JobQueue callback (PTB): сюда приходит context, из него достаём application.
-    """
-    await _mm_auto_tick_locked(ctx.application)
-
-
 def schedule_mm_auto(app: Application) -> List[str]:
     created: List[str] = []
 
@@ -642,7 +597,7 @@ def schedule_mm_auto(app: Application) -> List[str]:
         log.warning("JobQueue unavailable — cannot schedule MM auto")
         return created
 
-    # cleanup старых mm_auto jobs
+    # remove existing jobs
     for job in list(jq.jobs()):
         if job and job.name and job.name.startswith("mm_auto"):
             try:
@@ -652,26 +607,29 @@ def schedule_mm_auto(app: Application) -> List[str]:
 
     name = "mm_auto_tick"
 
-    # ✅ APScheduler job_kwargs:
-    # max_instances=2 -> не будет warning'ов APScheduler
-    # coalesce=True -> если были пропуски, не будет "догонялок" пачкой
-    # misfire_grace_time=30 -> не исполнять слишком старые прогоны
+    interval = int(MM_AUTO_CHECK_SEC)
+    if MM_AUTO_MIN_INTERVAL_SEC > 0:
+        interval = max(interval, int(MM_AUTO_MIN_INTERVAL_SEC))
+
+    # APScheduler job_kwargs (уменьшают шум/мисфайры; max_instances оставляем 1)
+    job_kwargs = {
+        "coalesce": True,
+        "max_instances": 1,
+        "misfire_grace_time": 30,
+    }
+
     jq.run_repeating(
-        callback=_mm_auto_job_callback,
-        interval=MM_AUTO_CHECK_SEC,
+        callback=lambda ctx: _mm_auto_tick(ctx.application),
+        interval=interval,
         first=10,
         name=name,
-        job_kwargs={
-            "max_instances": 2,
-            "coalesce": True,
-            "misfire_grace_time": 30,
-        },
+        job_kwargs=job_kwargs,
     )
     created.append(name)
 
     log.info(
         "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",
-        MM_AUTO_CHECK_SEC,
+        interval,
         ",".join(MM_TFS),
         MM_ALERT_CHAT_ID,
     )
