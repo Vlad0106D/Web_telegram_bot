@@ -209,34 +209,38 @@ def _fetch_event_filtered(
     max_age_bars: int,
     want_liq: bool,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Выбираем событие из mm_market_events в окне [ts - max_age_bars*bar, ts]
-    и фильтруем по типу:
-      want_liq=True  -> только liq_*
-      want_liq=False -> только НЕ liq_*
-    """
-    window_sec = _tf_seconds(tf) * max(1, int(max_age_bars))
-    min_ts = ts - timedelta(seconds=window_sec)
 
-    # NOTE: таблица событий у тебя через market_events_store (mm_market_events).
-    # Если имя таблицы другое — скажешь, поправим (но в проекте она именно mm_market_events).
     if want_liq:
-        pred = "event_type LIKE 'liq\\_%' ESCAPE '\\'"
+        event_like = "liq_%"
     else:
-        pred = "event_type NOT LIKE 'liq\\_%' ESCAPE '\\'"
+        event_like = "%"
 
     sql = """
-    SELECT *
-    FROM mm_market_events
-    WHERE symbol=%s AND tf=%s
-      AND ts <= %s AND ts >= %s
-      AND event_type LIKE %s
-    ORDER BY ts DESC, id DESC
-    LIMIT 1;
+        SELECT *
+        FROM mm_market_events
+        WHERE symbol=%s AND tf=%s
+          AND ts <= %s AND ts >= %s
+          AND event_type LIKE %s
+        ORDER BY ts DESC, id DESC
+        LIMIT 1;
     """
-with conn.cursor() as cur:
-    cur.execute(sql, (symbol, tf, ts, min_ts, "liq_%"))
-    return cur.fetchone()
+
+    min_ts = ts  # fallback
+    if max_age_bars > 0:
+        min_ts = ts - timedelta(minutes=1)  # безопасный минимум
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            sql,
+            (
+                symbol,
+                tf,
+                ts,
+                min_ts,
+                event_like,
+            ),
+        )
+        return cur.fetchone()
 
 
 def _get_state_event_for_ts(
