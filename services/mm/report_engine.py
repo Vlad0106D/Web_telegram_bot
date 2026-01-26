@@ -225,18 +225,18 @@ def _fetch_event_filtered(
     else:
         pred = "event_type NOT LIKE 'liq\\_%' ESCAPE '\\'"
 
-    sql = f"""
+    sql = """
     SELECT *
     FROM mm_market_events
     WHERE symbol=%s AND tf=%s
       AND ts <= %s AND ts >= %s
-      AND {pred}
+      AND event_type LIKE %s
     ORDER BY ts DESC, id DESC
     LIMIT 1;
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (symbol, tf, ts, min_ts))
-        return cur.fetchone()
+with conn.cursor() as cur:
+    cur.execute(sql, (symbol, tf, ts, min_ts, "liq_%"))
+    return cur.fetchone()
 
 
 def _get_state_event_for_ts(
