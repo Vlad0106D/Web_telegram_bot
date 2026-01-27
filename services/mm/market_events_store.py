@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Literal
 
 import psycopg
 from psycopg.rows import dict_row
@@ -20,6 +20,29 @@ def _db_url() -> str:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+# ---------------- Layer policy (STATE vs LIQ) ----------------
+def _is_liq_layer_event(event_type: Optional[str]) -> bool:
+    """
+    LIQ-layer события:
+      - liq_* (sweep, reclaim, локальные цели)
+      - local_reclaim* (на случай если где-то пишется без liq_ префикса)
+    """
+    et = (event_type or "").strip()
+    if not et:
+        return False
+    return et.startswith("liq_") or et.startswith("local_reclaim")
+
+
+def _layer_allows(event_type: Optional[str], layer: Literal["any", "state", "liq"]) -> bool:
+    if layer == "any":
+        return True
+    is_liq = _is_liq_layer_event(event_type)
+    if layer == "liq":
+        return is_liq
+    # layer == "state"
+    return not is_liq
 
 
 # ---------------- Event selection policy ----------------
@@ -66,6 +89,10 @@ def _lookback_minutes(tf: str) -> int:
 
 
 def _priority(event_type: Optional[str]) -> int:
+    """
+    Для неизвестных событий даём небольшой позитивный приоритет,
+    чтобы они могли победить wait, но проигрывали "сильным" state событиям.
+    """
     if not event_type:
         return -1
     return _EVENT_PRIORITY.get(event_type, 10)
@@ -94,14 +121,19 @@ def _tf_seconds(tf: str) -> int:
 
 
 # ---------------- Public API ----------------
-def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict[str, Any]]:
+def get_last_market_event(
+    *,
+    tf: str,
+    symbol: str = "BTC-USDT",
+    layer: Literal["any", "state", "liq"] = "any",
+) -> Optional[Dict[str, Any]]:
     """
-    Возвращает "последнее валидное событие состояния" для отчёта/ActionEngine.
+    Возвращает "последнее валидное событие" в рамках слоя.
 
-    Ключевая логика:
-    - wait НЕ перебивает давление/sweep/reclaim/accept/decision_zone.
-    - wait используется только как fallback, если в окне lookback нет "сильных" событий.
-    - выбор делаем по приоритету (а не просто самое последнее), чтобы "wait" не затирал контекст.
+    layer:
+      - any   : любые события (как раньше)
+      - state : исключает liq_* и local_reclaim*
+      - liq   : только liq_* и local_reclaim*
     """
     lb_min = _lookback_minutes(tf)
     since = _now_utc() - timedelta(minutes=lb_min)
@@ -133,6 +165,10 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
         ev = _normalize_event_row(r)
         et = (ev.get("event_type") or "").strip() or None
 
+        # ✅ слой-фильтр
+        if not _layer_allows(et, layer):
+            continue
+
         if et == "wait":
             if latest_wait is None:
                 latest_wait = ev
@@ -148,7 +184,14 @@ def get_last_market_event(*, tf: str, symbol: str = "BTC-USDT") -> Optional[Dict
     if latest_wait is not None:
         return latest_wait
 
-    return _normalize_event_row(rows[0])
+    # fallback: самый свежий, который прошёл layer-фильтр
+    for r in rows:
+        ev = _normalize_event_row(r)
+        et = (ev.get("event_type") or "").strip() or None
+        if _layer_allows(et, layer):
+            return ev
+
+    return None
 
 
 def get_market_event_for_ts(
@@ -157,18 +200,15 @@ def get_market_event_for_ts(
     ts: datetime,
     symbol: str = "BTC-USDT",
     max_age_bars: int = 2,
+    layer: Literal["any", "state", "liq"] = "any",
 ) -> Optional[Dict[str, Any]]:
     """
-    ✅ NEW: Возвращает событие, релевантное КОНКРЕТНОЙ свече ts.
+    Возвращает событие, релевантное КОНКРЕТНОЙ свече ts, в рамках слоя.
 
-    Зачем:
-      - репорт строится на конкретной закрытой свече ts
-      - action должен опираться на событие этой же свечи (или ближайших, но в пределах max_age_bars)
-
-    Логика:
-      1) Берём все события в окне [ts - max_age_bars*bar, ts]
-      2) Среди них выбираем best по приоритету (как в get_last_market_event)
-      3) wait используется только как fallback
+    layer:
+      - any   : любые события (как раньше)
+      - state : исключает liq_* и local_reclaim*
+      - liq   : только liq_* и local_reclaim*
     """
     if ts is None:
         return None
@@ -205,6 +245,10 @@ def get_market_event_for_ts(
         ev = _normalize_event_row(r)
         et = (ev.get("event_type") or "").strip() or None
 
+        # ✅ слой-фильтр
+        if not _layer_allows(et, layer):
+            continue
+
         if et == "wait":
             if latest_wait is None:
                 latest_wait = ev
@@ -220,7 +264,14 @@ def get_market_event_for_ts(
     if latest_wait is not None:
         return latest_wait
 
-    return _normalize_event_row(rows[0])
+    # fallback: самый свежий, который прошёл layer-фильтр
+    for r in rows:
+        ev = _normalize_event_row(r)
+        et = (ev.get("event_type") or "").strip() or None
+        if _layer_allows(et, layer):
+            return ev
+
+    return None
 
 
 def insert_market_event(
