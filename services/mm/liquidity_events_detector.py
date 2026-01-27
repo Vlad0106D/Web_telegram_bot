@@ -218,6 +218,32 @@ def _reclaim_already_written_for_sweep(
         return cur.fetchone() is not None
 
 
+def _liq_stale_info(tf: str, *, last_ts: datetime, liq_payload: Dict[str, Any], max_age_bars: int = 2) -> Dict[str, Any]:
+    """
+    ✅ NEW: проверка устаревания liq_levels относительно текущей свечи.
+    Мы НЕ блокируем детектор (чтобы не "молчать"), но помечаем stale для дебага.
+    """
+    liq_ts = liq_payload.get("_liq_ts")
+    if not isinstance(liq_ts, datetime):
+        return {
+            "liq_levels_stale": True,
+            "liq_levels_reason": "no_liq_ts",
+            "liq_ts": _safe_iso(liq_ts),
+            "last_ts": _safe_iso(last_ts),
+            "max_age_bars": int(max_age_bars),
+        }
+
+    age_sec = (last_ts - liq_ts).total_seconds()
+    stale = bool(age_sec > (max(1, int(max_age_bars)) * _tf_seconds(tf)))
+    return {
+        "liq_levels_stale": bool(stale),
+        "liq_levels_age_sec": float(age_sec),
+        "liq_ts": _safe_iso(liq_ts),
+        "last_ts": _safe_iso(last_ts),
+        "max_age_bars": int(max_age_bars),
+    }
+
+
 def detect_and_store_liquidity_events(tf: str) -> List[str]:
     """
     L2: LIQUIDITY ZONES events:
@@ -242,6 +268,14 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
             return out
 
         inserted_types_this_ts: set[str] = set()
+
+        # ✅ NEW: stale-check info (для логов + payload событий)
+        stale_info = _liq_stale_info(tf, last_ts=last.ts, liq_payload=liq_payload, max_age_bars=2)
+        if stale_info.get("liq_levels_stale"):
+            out.append(
+                f"{tf} liq_levels: STALE liq_ts={stale_info.get('liq_ts')} last_ts={stale_info.get('last_ts')}"
+            )
+
         liq_ts_iso = _safe_iso(liq_payload.get("_liq_ts"))
 
         # ==========================================================
@@ -269,7 +303,6 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                         # after liq_sweep_low -> reclaim up
                         if sweep_type == "liq_sweep_low":
                             want = "liq_reclaim_up"
-                            # cross-back: prev.close <= lvl, last.close > lvl*(1+tol)
                             crossed = (float(prev.close) <= lvl) and (float(last.close) > lvl * (1.0 + reclaim_tol))
                             if (
                                 want not in inserted_types_this_ts
@@ -304,6 +337,9 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                                         "sweep_zone": sweep_zone,
                                         "sweep_level_name": sweep_payload.get("level_name"),
                                         "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
+                                        # ✅ NEW: stale debug
+                                        "liq_ts": liq_ts_iso,
+                                        **stale_info,
                                     },
                                 )
                                 out.append(f"{tf} liq_reclaim_up {'+1' if ok else 'skip'}")
@@ -313,7 +349,6 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                         # after liq_sweep_high -> reclaim down
                         if sweep_type == "liq_sweep_high":
                             want = "liq_reclaim_down"
-                            # cross-back: prev.close >= lvl, last.close < lvl*(1-tol)
                             crossed = (float(prev.close) >= lvl) and (float(last.close) < lvl * (1.0 - reclaim_tol))
                             if (
                                 want not in inserted_types_this_ts
@@ -348,6 +383,9 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                                         "sweep_zone": sweep_zone,
                                         "sweep_level_name": sweep_payload.get("level_name"),
                                         "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
+                                        # ✅ NEW: stale debug
+                                        "liq_ts": liq_ts_iso,
+                                        **stale_info,
                                     },
                                 )
                                 out.append(f"{tf} liq_reclaim_down {'+1' if ok else 'skip'}")
@@ -389,6 +427,8 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                     "last_high": float(last.high),
                     "liq_ts": liq_ts_iso,
                     "liq_notes": liq_payload.get("notes"),
+                    # ✅ NEW: stale debug
+                    **stale_info,
                 },
             )
             out.append(f"{tf} liq_sweep_high({level_name}) {'+1' if ok else 'skip'}")
@@ -426,6 +466,8 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                     "last_low": float(last.low),
                     "liq_ts": liq_ts_iso,
                     "liq_notes": liq_payload.get("notes"),
+                    # ✅ NEW: stale debug
+                    **stale_info,
                 },
             )
             out.append(f"{tf} liq_sweep_low({level_name}) {'+1' if ok else 'skip'}")
