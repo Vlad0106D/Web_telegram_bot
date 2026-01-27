@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event
+from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event (now supports layer)
 from services.mm.state_store import load_last_state
 
 
@@ -112,15 +112,6 @@ def _safe_float(x) -> Optional[float]:
         return None
 
 
-def _safe_int(x) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-
 # ---------------- MTF helpers ----------------
 def _mtf_stack(tf: str) -> List[str]:
     """
@@ -197,62 +188,6 @@ def _range_filter(*, st: Dict[str, Any], desired_action: ActionType) -> Tuple[bo
 
 
 # ---------------- LIQ events (local sweeps/reclaims) ----------------
-def _recent_snapshot_window_min_ts(
-    conn: psycopg.Connection, *, tf: str, ts: datetime, max_age_bars: int
-) -> Optional[datetime]:
-    sql = """
-    SELECT ts
-    FROM mm_snapshots
-    WHERE symbol='BTC-USDT' AND tf=%s AND ts <= %s
-    ORDER BY ts DESC
-    LIMIT %s;
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (tf, ts, int(max_age_bars) + 1))
-        rows = cur.fetchall() or []
-    if not rows:
-        return None
-    return rows[-1]["ts"]
-
-
-def _get_event_for_ts_filtered(
-    conn: psycopg.Connection,
-    *,
-    tf: str,
-    ts: datetime,
-    symbol: str,
-    max_age_bars: int,
-    include_types: Optional[Tuple[str, ...]] = None,
-    include_prefix: Optional[str] = None,
-    exclude_prefix: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    min_ts = _recent_snapshot_window_min_ts(conn, tf=tf, ts=ts, max_age_bars=max_age_bars)
-    if min_ts is None:
-        min_ts = ts
-
-    sql = """
-    SELECT *
-    FROM mm_market_events
-    WHERE symbol=%s AND tf=%s AND ts >= %s AND ts <= %s
-    ORDER BY ts DESC, id DESC
-    LIMIT 50;
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (symbol, tf, min_ts, ts))
-        rows = cur.fetchall() or []
-
-    for r in rows:
-        et = str(r.get("event_type") or "").strip()
-        if exclude_prefix and et.startswith(exclude_prefix):
-            continue
-        if include_prefix and not et.startswith(include_prefix):
-            continue
-        if include_types and et not in include_types:
-            continue
-        return r
-    return None
-
-
 def _liq_bias_from_event(liq_ev: Optional[Dict[str, Any]]) -> Tuple[int, int, Optional[str]]:
     """
     Возвращает (bias_up, bias_down, liq_event_type)
@@ -288,6 +223,10 @@ def compute_action(tf: str) -> ActionDecision:
     ✅ TS-aligned:
       market event берётся по ts сохранённого mm_state (st['_state_ts'])
       чтобы action совпадал с отчётом на этой свече.
+
+    ✅ Layer-safe:
+      market_ev берём layer='state' (исключаем liq_* и local_reclaim*)
+      liq_ev   берём layer='liq'
     """
 
     st = load_last_state(tf=tf)
@@ -314,36 +253,29 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=st.get("event_type"),
         )
 
+    # ✅ TS-aligned, layer-safe selection
     market_ev = None
     liq_ev = None
+
     try:
-        market_ev = get_market_event_for_ts(tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2)
+        market_ev = get_market_event_for_ts(
+            tf=tf,
+            ts=state_ts,
+            symbol="BTC-USDT",
+            max_age_bars=2,
+            layer="state",
+        )
     except Exception:
         market_ev = None
 
     try:
-        with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-            conn.execute("SET TIME ZONE 'UTC';")
-
-            liq_ev = _get_event_for_ts_filtered(
-                conn,
-                tf=tf,
-                ts=state_ts,
-                symbol="BTC-USDT",
-                max_age_bars=2,
-                include_prefix="liq_",
-            )
-
-            # если store вернул liq_* как "главное событие" — вытаскиваем market отдельно
-            if market_ev and str(market_ev.get("event_type") or "").startswith("liq_"):
-                market_ev = _get_event_for_ts_filtered(
-                    conn,
-                    tf=tf,
-                    ts=state_ts,
-                    symbol="BTC-USDT",
-                    max_age_bars=2,
-                    exclude_prefix="liq_",
-                )
+        liq_ev = get_market_event_for_ts(
+            tf=tf,
+            ts=state_ts,
+            symbol="BTC-USDT",
+            max_age_bars=2,
+            layer="liq",
+        )
     except Exception:
         liq_ev = None
 
@@ -608,6 +540,10 @@ def compute_action(tf: str) -> ActionDecision:
         event_type=(ev_type or liq_type),
     )
 
+
+# -------------------------------------------------------------------
+# Ниже оставляю твой persistence/eval код без изменений (как у тебя)
+# -------------------------------------------------------------------
 
 def _thresholds(tf: str) -> Tuple[float, float, int]:
     confirm = float((os.getenv("MM_ACTION_CONFIRM_PCT") or "0.15").strip())
