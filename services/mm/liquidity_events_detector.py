@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
@@ -60,6 +60,15 @@ def _safe_iso(ts: Any) -> Optional[str]:
     return None
 
 
+def _tf_seconds(tf: str) -> int:
+    return {
+        "H1": 3600,
+        "H4": 4 * 3600,
+        "D1": 24 * 3600,
+        "W1": 7 * 24 * 3600,
+    }.get(tf, 3600)
+
+
 def _sweep_tol(tf: str) -> float:
     default = {
         "H1": 0.0004,
@@ -93,6 +102,24 @@ def _reclaim_tol(tf: str) -> float:
         return float((os.getenv(key) or str(default)).strip())
     except Exception:
         return float(default)
+
+
+def _reclaim_max_age_bars(tf: str) -> int:
+    """
+    Через сколько баров после sweep мы перестаём искать local reclaim.
+    Env override:
+      MM_LIQ_RECLAIM_MAX_AGE_BARS_H1/H4/D1/W1
+    """
+    default = {"H1": 3, "H4": 2, "D1": 2, "W1": 1}.get(tf, 2)
+    key = f"MM_LIQ_RECLAIM_MAX_AGE_BARS_{tf}"
+    raw = (os.getenv(key) or "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            return max(1, v)
+        except Exception:
+            pass
+    return int(default)
 
 
 def _uniq_keep_order(vals: List[float], tol: float) -> List[float]:
@@ -173,7 +200,7 @@ def _reclaim_already_written_for_sweep(
     want_event_type: str,
 ) -> bool:
     """
-    Защита от спама:
+    Anti-spam:
     если уже записали liq_reclaim_* с payload.sweep_ts == sweep_ts_iso,
     то больше не пишем для этого sweep.
     """
@@ -200,6 +227,7 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
     out: List[str] = []
     sweep_tol = _sweep_tol(tf)
     reclaim_tol = _reclaim_tol(tf)
+    reclaim_max_age_bars = _reclaim_max_age_bars(tf)
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
@@ -214,7 +242,6 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
             return out
 
         inserted_types_this_ts: set[str] = set()
-
         liq_ts_iso = _safe_iso(liq_payload.get("_liq_ts"))
 
         # ==========================================================
@@ -233,83 +260,107 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
 
             # строгий запрет: reclaim не в той же свече
             if sweep_ts is not None and sweep_ts < last.ts and sweep_level is not None and sweep_ts_iso:
-                lvl = float(sweep_level)
+                # max-age баров (чтобы не ловить “поздний” reclaim)
+                age_sec = (last.ts - sweep_ts).total_seconds()
+                if age_sec <= reclaim_max_age_bars * _tf_seconds(tf):
+                    lvl = float(sweep_level)
+                    if lvl > 0:
 
-                # after liq_sweep_low -> reclaim up
-                if sweep_type == "liq_sweep_low":
-                    want = "liq_reclaim_up"
-                    if (
-                        want not in inserted_types_this_ts
-                        and last.close > lvl * (1.0 + reclaim_tol)
-                        and not _reclaim_already_written_for_sweep(conn, tf=tf, symbol="BTC-USDT", sweep_ts_iso=sweep_ts_iso, want_event_type=want)
-                    ):
-                        ok = insert_market_event(
-                            ts=last.ts,
-                            tf=tf,
-                            event_type=want,
-                            symbol="BTC-USDT",
-                            side="up",
-                            level=lvl,
-                            zone=sweep_zone or f"{tf} LIQ",
-                            confidence=70,
-                            payload={
-                                "layer": "liquidity",
-                                "scope": "local",
-                                "from_event": "liq_sweep_low",
-                                "sweep_ts": sweep_ts_iso,
-                                "level": lvl,
-                                "reclaim_tol": float(reclaim_tol),
-                                "last_close": float(last.close),
-                                "sweep_zone": sweep_zone,
-                                "sweep_level_name": sweep_payload.get("level_name"),
-                                "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
-                            },
-                        )
-                        out.append(f"{tf} liq_reclaim_up {'+1' if ok else 'skip'}")
-                        if ok:
-                            inserted_types_this_ts.add(want)
+                        # after liq_sweep_low -> reclaim up
+                        if sweep_type == "liq_sweep_low":
+                            want = "liq_reclaim_up"
+                            # cross-back: prev.close <= lvl, last.close > lvl*(1+tol)
+                            crossed = (float(prev.close) <= lvl) and (float(last.close) > lvl * (1.0 + reclaim_tol))
+                            if (
+                                want not in inserted_types_this_ts
+                                and crossed
+                                and not _reclaim_already_written_for_sweep(
+                                    conn,
+                                    tf=tf,
+                                    symbol="BTC-USDT",
+                                    sweep_ts_iso=sweep_ts_iso,
+                                    want_event_type=want,
+                                )
+                            ):
+                                ok = insert_market_event(
+                                    ts=last.ts,
+                                    tf=tf,
+                                    event_type=want,
+                                    symbol="BTC-USDT",
+                                    side="up",
+                                    level=lvl,
+                                    zone=sweep_zone or f"{tf} LIQ",
+                                    confidence=70,
+                                    payload={
+                                        "layer": "liquidity",
+                                        "scope": "local",
+                                        "from_event": "liq_sweep_low",
+                                        "sweep_ts": sweep_ts_iso,
+                                        "level": lvl,
+                                        "reclaim_tol": float(reclaim_tol),
+                                        "reclaim_max_age_bars": int(reclaim_max_age_bars),
+                                        "prev_close": float(prev.close),
+                                        "last_close": float(last.close),
+                                        "sweep_zone": sweep_zone,
+                                        "sweep_level_name": sweep_payload.get("level_name"),
+                                        "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
+                                    },
+                                )
+                                out.append(f"{tf} liq_reclaim_up {'+1' if ok else 'skip'}")
+                                if ok:
+                                    inserted_types_this_ts.add(want)
 
-                # after liq_sweep_high -> reclaim down
-                if sweep_type == "liq_sweep_high":
-                    want = "liq_reclaim_down"
-                    if (
-                        want not in inserted_types_this_ts
-                        and last.close < lvl * (1.0 - reclaim_tol)
-                        and not _reclaim_already_written_for_sweep(conn, tf=tf, symbol="BTC-USDT", sweep_ts_iso=sweep_ts_iso, want_event_type=want)
-                    ):
-                        ok = insert_market_event(
-                            ts=last.ts,
-                            tf=tf,
-                            event_type=want,
-                            symbol="BTC-USDT",
-                            side="down",
-                            level=lvl,
-                            zone=sweep_zone or f"{tf} LIQ",
-                            confidence=70,
-                            payload={
-                                "layer": "liquidity",
-                                "scope": "local",
-                                "from_event": "liq_sweep_high",
-                                "sweep_ts": sweep_ts_iso,
-                                "level": lvl,
-                                "reclaim_tol": float(reclaim_tol),
-                                "last_close": float(last.close),
-                                "sweep_zone": sweep_zone,
-                                "sweep_level_name": sweep_payload.get("level_name"),
-                                "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
-                            },
-                        )
-                        out.append(f"{tf} liq_reclaim_down {'+1' if ok else 'skip'}")
-                        if ok:
-                            inserted_types_this_ts.add(want)
+                        # after liq_sweep_high -> reclaim down
+                        if sweep_type == "liq_sweep_high":
+                            want = "liq_reclaim_down"
+                            # cross-back: prev.close >= lvl, last.close < lvl*(1-tol)
+                            crossed = (float(prev.close) >= lvl) and (float(last.close) < lvl * (1.0 - reclaim_tol))
+                            if (
+                                want not in inserted_types_this_ts
+                                and crossed
+                                and not _reclaim_already_written_for_sweep(
+                                    conn,
+                                    tf=tf,
+                                    symbol="BTC-USDT",
+                                    sweep_ts_iso=sweep_ts_iso,
+                                    want_event_type=want,
+                                )
+                            ):
+                                ok = insert_market_event(
+                                    ts=last.ts,
+                                    tf=tf,
+                                    event_type=want,
+                                    symbol="BTC-USDT",
+                                    side="down",
+                                    level=lvl,
+                                    zone=sweep_zone or f"{tf} LIQ",
+                                    confidence=70,
+                                    payload={
+                                        "layer": "liquidity",
+                                        "scope": "local",
+                                        "from_event": "liq_sweep_high",
+                                        "sweep_ts": sweep_ts_iso,
+                                        "level": lvl,
+                                        "reclaim_tol": float(reclaim_tol),
+                                        "reclaim_max_age_bars": int(reclaim_max_age_bars),
+                                        "prev_close": float(prev.close),
+                                        "last_close": float(last.close),
+                                        "sweep_zone": sweep_zone,
+                                        "sweep_level_name": sweep_payload.get("level_name"),
+                                        "sweep_level_source_tf": sweep_payload.get("level_source_tf"),
+                                    },
+                                )
+                                out.append(f"{tf} liq_reclaim_down {'+1' if ok else 'skip'}")
+                                if ok:
+                                    inserted_types_this_ts.add(want)
 
         # ==========================================================
         # 1) LOCAL SWEEPS
         # ==========================================================
 
         # ---- HIGH sweeps ----
-        for level_name, lvl in highs:
-            lvl = float(lvl)
+        for level_name, lvl0 in highs:
+            lvl = float(lvl0)
             if lvl <= 0:
                 continue
             if not ((prev.high <= lvl or prev.close <= lvl) and last.high > lvl * (1.0 + sweep_tol)):
@@ -345,8 +396,8 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
                 inserted_types_this_ts.add("liq_sweep_high")
 
         # ---- LOW sweeps ----
-        for level_name, lvl in lows:
-            lvl = float(lvl)
+        for level_name, lvl0 in lows:
+            lvl = float(lvl0)
             if lvl <= 0:
                 continue
             if not ((prev.low >= lvl or prev.close >= lvl) and last.low < lvl * (1.0 - sweep_tol)):
