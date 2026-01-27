@@ -598,13 +598,38 @@ def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_f
     tfs = MTF_CONTEXT.get(primary_tf, [])
     out: List[Dict[str, Any]] = []
 
+    def _flt_float_list(xs: List[float]) -> List[float]:
+        out0: List[float] = []
+        for v in xs or []:
+            try:
+                out0.append(float(v))
+            except Exception:
+                pass
+        return out0
+
     for tf in tfs:
         try:
             down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
             down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-            down_t = down_t[:2]
-            up_t = up_t[:2]
+            down_t = _flt_float_list(down_t)[:2]
+            up_t = _flt_float_list(up_t)[:2]
+
+            # ✅ MTF semantic filter относительно ТЕКУЩЕЙ цены primary tf
+            # DN должны быть ниже цены, UP выше цены
+            dn_below = [x for x in down_t if x < float(btc_close_for_dist)]
+            up_above = [x for x in up_t if x > float(btc_close_for_dist)]
+
+            # если после фильтра пусто — оставляем как есть (fallback на "сырой" список),
+            # чтобы MTF контекст не стал совсем пустым при редких конфигурациях уровней
+            mtf_filtered = True
+            dn_show = dn_below[:2] if dn_below else down_t[:1]
+            up_show = up_above[:2] if up_above else up_t[:1]
+            if (dn_below and dn_show == down_t[:1]) or (up_above and up_show == up_t[:1]):
+                # формально не должно случаться, но оставим как страховку
+                mtf_filtered = False
+            if (not dn_below and down_t) or (not up_above and up_t):
+                mtf_filtered = False
 
             st_saved = load_last_state(tf=tf) or {}
             st_ts = st_saved.get("_state_ts")
@@ -614,7 +639,8 @@ def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_f
                 # ✅ ВАЖНО: HTF state не должен "прилипать" к liq_ событиям
                 ev = _get_state_event_for_ts(conn, tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
 
-            st = _event_driven_state(tf, btc_close=btc_close_for_dist, dn_targets=down_t, up_targets=up_t, ev=ev)
+            # ⚠️ для фаз/вероятностей используем отфильтрованные уровни (семантика!)
+            st = _event_driven_state(tf, btc_close=btc_close_for_dist, dn_targets=dn_show, up_targets=up_show, ev=ev)
 
             out.append(
                 {
@@ -627,8 +653,9 @@ def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_f
                     "prob_down": int(st.get("prob_down") or 0),
                     "prob_up": int(st.get("prob_up") or 0),
                     "key_zone": st.get("key_zone") or key_zone0,
-                    "down_targets": down_t,
-                    "up_targets": up_t,
+                    "down_targets": dn_show,
+                    "up_targets": up_show,
+                    "mtf_filtered": bool(mtf_filtered),
                 }
             )
         except Exception:
