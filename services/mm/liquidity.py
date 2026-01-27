@@ -29,7 +29,7 @@ LOOKBACK = {
 @dataclass
 class LiquidityLevels:
     tf: str
-    ts: datetime
+    ts: datetime  # source snapshot ts (последняя свеча, на которой считали)
 
     eqh: Optional[float]
     eql: Optional[float]
@@ -97,10 +97,8 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     highs = [float(r["high"]) for r in hist if r.get("high") is not None]
     lows = [float(r["low"]) for r in hist if r.get("low") is not None]
 
-    # Толеранс для кластеров
     tol = 0.0012 if tf in ("H1", "H4") else (0.0018 if tf == "D1" else 0.0025)
 
-    # Берём верхние/нижние хвосты для кластеризации
     top_highs = sorted(highs, reverse=True)[:40]
     bot_lows = sorted(lows)[:40]
 
@@ -111,7 +109,6 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     dn_targets: List[float] = []
     notes: List[str] = []
 
-    # EQH / EQL — это ликвидность
     if eqh is not None:
         up_targets.append(eqh)
         notes.append("eqh_cluster")
@@ -120,8 +117,6 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
         dn_targets.append(eql)
         notes.append("eql_cluster")
 
-    # Дополнительно: вторые кластеры (если есть)
-    # Это даёт L2 ликвидность, но без экстремумов
     alt_eqh = _cluster_level(top_highs[10:], tol=tol, min_hits=2)
     alt_eql = _cluster_level(bot_lows[10:], tol=tol, min_hits=2)
 
@@ -133,7 +128,6 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
         dn_targets.append(alt_eql)
         notes.append("eql_alt")
 
-    # Упорядочиваем
     up_targets = sorted(list(dict.fromkeys(up_targets)))[:2]
     dn_targets = sorted(list(dict.fromkeys(dn_targets)), reverse=True)[:2]
 
@@ -202,15 +196,20 @@ def _same_liq(prev_payload: Optional[Dict[str, Any]], lv: LiquidityLevels) -> bo
 
 
 def save_liquidity_levels(levels: LiquidityLevels) -> bool:
-    payload = {
+    payload: Dict[str, Any] = {
         "tf": levels.tf,
         "eqh": levels.eqh,
         "eql": levels.eql,
         "up_targets": levels.up_targets,
         "dn_targets": levels.dn_targets,
         "notes": levels.notes,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
+        # ✅ доп поля для диагностики “устаревшей памяти”
+        "source_snapshot_ts": levels.ts.isoformat(),
+        "computed_at": datetime.now(timezone.utc).isoformat(),
     }
+
+    # ✅ никогда не сохраняем служебные поля
+    payload.pop("_liq_ts", None)
 
     sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
