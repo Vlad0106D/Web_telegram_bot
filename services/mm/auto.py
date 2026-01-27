@@ -507,15 +507,17 @@ async def _mm_auto_tick(app: Application) -> None:
                         exp,
                     )
 
-                    # action считаем/пишем даже если close-report skip
+                    # ✅ ВАЖНО: даже если отчёт не шлём — state должен обновиться на latest_ts
+                    view = build_market_view(tf, manual=False)
+
                     latest_close = _get_latest_snapshot_close(conn, tf)
                     if latest_close is not None:
                         try:
                             ins = _insert_action_decision(
-                                conn, tf=tf, action_ts=latest_ts, action_close=float(latest_close)
+                                conn, tf=tf, action_ts=view.ts, action_close=float(latest_close)
                             )
                             evn = _evaluate_pending(
-                                conn, tf=tf, latest_ts=latest_ts, latest_close=float(latest_close)
+                                conn, tf=tf, latest_ts=view.ts, latest_close=float(latest_close)
                             )
                             if ins or evn:
                                 conn.commit()
