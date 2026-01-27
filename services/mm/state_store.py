@@ -37,7 +37,9 @@ def _same_state(prev: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> bool
     if not prev:
         return False
 
-    ignore = {"saved_at"}
+    # ✅ системные/временные ключи не должны влиять на сравнение
+    ignore = {"saved_at", "_state_ts"}
+
     p0 = {k: v for k, v in prev.items() if k not in ignore}
     p1 = {k: v for k, v in payload.items() if k not in ignore}
 
@@ -68,14 +70,17 @@ def save_state(
     """
     Сохраняет "последнее состояние" mm_state в mm_events.
 
-    ВАЖНО: в твоей схеме есть partial unique index ux_mm_events_state
+    ВАЖНО: в схеме есть partial unique index ux_mm_events_state
     по (event_type, tf) для event_type IN ('mm_state','report_sent','liq_levels').
-    Поэтому используем UPSERT, иначе ловим UniqueViolation.
+    Поэтому используем UPSERT.
     """
     payload = dict(payload)
+
+    # ✅ никогда не сохраняем _state_ts в JSON (он берётся из mm_events.ts)
+    payload.pop("_state_ts", None)
+
     payload.setdefault("saved_at", datetime.now(timezone.utc).isoformat())
 
-    # Этот WHERE должен совпадать с predicate в ux_mm_events_state
     sql_upsert = """
     INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
     VALUES (%s, %s, %s, %s, %s)
@@ -124,5 +129,6 @@ def load_last_state(
         return None
 
     payload = row.get("payload_json") or {}
+    # ✅ _state_ts живёт только "снаружи" как вычисляемое поле
     payload["_state_ts"] = row.get("ts")
     return payload
