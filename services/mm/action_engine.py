@@ -138,10 +138,6 @@ def _mtf_stack(tf: str) -> List[str]:
 
 
 def _state_allows_long(st: Dict[str, Any]) -> bool:
-    """
-    Блокирует LONG, если HTF явно медвежий/перекос вниз.
-    Мягкий режим: если состояния нет — не блокируем.
-    """
     if not st:
         return True
     if st.get("state_icon") == "🔴":
@@ -152,10 +148,6 @@ def _state_allows_long(st: Dict[str, Any]) -> bool:
 
 
 def _state_allows_short(st: Dict[str, Any]) -> bool:
-    """
-    Блокирует SHORT, если HTF явно бычий/перекос вверх.
-    Мягкий режим: если состояния нет — не блокируем.
-    """
     if not st:
         return True
     if st.get("state_icon") == "🟢":
@@ -166,9 +158,6 @@ def _state_allows_short(st: Dict[str, Any]) -> bool:
 
 
 def _mtf_filter(*, tf: str, desired_action: ActionType) -> Tuple[bool, str]:
-    """
-    Проверяет, не конфликтует ли action со старшими ТФ.
-    """
     stack = _mtf_stack(tf)
     if not stack or desired_action == "NONE":
         return True, "no_mtf_required"
@@ -190,18 +179,11 @@ def _range_state(st: Dict[str, Any]) -> str:
 
 
 def _range_blocks_long(st: Dict[str, Any]) -> bool:
-    """
-    RANGE — главный режим.
-    Если мы в ACCEPT_DOWN или ждём закреп вниз — не даём контртренд LONG.
-    """
     rs = _range_state(st)
     return rs in ("PENDING_ACCEPT_DOWN", "ACCEPT_DOWN")
 
 
 def _range_blocks_short(st: Dict[str, Any]) -> bool:
-    """
-    Если мы в ACCEPT_UP или ждём закреп вверх — не даём контртренд SHORT.
-    """
     rs = _range_state(st)
     return rs in ("PENDING_ACCEPT_UP", "ACCEPT_UP")
 
@@ -214,13 +196,10 @@ def _range_filter(*, st: Dict[str, Any], desired_action: ActionType) -> Tuple[bo
     return True, "range_ok"
 
 
-# ---------------- LIQ events (local sweeps) ----------------
+# ---------------- LIQ events (local sweeps/reclaims) ----------------
 def _recent_snapshot_window_min_ts(
     conn: psycopg.Connection, *, tf: str, ts: datetime, max_age_bars: int
 ) -> Optional[datetime]:
-    """
-    Находим минимальный ts окна из последних (max_age_bars+1) закрытых свечей до state_ts.
-    """
     sql = """
     SELECT ts
     FROM mm_snapshots
@@ -247,12 +226,6 @@ def _get_event_for_ts_filtered(
     include_prefix: Optional[str] = None,
     exclude_prefix: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Достаём event в окне state_ts (по свечам), но с фильтрами:
-      - include_types (точное совпадение)
-      - include_prefix (например "liq_")
-      - exclude_prefix (например "liq_")
-    """
     min_ts = _recent_snapshot_window_min_ts(conn, tf=tf, ts=ts, max_age_bars=max_age_bars)
     if min_ts is None:
         min_ts = ts
@@ -283,23 +256,32 @@ def _get_event_for_ts_filtered(
 def _liq_bias_from_event(liq_ev: Optional[Dict[str, Any]]) -> Tuple[int, int, Optional[str]]:
     """
     Возвращает (bias_up, bias_down, liq_event_type)
-    bias_* в процентах (прибавка/убавка к вероятности/уверенности).
+    bias_* — небольшая корректировка prob, НЕ смена режима.
     """
     if not liq_ev:
         return 0, 0, None
 
     et = str(liq_ev.get("event_type") or "").strip()
+
+    # weaker
     if et == "liq_sweep_low":
         return +6, -6, et
     if et == "liq_sweep_high":
         return -6, +6, et
+
+    # stronger (local reclaim)
+    if et == "liq_reclaim_up":
+        return +10, -10, et
+    if et == "liq_reclaim_down":
+        return -10, +10, et
+
     return 0, 0, et
 
 
 # ---------------- Core logic ----------------
 def compute_action(tf: str) -> ActionDecision:
     """
-    Action Mode v1.1 (MTF-aware + RANGE gate + LIQ local sweeps)
+    Action Mode v1.2 (MTF-aware + RANGE gate + LIQ local sweeps + LOCAL RECLAIM)
     НЕ открывает сделки.
     Возвращает разрешение направления или NONE.
 
@@ -322,7 +304,6 @@ def compute_action(tf: str) -> ActionDecision:
     prob_down = int(st.get("prob_down", 0))
     state_title = str(st.get("state_title", "") or "")
 
-    # ✅ state_ts for strict alignment
     state_ts = st.get("_state_ts")
     if state_ts is None:
         return ActionDecision(
@@ -333,19 +314,17 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=st.get("event_type"),
         )
 
-    # Pull events: market (exclude liq_) + liq (include liq_*)
     market_ev = None
     liq_ev = None
     try:
-        # market event через store-хелпер (как раньше)
         market_ev = get_market_event_for_ts(tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2)
     except Exception:
         market_ev = None
 
-    # liq event — напрямую из mm_market_events (окно по свечам)
     try:
         with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
             conn.execute("SET TIME ZONE 'UTC';")
+
             liq_ev = _get_event_for_ts_filtered(
                 conn,
                 tf=tf,
@@ -354,8 +333,8 @@ def compute_action(tf: str) -> ActionDecision:
                 max_age_bars=2,
                 include_prefix="liq_",
             )
-            # если get_market_event_for_ts вдруг вернул liq_* как "главное событие" — не проблема,
-            # но нам всё равно нужен "не-liq" event для логики v1
+
+            # если store вернул liq_* как "главное событие" — вытаскиваем market отдельно
             if market_ev and str(market_ev.get("event_type") or "").startswith("liq_"):
                 market_ev = _get_event_for_ts_filtered(
                     conn,
@@ -371,21 +350,76 @@ def compute_action(tf: str) -> ActionDecision:
     ev_type = (market_ev.get("event_type") if market_ev else None)
     side = (market_ev.get("side") if market_ev else None)
 
-    # LIQ bias
     bias_up, bias_down, liq_type = _liq_bias_from_event(liq_ev)
     prob_up_eff = max(0, min(100, prob_up + bias_up))
     prob_down_eff = max(0, min(100, prob_down + bias_down))
 
-    # RANGE gate always applies
     ok_r_long, why_r_long = _range_filter(st=st, desired_action="LONG_ALLOWED")
     ok_r_short, why_r_short = _range_filter(st=st, desired_action="SHORT_ALLOWED")
 
-    # базовые события (range/accept/reclaim/decision)
     long_events = ("reclaim_up", "accept_above", "decision_zone")
     short_events = ("reclaim_down", "accept_below", "decision_zone")
 
-    # 0) Если WAIT — обычно NONE, но LIQ sweep может дать "спекулятивное разрешение"
+    # -----------------------------
+    # 0) WAIT: allow local reclaim / sweep as "signal-layer"
+    # -----------------------------
     if state_title == "ОЖИДАНИЕ":
+        # local reclaim stronger than sweep
+        if liq_type == "liq_reclaim_up":
+            if ok_r_long:
+                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+                if ok_mtf:
+                    conf = max(58, min(80, prob_up_eff))
+                    return ActionDecision(
+                        tf=tf,
+                        action="LONG_ALLOWED",
+                        confidence=conf,
+                        reason=f"WAIT + {liq_type} (local reclaim) | {why_r_long} | {why_mtf}",
+                        event_type=liq_type,
+                    )
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=max(prob_up_eff, prob_down_eff),
+                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
+                    event_type=liq_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"WAIT + {liq_type} blocked | {why_r_long}",
+                event_type=liq_type,
+            )
+
+        if liq_type == "liq_reclaim_down":
+            if ok_r_short:
+                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+                if ok_mtf:
+                    conf = max(58, min(80, prob_down_eff))
+                    return ActionDecision(
+                        tf=tf,
+                        action="SHORT_ALLOWED",
+                        confidence=conf,
+                        reason=f"WAIT + {liq_type} (local reclaim) | {why_r_short} | {why_mtf}",
+                        event_type=liq_type,
+                    )
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=max(prob_up_eff, prob_down_eff),
+                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
+                    event_type=liq_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"WAIT + {liq_type} blocked | {why_r_short}",
+                event_type=liq_type,
+            )
+
+        # sweeps (как было)
         if liq_type == "liq_sweep_low":
             if ok_r_long:
                 ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
@@ -448,7 +482,9 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=ev_type,
         )
 
-    # 1) LONG candidate from market events
+    # -----------------------------
+    # 1) Market-driven LONG
+    # -----------------------------
     if prob_up_eff >= 55 and ev_type in long_events and side in ("up", None):
         if not ok_r_long:
             return ActionDecision(
@@ -476,7 +512,9 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=ev_type,
         )
 
-    # 2) SHORT candidate from market events
+    # -----------------------------
+    # 2) Market-driven SHORT
+    # -----------------------------
     if prob_down_eff >= 55 and ev_type in short_events and side in ("down", None):
         if not ok_r_short:
             return ActionDecision(
@@ -504,8 +542,38 @@ def compute_action(tf: str) -> ActionDecision:
             event_type=ev_type,
         )
 
-    # 3) Если market-событие не “сигнальное”, но был LIQ sweep — мягко повышаем шанс
-    #    (не превращаем в источник режима, но можем дать early разрешение при сильном перекосе)
+    # -----------------------------
+    # 3) Local reclaim can generate action if market event didn't
+    # -----------------------------
+    if liq_type == "liq_reclaim_up" and prob_up_eff >= 55:
+        if ok_r_long:
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+            if ok_mtf:
+                conf = max(60, min(80, prob_up_eff))
+                return ActionDecision(
+                    tf=tf,
+                    action="LONG_ALLOWED",
+                    confidence=conf,
+                    reason=f"{liq_type} + prob_up={prob_up_eff} | {why_r_long} | {why_mtf}",
+                    event_type=liq_type,
+                )
+
+    if liq_type == "liq_reclaim_down" and prob_down_eff >= 55:
+        if ok_r_short:
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+            if ok_mtf:
+                conf = max(60, min(80, prob_down_eff))
+                return ActionDecision(
+                    tf=tf,
+                    action="SHORT_ALLOWED",
+                    confidence=conf,
+                    reason=f"{liq_type} + prob_down={prob_down_eff} | {why_r_short} | {why_mtf}",
+                    event_type=liq_type,
+                )
+
+    # -----------------------------
+    # 4) Sweeps remain a softer "early" option when prob is strong
+    # -----------------------------
     if liq_type == "liq_sweep_low" and prob_up_eff >= 60:
         if ok_r_long:
             ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
@@ -530,7 +598,6 @@ def compute_action(tf: str) -> ActionDecision:
                     event_type=liq_type,
                 )
 
-    # default
     best = max(prob_up_eff, prob_down_eff)
     extra = f" | liq={liq_type}" if liq_type else ""
     return ActionDecision(
@@ -543,15 +610,6 @@ def compute_action(tf: str) -> ActionDecision:
 
 
 def _thresholds(tf: str) -> Tuple[float, float, int]:
-    """
-    Возвращает:
-      confirm_pct (в %),
-      fail_pct (в %),
-      max_bars
-    Можно переопределить env:
-      MM_ACTION_CONFIRM_PCT, MM_ACTION_FAIL_PCT
-      MM_ACTION_MAX_BARS_H1/H4/D1/W1
-    """
     confirm = float((os.getenv("MM_ACTION_CONFIRM_PCT") or "0.15").strip())
     fail = float((os.getenv("MM_ACTION_FAIL_PCT") or "0.15").strip())
 
@@ -583,10 +641,6 @@ def _insert_action_row(
     decision: ActionDecision,
     snapshot_meta: Dict[str, Any],
 ) -> bool:
-    """
-    Пишем 1 запись на новую закрытую свечу, если появился action != NONE.
-    Возвращает True если записали, False если пропустили (дубль/повтор).
-    """
     cols = set(_get_table_columns(conn, "mm_action_engine"))
 
     last = _get_latest_action_row(conn, tf)
@@ -723,14 +777,6 @@ def _update_action_eval(
 
 
 def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
-    """
-    1) Берём последнюю закрытую свечу BTC по tf (из mm_snapshots)
-    2) Считаем action через compute_action()
-    3) Пишем action (если != NONE)
-    4) Обновляем все pending actions на этом tf (confirmed/failed/need_more_time)
-
-    Возвращает компактный dict-итог (удобно для логов/команды).
-    """
     out: Dict[str, Any] = {"tf": tf, "inserted": False, "evaluated": 0, "latest_ts": None}
 
     confirm_pct, fail_pct, max_bars = _thresholds(tf)
