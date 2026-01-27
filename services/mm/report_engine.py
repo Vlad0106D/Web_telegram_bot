@@ -599,7 +599,12 @@ def _tf_rank(tf: str) -> int:
     return {"H1": 1, "H4": 2, "D1": 3, "W1": 4}.get(tf, 99)
 
 
-def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_for_dist: float) -> List[Dict[str, Any]]:
+def _build_mtf_context(
+    conn: psycopg.Connection,
+    primary_tf: str,
+    *,
+    btc_close_for_dist: float,
+) -> List[Dict[str, Any]]:
     tfs = MTF_CONTEXT.get(primary_tf, [])
     out: List[Dict[str, Any]] = []
 
@@ -625,15 +630,13 @@ def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_f
             dn_below = [x for x in down_t if x < float(btc_close_for_dist)]
             up_above = [x for x in up_t if x > float(btc_close_for_dist)]
 
-            # если после фильтра пусто — оставляем как есть (fallback на "сырой" список),
-            # чтобы MTF контекст не стал совсем пустым при редких конфигурациях уровней
+            # ✅ ВАЖНО: никаких fallback'ов на "сырой" список
+            # если DN нет ниже цены — DN просто не показываем
+            dn_show = dn_below[:2]
+            up_show = up_above[:2]
+
             mtf_filtered = True
-            dn_show = dn_below[:2] if dn_below else down_t[:1]
-            up_show = up_above[:2] if up_above else up_t[:1]
-            if (dn_below and dn_show == down_t[:1]) or (up_above and up_show == up_t[:1]):
-                # формально не должно случаться, но оставим как страховку
-                mtf_filtered = False
-            if (not dn_below and down_t) or (not up_above and up_t):
+            if (down_t and not dn_below) or (up_t and not up_above):
                 mtf_filtered = False
 
             st_saved = load_last_state(tf=tf) or {}
@@ -641,11 +644,23 @@ def _build_mtf_context(conn: psycopg.Connection, primary_tf: str, *, btc_close_f
 
             ev = None
             if st_ts:
-                # ✅ ВАЖНО: HTF state не должен "прилипать" к liq_/local_reclaim событиям
-                ev = _get_state_event_for_ts(conn, tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
+                # ✅ HTF state не должен залипать на liq_/local_reclaim
+                ev = _get_state_event_for_ts(
+                    conn,
+                    tf=tf,
+                    ts=st_ts,
+                    symbol="BTC-USDT",
+                    max_age_bars=2,
+                )
 
-            # ⚠️ для фаз/вероятностей используем отфильтрованные уровни (семантика!)
-            st = _event_driven_state(tf, btc_close=btc_close_for_dist, dn_targets=dn_show, up_targets=up_show, ev=ev)
+            # ⚠️ для фаз/вероятностей используем ТОЛЬКО семантически корректные уровни
+            st = _event_driven_state(
+                tf,
+                btc_close=btc_close_for_dist,
+                dn_targets=dn_show,
+                up_targets=up_show,
+                ev=ev,
+            )
 
             out.append(
                 {
@@ -1061,5 +1076,4 @@ def render_report(view: MarketView) -> str:
     lines.append(f"ETH: {view.eth_confirmation}")
 
     text = "\n".join(lines)
-    text = text.replace("%", "%%")  # ✅ FIX: защита от '%' placeholder ошибки при отправке
     return text
