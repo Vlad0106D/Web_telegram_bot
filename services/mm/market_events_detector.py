@@ -63,16 +63,11 @@ def _rel_dist(px: float, level: float) -> float:
     return abs(px / level - 1.0)
 
 
-def _has_non_wait_event_for_ts(
-    *,
-    tf: str,
-    ts: datetime,
-    symbol: str = "BTC-USDT",
-) -> bool:
+def _has_non_wait_event_on_ts(conn: psycopg.Connection, *, tf: str, ts: datetime, symbol: str = "BTC-USDT") -> bool:
     """
-    ✅ Anti-noise:
-    если на этой же свече уже есть любое событие кроме 'wait',
-    то 'wait' больше не пишем (иначе получаем pressure_* + wait на одном ts).
+    Anti-spam:
+    если на этой свече уже есть любое событие != 'wait', то 'wait' не пишем.
+    Убирает кейс: повторный тик -> pressure_up уже есть (дубль) -> ok=False -> wrote_any=False -> записали wait.
     """
     sql = """
     SELECT 1
@@ -81,11 +76,9 @@ def _has_non_wait_event_for_ts(
       AND event_type <> 'wait'
     LIMIT 1;
     """
-    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-        conn.execute("SET TIME ZONE 'UTC';")
-        with conn.cursor() as cur:
-            cur.execute(sql, (symbol, tf, ts))
-            return cur.fetchone() is not None
+    with conn.cursor() as cur:
+        cur.execute(sql, (symbol, tf, ts))
+        return cur.fetchone() is not None
 
 
 # -----------------------------------------------------------------------------
@@ -100,7 +93,6 @@ def _get_levels_sets(tf: str) -> List[Dict[str, Any]]:
       - range_high/low, eqh/eql
       - up_targets/dn_targets
     """
-
     def _pack(source_tf: str, zone_prefix: str) -> Dict[str, Any]:
         liq = load_last_liquidity_levels(source_tf) or {}
         return {
@@ -223,299 +215,302 @@ def detect_and_store_market_events(tf: str) -> List[str]:
             return out
         last, prev = pair
 
-    px = float(last.close)
-    wrote_any = False
+        px = float(last.close)
 
-    inserted_types_this_ts: set[str] = set()
+        # wrote_any = "в этом тике мы реально увидели/сгенерировали хотя бы одно НЕ-wait событие"
+        # даже если insert дал ok=False (дубль), всё равно считаем activity, чтобы не писать wait.
+        wrote_any = False
 
-    # -------------------------------------------------------------------------
-    # 0) RECLAIM / ACCEPTANCE (НЕ в той же свече): смотрим по прошлому sweep_*
-    # -------------------------------------------------------------------------
-    last_ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
-    if last_ev:
-        last_type = (last_ev.get("event_type") or "").strip()
-        last_ts = last_ev.get("ts")
-        last_level = _as_float(last_ev.get("level"))
-        last_zone = last_ev.get("zone")
+        inserted_types_this_ts: set[str] = set()
 
-        if last_ts is not None and last_ts < last.ts and last_level is not None:
-            lvl = float(last_level)
+        # -------------------------------------------------------------------------
+        # 0) RECLAIM / ACCEPTANCE (НЕ в той же свече): смотрим по прошлому sweep_*
+        # -------------------------------------------------------------------------
+        last_ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
+        if last_ev:
+            last_type = (last_ev.get("event_type") or "").strip()
+            last_ts = last_ev.get("ts")
+            last_level = _as_float(last_ev.get("level"))
+            last_zone = last_ev.get("zone")
 
-            if last_type == "sweep_low":
-                if last.close > lvl:
+            if last_ts is not None and last_ts < last.ts and last_level is not None:
+                lvl = float(last_level)
+
+                if last_type == "sweep_low":
+                    if last.close > lvl:
+                        wrote_any = True
+                        ok = insert_market_event(
+                            ts=last.ts,
+                            tf=tf,
+                            event_type="reclaim_up",
+                            side="up",
+                            level=lvl,
+                            zone=last_zone,
+                            confidence=72,
+                            payload={
+                                "from_event": "sweep_low",
+                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "level": lvl,
+                                "last_close": float(last.close),
+                            },
+                        )
+                        out.append(f"{tf} reclaim_up {'+1' if ok else 'skip'}")
+                        if ok:
+                            inserted_types_this_ts.add("reclaim_up")
+
+                    elif last.close < lvl * (1.0 - accept_tol):
+                        wrote_any = True
+                        ok = insert_market_event(
+                            ts=last.ts,
+                            tf=tf,
+                            event_type="accept_below",
+                            side="down",
+                            level=lvl,
+                            zone=last_zone,
+                            confidence=68,
+                            payload={
+                                "from_event": "sweep_low",
+                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "level": lvl,
+                                "last_close": float(last.close),
+                                "accept_tol": accept_tol,
+                            },
+                        )
+                        out.append(f"{tf} accept_below {'+1' if ok else 'skip'}")
+                        if ok:
+                            inserted_types_this_ts.add("accept_below")
+
+                if last_type == "sweep_high":
+                    if last.close < lvl:
+                        wrote_any = True
+                        ok = insert_market_event(
+                            ts=last.ts,
+                            tf=tf,
+                            event_type="reclaim_down",
+                            side="down",
+                            level=lvl,
+                            zone=last_zone,
+                            confidence=72,
+                            payload={
+                                "from_event": "sweep_high",
+                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "level": lvl,
+                                "last_close": float(last.close),
+                            },
+                        )
+                        out.append(f"{tf} reclaim_down {'+1' if ok else 'skip'}")
+                        if ok:
+                            inserted_types_this_ts.add("reclaim_down")
+
+                    elif last.close > lvl * (1.0 + accept_tol):
+                        wrote_any = True
+                        ok = insert_market_event(
+                            ts=last.ts,
+                            tf=tf,
+                            event_type="accept_above",
+                            side="up",
+                            level=lvl,
+                            zone=last_zone,
+                            confidence=68,
+                            payload={
+                                "from_event": "sweep_high",
+                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "level": lvl,
+                                "last_close": float(last.close),
+                                "accept_tol": accept_tol,
+                            },
+                        )
+                        out.append(f"{tf} accept_above {'+1' if ok else 'skip'}")
+                        if ok:
+                            inserted_types_this_ts.add("accept_above")
+
+        # -------------------------------------------------------------------------
+        # 1) DECISION ZONES + SWEEPS по уровням (H1: H4+H1)
+        #    SWEEP только от range_high / range_low
+        # -------------------------------------------------------------------------
+        level_sets = _get_levels_sets(tf)
+
+        for lv in level_sets:
+            zpref = lv["zone_prefix"]
+            source_tf = lv["source_tf"]
+
+            rh = lv.get("range_high")
+            rl = lv.get("range_low")
+
+            # DECISION ZONE (range high/low)
+            if "decision_zone" not in inserted_types_this_ts:
+                if rh is not None and _rel_dist(px, float(rh)) <= dz_tol:
+                    wrote_any = True
                     ok = insert_market_event(
                         ts=last.ts,
                         tf=tf,
-                        event_type="reclaim_up",
+                        event_type="decision_zone",
+                        side="up",
+                        level=float(rh),
+                        zone=_label_level(zpref, "RANGE HIGH"),
+                        confidence=70,
+                        payload={"px": float(px), "tol": dz_tol, "source_tf": source_tf},
+                    )
+                    out.append(f"{tf} decision_zone(up:{zpref}) {'+1' if ok else 'skip'}")
+                    if ok:
+                        inserted_types_this_ts.add("decision_zone")
+
+                if "decision_zone" not in inserted_types_this_ts and rl is not None and _rel_dist(px, float(rl)) <= dz_tol:
+                    wrote_any = True
+                    ok = insert_market_event(
+                        ts=last.ts,
+                        tf=tf,
+                        event_type="decision_zone",
+                        side="down",
+                        level=float(rl),
+                        zone=_label_level(zpref, "RANGE LOW"),
+                        confidence=70,
+                        payload={"px": float(px), "tol": dz_tol, "source_tf": source_tf},
+                    )
+                    out.append(f"{tf} decision_zone(down:{zpref}) {'+1' if ok else 'skip'}")
+                    if ok:
+                        inserted_types_this_ts.add("decision_zone")
+
+            # SWEEP HIGH: только range_high
+            if "sweep_high" not in inserted_types_this_ts and rh is not None:
+                lvl = float(rh)
+                was_below = (prev.high <= lvl) or (prev.close <= lvl)
+                swept = was_below and (last.high > lvl * (1.0 + sweep_tol))
+                if swept:
+                    wrote_any = True
+                    ok = insert_market_event(
+                        ts=last.ts,
+                        tf=tf,
+                        event_type="sweep_high",
                         side="up",
                         level=lvl,
-                        zone=last_zone,
-                        confidence=72,
+                        zone=_label_level(zpref, "RANGE HIGH"),
+                        confidence=75,
                         payload={
-                            "from_event": "sweep_low",
-                            "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
-                            "level": lvl,
-                            "last_close": float(last.close),
+                            "source_tf": source_tf,
+                            "prev_close": float(prev.close),
+                            "prev_high": float(prev.high),
+                            "last_high": float(last.high),
+                            "tol": sweep_tol,
                         },
                     )
-                    out.append(f"{tf} reclaim_up {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
+                    out.append(f"{tf} sweep_high({zpref}) {'+1' if ok else 'skip'}")
                     if ok:
-                        inserted_types_this_ts.add("reclaim_up")
+                        inserted_types_this_ts.add("sweep_high")
 
-                elif last.close < lvl * (1.0 - accept_tol):
+            # SWEEP LOW: только range_low
+            if "sweep_low" not in inserted_types_this_ts and rl is not None:
+                lvl = float(rl)
+                was_above = (prev.low >= lvl) or (prev.close >= lvl)
+                swept = was_above and (last.low < lvl * (1.0 - sweep_tol))
+                if swept:
+                    wrote_any = True
                     ok = insert_market_event(
                         ts=last.ts,
                         tf=tf,
-                        event_type="accept_below",
+                        event_type="sweep_low",
                         side="down",
                         level=lvl,
-                        zone=last_zone,
-                        confidence=68,
+                        zone=_label_level(zpref, "RANGE LOW"),
+                        confidence=75,
                         payload={
-                            "from_event": "sweep_low",
-                            "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
-                            "level": lvl,
-                            "last_close": float(last.close),
-                            "accept_tol": accept_tol,
+                            "source_tf": source_tf,
+                            "prev_close": float(prev.close),
+                            "prev_low": float(prev.low),
+                            "last_low": float(last.low),
+                            "tol": sweep_tol,
                         },
                     )
-                    out.append(f"{tf} accept_below {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
+                    out.append(f"{tf} sweep_low({zpref}) {'+1' if ok else 'skip'}")
                     if ok:
-                        inserted_types_this_ts.add("accept_below")
+                        inserted_types_this_ts.add("sweep_low")
 
-            if last_type == "sweep_high":
-                if last.close < lvl:
-                    ok = insert_market_event(
-                        ts=last.ts,
-                        tf=tf,
-                        event_type="reclaim_down",
-                        side="down",
-                        level=lvl,
-                        zone=last_zone,
-                        confidence=72,
-                        payload={
-                            "from_event": "sweep_high",
-                            "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
-                            "level": lvl,
-                            "last_close": float(last.close),
-                        },
-                    )
-                    out.append(f"{tf} reclaim_down {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
-                    if ok:
-                        inserted_types_this_ts.add("reclaim_down")
+        # -------------------------------------------------------------------------
+        # 2) PRESSURE — минимально + фильтры
+        # -------------------------------------------------------------------------
+        body = _body_pct(last)
 
-                elif last.close > lvl * (1.0 + accept_tol):
-                    ok = insert_market_event(
-                        ts=last.ts,
-                        tf=tf,
-                        event_type="accept_above",
-                        side="up",
-                        level=lvl,
-                        zone=last_zone,
-                        confidence=68,
-                        payload={
-                            "from_event": "sweep_high",
-                            "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
-                            "level": lvl,
-                            "last_close": float(last.close),
-                            "accept_tol": accept_tol,
-                        },
-                    )
-                    out.append(f"{tf} accept_above {'+1' if ok else 'skip'}")
-                    wrote_any = wrote_any or ok
-                    if ok:
-                        inserted_types_this_ts.add("accept_above")
-
-    # -------------------------------------------------------------------------
-    # 1) DECISION ZONES + SWEEPS по уровням (H1: H4+H1)
-    #    SWEEP только от range_high / range_low
-    # -------------------------------------------------------------------------
-    level_sets = _get_levels_sets(tf)
-
-    for lv in level_sets:
-        zpref = lv["zone_prefix"]
-        source_tf = lv["source_tf"]
-
-        rh = lv.get("range_high")
-        rl = lv.get("range_low")
-
-        # DECISION ZONE (range high/low)
-        if "decision_zone" not in inserted_types_this_ts:
-            if rh is not None and _rel_dist(px, float(rh)) <= dz_tol:
+        if "pressure_down" not in inserted_types_this_ts:
+            if (
+                (last.close < prev.close)
+                and (last.low < prev.low)
+                and (body >= body_min)
+                and (_close_pos_to_low(last) <= close_pos_max)
+            ):
+                wrote_any = True
                 ok = insert_market_event(
                     ts=last.ts,
                     tf=tf,
-                    event_type="decision_zone",
-                    side="up",
-                    level=float(rh),
-                    zone=_label_level(zpref, "RANGE HIGH"),
-                    confidence=70,
-                    payload={"px": float(px), "tol": dz_tol, "source_tf": source_tf},
-                )
-                out.append(f"{tf} decision_zone(up:{zpref}) {'+1' if ok else 'skip'}")
-                wrote_any = wrote_any or ok
-                if ok:
-                    inserted_types_this_ts.add("decision_zone")
-
-            if "decision_zone" not in inserted_types_this_ts and rl is not None and _rel_dist(px, float(rl)) <= dz_tol:
-                ok = insert_market_event(
-                    ts=last.ts,
-                    tf=tf,
-                    event_type="decision_zone",
+                    event_type="pressure_down",
                     side="down",
-                    level=float(rl),
-                    zone=_label_level(zpref, "RANGE LOW"),
-                    confidence=70,
-                    payload={"px": float(px), "tol": dz_tol, "source_tf": source_tf},
-                )
-                out.append(f"{tf} decision_zone(down:{zpref}) {'+1' if ok else 'skip'}")
-                wrote_any = wrote_any or ok
-                if ok:
-                    inserted_types_this_ts.add("decision_zone")
-
-        # SWEEP HIGH: только range_high
-        if "sweep_high" not in inserted_types_this_ts and rh is not None:
-            lvl = float(rh)
-            was_below = (prev.high <= lvl) or (prev.close <= lvl)
-            swept = was_below and (last.high > lvl * (1.0 + sweep_tol))
-            if swept:
-                ok = insert_market_event(
-                    ts=last.ts,
-                    tf=tf,
-                    event_type="sweep_high",
-                    side="up",
-                    level=lvl,
-                    zone=_label_level(zpref, "RANGE HIGH"),
-                    confidence=75,
+                    level=None,
+                    zone=None,
+                    confidence=65,
                     payload={
-                        "source_tf": source_tf,
-                        "prev_close": float(prev.close),
-                        "prev_high": float(prev.high),
-                        "last_high": float(last.high),
-                        "tol": sweep_tol,
-                    },
-                )
-                out.append(f"{tf} sweep_high({zpref}) {'+1' if ok else 'skip'}")
-                wrote_any = wrote_any or ok
-                if ok:
-                    inserted_types_this_ts.add("sweep_high")
-
-        # SWEEP LOW: только range_low
-        if "sweep_low" not in inserted_types_this_ts and rl is not None:
-            lvl = float(rl)
-            was_above = (prev.low >= lvl) or (prev.close >= lvl)
-            swept = was_above and (last.low < lvl * (1.0 - sweep_tol))
-            if swept:
-                ok = insert_market_event(
-                    ts=last.ts,
-                    tf=tf,
-                    event_type="sweep_low",
-                    side="down",
-                    level=lvl,
-                    zone=_label_level(zpref, "RANGE LOW"),
-                    confidence=75,
-                    payload={
-                        "source_tf": source_tf,
                         "prev_close": float(prev.close),
                         "prev_low": float(prev.low),
+                        "last_close": float(last.close),
                         "last_low": float(last.low),
-                        "tol": sweep_tol,
+                        "body_pct": round(body * 100.0, 4),
+                        "body_min_pct": round(body_min * 100.0, 4),
+                        "close_pos_to_low": round(_close_pos_to_low(last), 4),
+                        "close_pos_max": close_pos_max,
                     },
                 )
-                out.append(f"{tf} sweep_low({zpref}) {'+1' if ok else 'skip'}")
-                wrote_any = wrote_any or ok
+                out.append(f"{tf} pressure_down {'+1' if ok else 'skip'}")
                 if ok:
-                    inserted_types_this_ts.add("sweep_low")
+                    inserted_types_this_ts.add("pressure_down")
 
-    # -------------------------------------------------------------------------
-    # 2) PRESSURE — минимально + фильтры
-    # -------------------------------------------------------------------------
-    body = _body_pct(last)
+        if "pressure_up" not in inserted_types_this_ts:
+            if (
+                (last.close > prev.close)
+                and (last.high > prev.high)
+                and (body >= body_min)
+                and (_close_pos_to_high(last) <= close_pos_max)
+            ):
+                wrote_any = True
+                ok = insert_market_event(
+                    ts=last.ts,
+                    tf=tf,
+                    event_type="pressure_up",
+                    side="up",
+                    level=None,
+                    zone=None,
+                    confidence=65,
+                    payload={
+                        "prev_close": float(prev.close),
+                        "prev_high": float(prev.high),
+                        "last_close": float(last.close),
+                        "last_high": float(last.high),
+                        "body_pct": round(body * 100.0, 4),
+                        "body_min_pct": round(body_min * 100.0, 4),
+                        "close_pos_to_high": round(_close_pos_to_high(last), 4),
+                        "close_pos_max": close_pos_max,
+                    },
+                )
+                out.append(f"{tf} pressure_up {'+1' if ok else 'skip'}")
+                if ok:
+                    inserted_types_this_ts.add("pressure_up")
 
-    if "pressure_down" not in inserted_types_this_ts:
-        if (
-            (last.close < prev.close)
-            and (last.low < prev.low)
-            and (body >= body_min)
-            and (_close_pos_to_low(last) <= close_pos_max)
-        ):
+        # -------------------------------------------------------------------------
+        # 3) WAIT (heartbeat) — только если реально нет non-wait событий на этой свече
+        # -------------------------------------------------------------------------
+        if not wrote_any:
+            # если в БД уже есть non-wait на этот ts — wait не пишем
+            if _has_non_wait_event_on_ts(conn, tf=tf, ts=last.ts, symbol="BTC-USDT"):
+                out.append(f"{tf} wait skip(has_non_wait_on_ts)")
+                return out
+
             ok = insert_market_event(
                 ts=last.ts,
                 tf=tf,
-                event_type="pressure_down",
-                side="down",
+                event_type="wait",
+                side=None,
                 level=None,
                 zone=None,
-                confidence=65,
-                payload={
-                    "prev_close": float(prev.close),
-                    "prev_low": float(prev.low),
-                    "last_close": float(last.close),
-                    "last_low": float(last.low),
-                    "body_pct": round(body * 100.0, 4),
-                    "body_min_pct": round(body_min * 100.0, 4),
-                    "close_pos_to_low": round(_close_pos_to_low(last), 4),
-                    "close_pos_max": close_pos_max,
-                },
+                confidence=50,
+                payload={"px": float(px)},
             )
-            out.append(f"{tf} pressure_down {'+1' if ok else 'skip'}")
-            wrote_any = wrote_any or ok
-            if ok:
-                inserted_types_this_ts.add("pressure_down")
+            out.append(f"{tf} wait {'+1' if ok else 'skip'}")
 
-    if "pressure_up" not in inserted_types_this_ts:
-        if (
-            (last.close > prev.close)
-            and (last.high > prev.high)
-            and (body >= body_min)
-            and (_close_pos_to_high(last) <= close_pos_max)
-        ):
-            ok = insert_market_event(
-                ts=last.ts,
-                tf=tf,
-                event_type="pressure_up",
-                side="up",
-                level=None,
-                zone=None,
-                confidence=65,
-                payload={
-                    "prev_close": float(prev.close),
-                    "prev_high": float(prev.high),
-                    "last_close": float(last.close),
-                    "last_high": float(last.high),
-                    "body_pct": round(body * 100.0, 4),
-                    "body_min_pct": round(body_min * 100.0, 4),
-                    "close_pos_to_high": round(_close_pos_to_high(last), 4),
-                    "close_pos_max": close_pos_max,
-                },
-            )
-            out.append(f"{tf} pressure_up {'+1' if ok else 'skip'}")
-            wrote_any = wrote_any or ok
-            if ok:
-                inserted_types_this_ts.add("pressure_up")
-
-    # -------------------------------------------------------------------------
-    # 3) WAIT (heartbeat) — только если реально ничего не записали
-    #    ✅ и только если на этом ts вообще нет НЕ-wait событий
-    # -------------------------------------------------------------------------
-    if not wrote_any:
-        if _has_non_wait_event_for_ts(tf=tf, ts=last.ts, symbol="BTC-USDT"):
-            out.append(f"{tf} wait skip(existing_non_wait)")
-            return out
-
-        ok = insert_market_event(
-            ts=last.ts,
-            tf=tf,
-            event_type="wait",
-            side=None,
-            level=None,
-            zone=None,
-            confidence=50,
-            payload={"px": float(px)},
-        )
-        out.append(f"{tf} wait {'+1' if ok else 'skip'}")
-
-    return out
+        return out
