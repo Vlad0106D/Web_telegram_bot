@@ -161,19 +161,23 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 # =============================================================================
 # CLOSE-TIME POLICY (D1/W1) — чтобы не слать "догоняющие" отчёты после рестарта
+# ВАЖНО: mm_snapshots хранит ts = open_time последней ЗАКРЫТОЙ свечи.
+# Поэтому для D1 закрытие суток, случившееся в 00:00, соответствует ts=вчера 00:00.
 # =============================================================================
 
 def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
     now = now.astimezone(timezone.utc).replace(microsecond=0)
 
     if tf == "D1":
-        # D1 utc close -> ts = 00:00 текущего дня (свеча, закрывшаяся в 00:00)
-        return datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        # D1: последняя ЗАКРЫТАЯ свеча в течение текущего дня имеет ts = 00:00 ВЧЕРАШНЕГО дня.
+        today_00 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+        return today_00 - timedelta(days=1)
 
     if tf == "W1":
-        # W1 utc close -> ts = понедельник 00:00 текущей недели
-        monday = (now.date() - timedelta(days=now.weekday()))
-        return datetime(monday.year, monday.month, monday.day, tzinfo=timezone.utc)
+        # W1: последняя ЗАКРЫТАЯ недельная свеча в течение текущей недели имеет ts = понедельник 00:00 ПРЕДЫДУЩЕЙ недели.
+        monday_this_week = (now.date() - timedelta(days=now.weekday()))
+        monday_00 = datetime(monday_this_week.year, monday_this_week.month, monday_this_week.day, tzinfo=timezone.utc)
+        return monday_00 - timedelta(days=7)
 
     return None
 
@@ -182,7 +186,8 @@ def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bo
     exp = _expected_close_ts(tf, now)
     if exp is None:
         return True
-    # политика "без бэкфилла": только если закрытие на ожидаемой границе
+    # политика "без бэкфилла": только если latest_ts ровно тот ts, который соответствует
+    # последней закрытой свече по нашей схеме хранения
     return latest_ts == exp
 
 
