@@ -161,23 +161,27 @@ def _mark_report_sent(conn: psycopg.Connection, tf: str, ts: datetime, payload: 
 
 # =============================================================================
 # CLOSE-TIME POLICY (D1/W1) — чтобы не слать "догоняющие" отчёты после рестарта
-# ВАЖНО: mm_snapshots хранит ts = open_time последней ЗАКРЫТОЙ свечи.
-# Поэтому для D1 закрытие суток, случившееся в 00:00, соответствует ts=вчера 00:00.
 # =============================================================================
 
 def _expected_close_ts(tf: str, now: datetime) -> Optional[datetime]:
+    """
+    ВАЖНО: в mm_snapshots ts = ВРЕМЯ ОТКРЫТИЯ свечи (floor).
+    Значит:
+      - D1 "закрытие дня" происходит в 00:00 today UTC,
+        но закрытая свеча имеет ts = 00:00 YESTERDAY UTC.
+      - W1 закрытие недели в понедельник 00:00,
+        но закрытая недельная свеча имеет ts = понедельник ПРЕДЫДУЩЕЙ недели 00:00.
+    """
     now = now.astimezone(timezone.utc).replace(microsecond=0)
 
     if tf == "D1":
-        # D1: последняя ЗАКРЫТАЯ свеча в течение текущего дня имеет ts = 00:00 ВЧЕРАШНЕГО дня.
         today_00 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
         return today_00 - timedelta(days=1)
 
     if tf == "W1":
-        # W1: последняя ЗАКРЫТАЯ недельная свеча в течение текущей недели имеет ts = понедельник 00:00 ПРЕДЫДУЩЕЙ недели.
-        monday_this_week = (now.date() - timedelta(days=now.weekday()))
-        monday_00 = datetime(monday_this_week.year, monday_this_week.month, monday_this_week.day, tzinfo=timezone.utc)
-        return monday_00 - timedelta(days=7)
+        monday_this = (now.date() - timedelta(days=now.weekday()))
+        monday_this_00 = datetime(monday_this.year, monday_this.month, monday_this.day, tzinfo=timezone.utc)
+        return monday_this_00 - timedelta(days=7)
 
     return None
 
@@ -186,8 +190,7 @@ def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bo
     exp = _expected_close_ts(tf, now)
     if exp is None:
         return True
-    # политика "без бэкфилла": только если latest_ts ровно тот ts, который соответствует
-    # последней закрытой свече по нашей схеме хранения
+    # политика "без бэкфилла": только если закрытие на ожидаемой границе
     return latest_ts == exp
 
 
@@ -512,17 +515,15 @@ async def _mm_auto_tick(app: Application) -> None:
                         exp,
                     )
 
-                    # ✅ ВАЖНО: даже если отчёт не шлём — state должен обновиться на latest_ts
-                    view = build_market_view(tf, manual=False)
-
+                    # action считаем/пишем даже если close-report skip
                     latest_close = _get_latest_snapshot_close(conn, tf)
                     if latest_close is not None:
                         try:
                             ins = _insert_action_decision(
-                                conn, tf=tf, action_ts=view.ts, action_close=float(latest_close)
+                                conn, tf=tf, action_ts=latest_ts, action_close=float(latest_close)
                             )
                             evn = _evaluate_pending(
-                                conn, tf=tf, latest_ts=view.ts, latest_close=float(latest_close)
+                                conn, tf=tf, latest_ts=latest_ts, latest_close=float(latest_close)
                             )
                             if ins or evn:
                                 conn.commit()
