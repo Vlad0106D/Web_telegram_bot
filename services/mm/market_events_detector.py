@@ -63,6 +63,31 @@ def _rel_dist(px: float, level: float) -> float:
     return abs(px / level - 1.0)
 
 
+def _has_non_wait_event_for_ts(
+    *,
+    tf: str,
+    ts: datetime,
+    symbol: str = "BTC-USDT",
+) -> bool:
+    """
+    ✅ Anti-noise:
+    если на этой же свече уже есть любое событие кроме 'wait',
+    то 'wait' больше не пишем (иначе получаем pressure_* + wait на одном ts).
+    """
+    sql = """
+    SELECT 1
+    FROM mm_market_events
+    WHERE symbol=%s AND tf=%s AND ts=%s
+      AND event_type <> 'wait'
+    LIMIT 1;
+    """
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        with conn.cursor() as cur:
+            cur.execute(sql, (symbol, tf, ts))
+            return cur.fetchone() is not None
+
+
 # -----------------------------------------------------------------------------
 # LEVELS: для H1 берём уровни и от H1, и от H4 (H4 приоритетнее)
 # -----------------------------------------------------------------------------
@@ -75,6 +100,7 @@ def _get_levels_sets(tf: str) -> List[Dict[str, Any]]:
       - range_high/low, eqh/eql
       - up_targets/dn_targets
     """
+
     def _pack(source_tf: str, zone_prefix: str) -> Dict[str, Any]:
         liq = load_last_liquidity_levels(source_tf) or {}
         return {
@@ -473,8 +499,13 @@ def detect_and_store_market_events(tf: str) -> List[str]:
 
     # -------------------------------------------------------------------------
     # 3) WAIT (heartbeat) — только если реально ничего не записали
+    #    ✅ и только если на этом ts вообще нет НЕ-wait событий
     # -------------------------------------------------------------------------
     if not wrote_any:
+        if _has_non_wait_event_for_ts(tf=tf, ts=last.ts, symbol="BTC-USDT"):
+            out.append(f"{tf} wait skip(existing_non_wait)")
+            return out
+
         ok = insert_market_event(
             ts=last.ts,
             tf=tf,
