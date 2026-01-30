@@ -769,16 +769,25 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         # ─────────────────────────────────────────
         # LIQUIDITY TARGETS (PRIMARY TF)
         # ─────────────────────────────────────────
-        down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
-        down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
+        raw_dn, raw_up, key_zone0 = _targets_from_liq_levels(tf)
+        raw_dn, raw_up, key_zone0 = _merge_with_persisted(tf, raw_dn, raw_up, key_zone0)
 
-        # ✅ строгий семантический фильтр (как в MTF): DN только ниже цены, UP только выше
-        down_t = [float(x) for x in (down_t or []) if x is not None and float(x) < btc_close]
-        up_t   = [float(x) for x in (up_t or [])   if x is not None and float(x) > btc_close]
+        # ✅ НОРМАЛИЗАЦИЯ: не доверяем тому, что пришло "в dn/up",
+        # раскладываем уровни строго относительно текущей цены.
+        cand: List[float] = []
+        for v in (raw_dn or []) + (raw_up or []):
+            try:
+                fv = float(v)
+                if math.isfinite(fv):
+                    cand.append(fv)
+            except Exception:
+                pass
 
-        # ✅ без fallback’ов — если целей нет по смыслу, значит показываем "—"
-        down_t = down_t[:2]
-        up_t   = up_t[:2]
+        # уникализация (с сохранением порядка не нужна, дальше сортируем)
+        cand = list(dict.fromkeys(cand))
+
+        down_t = sorted([x for x in cand if x < btc_close], reverse=True)[:2]  # ближайшая DN первой
+        up_t = sorted([x for x in cand if x > btc_close])[:2]                  # ближайшая UP первой
 
         # ─────────────────────────────────────────
         # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned
@@ -868,10 +877,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 "eth_confirmation": eth_conf,
                 "event_type": st.get("event_type"),
             }
-            # ✅ inject range patch into payload (range — часть state/режима)
             payload.update(range_patch)
-
-            # ❗ liq_event_* / local_reclaim НЕ сохраняем в state (чтобы не путать слои)
             save_state(tf=tf, ts=ts, payload=payload)
         except Exception:
             pass
@@ -894,13 +900,11 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             btc_up_targets=up_t,
             key_zone=key_zone,
 
-            # ✅ range fields
             range_state=rr.state,
             range_rh_zone=rr.rh.to_dict(),
             range_rl_zone=rr.rl.to_dict(),
             range_width=float(rr.width),
 
-            # ✅ liquidity events (report-only)
             liq_event_type=liq_event_type,
             liq_event_side=liq_event_side,
             liq_event_level=liq_event_level,
