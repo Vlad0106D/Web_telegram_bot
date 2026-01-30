@@ -101,11 +101,14 @@ def _uniq_floats(xs: List[float]) -> List[float]:
 def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     """
     Семантика:
-    - eqh/eql = границы (локальная ликвидность / range boundary)
+    - eqh/eql = границы (локальная ликвидность / boundary)
     - up_targets/dn_targets = ВНЕШНИЕ цели (следующая ликвидность ЗА границами)
-      *Если цена внутри диапазона eqh/eql → targets ищем только выше eqh и ниже eql.*
-      *Если цена выше eqh → up_targets ищем выше eqh; dn_targets = ретест зона (eqh) не пишем в targets.*
-      *Если цена ниже eql → dn_targets ищем ниже eql; up_targets = ретест зона (eql) не пишем в targets.*
+
+    Правила:
+    - Если цена внутри диапазона eqh/eql → targets ищем только выше eqh и ниже eql.
+    - Если цена выше eqh → ищем только up_targets (внешние, выше eqh). dn_targets не строим.
+    - Если цена ниже eql → ищем только dn_targets (внешние, ниже eql). up_targets не строим.
+    - eqh/eql НИКОГДА не добавляем в targets.
     """
 
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
@@ -143,7 +146,7 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
 
     tol = 0.0012 if tf in ("H1", "H4") else (0.0018 if tf == "D1" else 0.0025)
 
-    # RECENT экстремумы (для fallback, но аккуратно — только если ВНЕ диапазона)
+    # RECENT экстремумы (для boundary fallback)
     recent_n = min(len(hist), RECENT_FALLBACK.get(tf, 50))
     recent_high = None
     recent_low = None
@@ -156,7 +159,7 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     except Exception:
         recent_low = None
 
-    # 1) boundary (eqh/eql) как раньше (кластер + fallback на recent)
+    # 1) boundary (eqh/eql): кластер + fallback на recent
     top_highs = sorted(highs, reverse=True)[:40]
     bot_lows = sorted(lows)[:40]
 
@@ -178,7 +181,7 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     if eql is not None:
         notes.append("eql_boundary")
 
-    # если нет px — дальше targets лучше не строить (чтобы не лепить мусор)
+    # если нет px или boundaries — targets не строим (иначе будем писать мусор)
     if px is None or eqh is None or eql is None:
         return LiquidityLevels(
             tf=tf,
@@ -190,56 +193,62 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
             notes=(notes + ["no_price_or_boundary"])[:10],
         )
 
-    # 2) определяем режим: цена относительно boundary
-    # небольшая "подушка", чтобы не флипалось от копеек
-    upper_edge = float(eqh) * (1.0 - tol * 0.2)
-    lower_edge = float(eql) * (1.0 + tol * 0.2)
+    eqh = float(eqh)
+    eql = float(eql)
+    px = float(px)
+
+    # 2) режим: цена относительно boundary
+    # подушка, чтобы не дрожало около границы
+    upper_edge = eqh * (1.0 - tol * 0.2)
+    lower_edge = eql * (1.0 + tol * 0.2)
 
     in_range = (px <= upper_edge) and (px >= lower_edge)
+    above_eqh = px > eqh * (1.0 + tol)
+    below_eql = px < eql * (1.0 - tol)
 
     # 3) external targets: ищем кластера ВНЕ boundary
     up_targets: List[float] = []
     dn_targets: List[float] = []
 
-    # кандидаты "снаружи"
-    highs_out = [h for h in highs if h > float(eqh) * (1.0 + tol)]
-    lows_out = [l for l in lows if l < float(eql) * (1.0 - tol)]
+    # кандидаты "снаружи" boundary
+    highs_out = [h for h in highs if h > eqh * (1.0 + tol)]
+    lows_out = [l for l in lows if l < eql * (1.0 - tol)]
 
-    # если цена уже выше eqh — всё равно ищем выше eqh (это внешняя ликвидность)
-    # если цена ниже eql — ищем ниже eql
-    # если внутри — ищем обе стороны снаружи
-    # (мы НЕ добавляем eqh/eql в targets вообще)
-    if in_range or (px >= float(eqh) * (1.0 + tol)):
+    # ── UP external
+    if in_range or above_eqh:
         if highs_out:
             top_out = sorted(highs_out, reverse=True)[:80]
             t1 = _cluster_level(top_out, tol=tol, min_hits=2)
             if t1 is not None:
                 up_targets.append(float(t1))
                 notes.append("up_ext_cluster")
+
             t2 = _cluster_level(top_out[10:], tol=tol, min_hits=2)
             if t2 is not None and (not up_targets or not _near(t2, up_targets[0], tol)):
                 up_targets.append(float(t2))
                 notes.append("up_ext_alt")
 
-        # fallback: только если recent_high действительно ВЫШЕ eqh
-        if not up_targets and recent_high is not None and float(recent_high) > float(eqh) * (1.0 + tol):
+        # fallback: только если recent_high действительно ВЫШЕ eqh (иначе мусор)
+        if not up_targets and recent_high is not None and float(recent_high) > eqh * (1.0 + tol):
             up_targets.append(float(recent_high))
             notes.append("up_ext_recent_fallback")
 
-    if in_range or (px <= float(eql) * (1.0 - tol)):
+    # ── DN external
+    if in_range or below_eql:
         if lows_out:
             bot_out = sorted(lows_out)[:80]
             t1 = _cluster_level(bot_out, tol=tol, min_hits=2)
             if t1 is not None:
                 dn_targets.append(float(t1))
                 notes.append("dn_ext_cluster")
+
             t2 = _cluster_level(bot_out[10:], tol=tol, min_hits=2)
             if t2 is not None and (not dn_targets or not _near(t2, dn_targets[0], tol)):
                 dn_targets.append(float(t2))
                 notes.append("dn_ext_alt")
 
-        # fallback: только если recent_low действительно НИЖЕ eql
-        if not dn_targets and recent_low is not None and float(recent_low) < float(eql) * (1.0 - tol):
+        # fallback: только если recent_low действительно НИЖЕ eql (иначе мусор)
+        if not dn_targets and recent_low is not None and float(recent_low) < eql * (1.0 - tol):
             dn_targets.append(float(recent_low))
             notes.append("dn_ext_recent_fallback")
 
@@ -247,18 +256,30 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     # UP: по возрастанию (ближайшая выше границы первая)
     up_targets = sorted(list(dict.fromkeys([float(x) for x in up_targets if x is not None])))[:2]
 
-    # DN: по убыванию (ближайшая ниже границы первая) — поэтому reverse=True
+    # DN: по убыванию (ближайшая ниже границы первая)
     dn_targets = sorted(list(dict.fromkeys([float(x) for x in dn_targets if x is not None])), reverse=True)[:2]
 
-    notes.append("in_range" if in_range else ("above_eqh" if px > eqh else "below_eql"))
+    # 5) финальный safety-check: targets должны быть "снаружи" boundary
+    # (на случай редких краевых кейсов)
+    up_targets = [x for x in up_targets if x > eqh * (1.0 + tol)]
+    dn_targets = [x for x in dn_targets if x < eql * (1.0 - tol)]
+
+    if in_range:
+        notes.append("in_range")
+    elif above_eqh:
+        notes.append("above_eqh")
+    elif below_eql:
+        notes.append("below_eql")
+    else:
+        notes.append("between_edges")
 
     return LiquidityLevels(
         tf=tf,
         ts=ts,
-        eqh=float(eqh) if eqh is not None else None,
-        eql=float(eql) if eql is not None else None,
-        up_targets=up_targets,
-        dn_targets=dn_targets,
+        eqh=eqh,
+        eql=eql,
+        up_targets=up_targets[:2],
+        dn_targets=dn_targets[:2],
         notes=notes[:10],
     )
 
