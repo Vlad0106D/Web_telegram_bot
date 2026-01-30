@@ -772,10 +772,13 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         down_t, up_t, key_zone0 = _targets_from_liq_levels(tf)
         down_t, up_t, key_zone0 = _merge_with_persisted(tf, down_t, up_t, key_zone0)
 
-        down_filtered = [x for x in down_t if x < btc_close]
-        up_filtered = [x for x in up_t if x > btc_close]
-        down_t = (down_filtered[:2] if down_filtered else down_t[:2])
-        up_t = (up_filtered[:2] if up_filtered else up_t[:2])
+        # ✅ строгий семантический фильтр (как в MTF): DN только ниже цены, UP только выше
+        down_t = [float(x) for x in (down_t or []) if x is not None and float(x) < btc_close]
+        up_t   = [float(x) for x in (up_t or [])   if x is not None and float(x) > btc_close]
+
+        # ✅ без fallback’ов — если целей нет по смыслу, значит показываем "—"
+        down_t = down_t[:2]
+        up_t   = up_t[:2]
 
         # ─────────────────────────────────────────
         # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned
