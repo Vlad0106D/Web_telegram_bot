@@ -441,7 +441,7 @@ async def _mm_auto_tick(app: Application) -> None:
 
     now = _now_utc()
 
-    # 1) SNAPSHOTS
+    # 1) SNAPSHOTS (должны быть первыми)
     try:
         await run_snapshots_once()
     except Exception:
@@ -450,57 +450,64 @@ async def _mm_auto_tick(app: Application) -> None:
 
     seen = _get_seen_map(app)
 
+    # ⚠️ ВАЖНО: НЕ обновляем seen заранее.
+    # Обновим seen только ПОСЛЕ успешного полного прохода по tf.
+
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
 
-        tfs_to_process: List[Tuple[str, datetime]] = []
+        # Сначала соберём кандидатов
+        candidates: List[Tuple[str, datetime]] = []
         for tf in MM_TFS:
             latest_ts = _get_latest_snapshot_ts(conn, tf)
             if latest_ts is None:
                 continue
 
-            # ✅ D1/W1 НЕ зависят от seen-map (иначе может “залипнуть”)
+            # D1/W1 не зависят от seen-map (иначе может “залипнуть”)
             if tf not in ("D1", "W1"):
                 if seen.get(tf) == _iso(latest_ts):
                     continue
 
-            tfs_to_process.append((tf, latest_ts))
+            candidates.append((tf, latest_ts))
 
-        if not tfs_to_process:
+        if not candidates:
             return
 
-        # ✅ seen отмечаем только для H1/H4 и прочих
-        for tf, ts in tfs_to_process:
-            if tf not in ("D1", "W1"):
-                seen[tf] = _iso(ts)
-
-        # 2) LIQUIDITY MEMORY
-        try:
-            await update_liquidity_memory([tf for tf, _ in tfs_to_process])
-        except Exception:
-            log.exception("MM auto: liquidity memory failed")
-
-        # 2.5) LIQUIDITY EVENTS (NEW LAYER)
-        for tf, _ in tfs_to_process:
+        # Обрабатываем каждый TF отдельно, и только после успеха отмечаем seen
+        for tf, initial_ts in candidates:
             try:
-                evs = detect_and_store_liquidity_events(tf)
-                if evs:
-                    log.info("MM liquidity events %s: %s", tf, "; ".join(evs))
-            except Exception:
-                log.exception("MM auto: liquidity events failed for tf=%s", tf)
+                # перечитаем актуальный ts на случай, если что-то успело обновиться
+                latest_ts = _get_latest_snapshot_ts(conn, tf)
+                if latest_ts is None:
+                    continue
 
-        # 3) MARKET EVENTS
-        for tf, _ in tfs_to_process:
-            try:
-                events = detect_and_store_market_events(tf)
-                if events:
-                    log.info("MM market events %s: %s", tf, "; ".join(events))
-            except Exception:
-                log.exception("MM auto: market events failed for tf=%s", tf)
+                # 2) LIQUIDITY MEMORY (обязательно ДО liquidity-events)
+                try:
+                    await update_liquidity_memory([tf])
+                except Exception:
+                    # если здесь упало — НЕ ставим seen и дадим перезапуститься на следующем тике
+                    log.exception("MM auto: liquidity memory failed tf=%s", tf)
+                    continue
 
-        # 4) REPORTS + ACTION ENGINE persistence/eval
-        for tf, _ in tfs_to_process:
-            try:
+                # 2.5) LIQUIDITY EVENTS (сигнальный слой, зависит от liq_levels)
+                try:
+                    evs = detect_and_store_liquidity_events(tf)
+                    if evs:
+                        log.info("MM liquidity events %s: %s", tf, "; ".join(evs))
+                except Exception:
+                    log.exception("MM auto: liquidity events failed for tf=%s", tf)
+                    # не критично для отчёта — продолжаем
+
+                # 3) MARKET EVENTS (state-layer)
+                try:
+                    events = detect_and_store_market_events(tf)
+                    if events:
+                        log.info("MM market events %s: %s", tf, "; ".join(events))
+                except Exception:
+                    log.exception("MM auto: market events failed for tf=%s", tf)
+                    # не критично для отчёта — продолжаем
+
+                # 4) REPORTS + ACTION ENGINE persistence/eval
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
                 if latest_ts is None:
                     continue
@@ -536,6 +543,10 @@ async def _mm_auto_tick(app: Application) -> None:
                         except Exception:
                             conn.rollback()
                             log.exception("MM auto: action persistence failed tf=%s (close-report skipped)", tf)
+
+                    # ✅ только здесь фиксируем seen (потому что цикл tf прошёл нормально)
+                    if tf not in ("D1", "W1"):
+                        seen[tf] = _iso(latest_ts)
                     continue
 
                 # строим view (внутри сохранится mm_state)
@@ -565,6 +576,9 @@ async def _mm_auto_tick(app: Application) -> None:
 
                 # отчёт уже отправляли на этот ts?
                 if _report_already_sent(conn, tf, view.ts):
+                    # ✅ прошли успешно → фиксируем seen
+                    if tf not in ("D1", "W1"):
+                        seen[tf] = _iso(view.ts)
                     continue
 
                 # отправляем отчёт
@@ -582,9 +596,15 @@ async def _mm_auto_tick(app: Application) -> None:
 
                 log.info("MM report sent tf=%s ts=%s", tf, view.ts)
 
+                # ✅ только ПОСЛЕ полного успеха отмечаем seen (чтобы не залипало)
+                if tf not in ("D1", "W1"):
+                    seen[tf] = _iso(view.ts)
+
             except Exception:
                 conn.rollback()
-                log.exception("MM auto: report failed tf=%s", tf)
+                log.exception("MM auto: tick failed tf=%s", tf)
+                # ⚠️ НЕ отмечаем seen — пусть повторит на следующем тике
+                continue
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
