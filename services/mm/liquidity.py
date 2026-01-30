@@ -25,6 +25,14 @@ LOOKBACK = {
     "W1": 80,
 }
 
+# ✅ NEW: окно "свежести" для fallback уровней
+RECENT_FALLBACK = {
+    "H1": 60,
+    "H4": 50,
+    "D1": 30,
+    "W1": 20,
+}
+
 
 @dataclass
 class LiquidityLevels:
@@ -41,9 +49,8 @@ class LiquidityLevels:
 
 
 def _fetch_history(conn: psycopg.Connection, tf: str, limit: int) -> List[Dict[str, Any]]:
-    # ✅ FIX: добавили close, чтобы фильтровать цели относительно текущей цены
     sql = """
-    SELECT ts, high, low, close
+    SELECT ts, high, low
     FROM mm_snapshots
     WHERE symbol='BTC-USDT' AND tf=%s
     ORDER BY ts DESC
@@ -78,47 +85,6 @@ def _cluster_level(values: List[float], tol: float, min_hits: int = 2) -> Option
     return None
 
 
-def _cluster_levels(values: List[float], tol: float, min_hits: int = 2, max_levels: int = 6) -> List[float]:
-    """
-    ✅ NEW: находим несколько кластеров (уровней), а не один лучший.
-    Greedy: нашёл лучший кластер → выкинул его элементы → повторил.
-    """
-    pool = list(values or [])
-    out: List[float] = []
-
-    while pool and len(out) < max_levels:
-        best_hits = 0
-        best_mean = None
-        best_cluster: List[float] = []
-
-        for v in pool:
-            hits = [x for x in pool if _near(x, v, tol)]
-            if len(hits) > best_hits:
-                best_hits = len(hits)
-                best_cluster = hits
-                best_mean = sum(hits) / len(hits)
-
-        if best_hits < min_hits or best_mean is None:
-            break
-
-        lvl = float(best_mean)
-        out.append(lvl)
-
-        # выкидываем найденный кластер из пула
-        pool = [x for x in pool if x not in best_cluster]
-
-    # уникализация с учётом tol (чтобы рядом стоящие уровни не дублировались)
-    uniq: List[float] = []
-    for v in sorted(out):
-        if not uniq:
-            uniq.append(v)
-            continue
-        if not _near(v, uniq[-1], tol):
-            uniq.append(v)
-
-    return uniq
-
-
 def compute_liquidity_levels(tf: str) -> LiquidityLevels:
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
@@ -136,57 +102,79 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
             notes=["insufficient_history"],
         )
 
+    ts = hist[0]["ts"]
+
     highs = [float(r["high"]) for r in hist if r.get("high") is not None]
     lows = [float(r["low"]) for r in hist if r.get("low") is not None]
 
-    # ✅ ref_price = close последней свечи (главный фикс против "залипания" уровней)
-    ref_price: Optional[float] = None
-    try:
-        ref_price = float(hist[0].get("close")) if hist and hist[0].get("close") is not None else None
-    except Exception:
-        ref_price = None
-
     tol = 0.0012 if tf in ("H1", "H4") else (0.0018 if tf == "D1" else 0.0025)
 
-    # ✅ Важно: используем НЕ "самые высокие хаи / самые низкие лои",
-    # а кластера по ближней истории, чтобы уровни быстрее "переезжали" в новый режим.
-    max_pool = 140 if tf in ("H1", "H4") else (120 if tf == "D1" else 100)
-    highs_pool = highs[:max_pool]
-    lows_pool = lows[:max_pool]
+    # ✅ RECENT fallback уровни (если кластер не находится)
+    recent_n = min(len(hist), RECENT_FALLBACK.get(tf, 50))
+    recent_high = None
+    recent_low = None
+    try:
+        recent_high = max(float(r["high"]) for r in hist[:recent_n] if r.get("high") is not None)
+    except Exception:
+        recent_high = None
+    try:
+        recent_low = min(float(r["low"]) for r in hist[:recent_n] if r.get("low") is not None)
+    except Exception:
+        recent_low = None
 
-    # Несколько кластеров
-    hi_levels = _cluster_levels(highs_pool, tol=tol, min_hits=2, max_levels=8)
-    lo_levels = _cluster_levels(lows_pool, tol=tol, min_hits=2, max_levels=8)
+    top_highs = sorted(highs, reverse=True)[:40]
+    bot_lows = sorted(lows)[:40]
 
-    # Fallback: если кластера не нашлись (редко, но возможно)
-    if not hi_levels:
-        hi_levels = sorted(set(highs_pool))[-8:] if highs_pool else []
-    if not lo_levels:
-        lo_levels = sorted(set(lows_pool))[:8] if lows_pool else []
+    eqh = _cluster_level(top_highs, tol=tol, min_hits=2)
+    eql = _cluster_level(bot_lows, tol=tol, min_hits=2)
 
     up_targets: List[float] = []
     dn_targets: List[float] = []
-    notes: List[str] = ["multi_cluster"]
+    notes: List[str] = []
 
-    if ref_price is not None:
-        # ✅ Семантика: DN строго ниже цены, UP строго выше цены
-        ups = sorted([x for x in hi_levels if x > ref_price])
-        dns = sorted([x for x in lo_levels if x < ref_price], reverse=True)
+    # ─────────────────────────────────────────
+    # ✅ HARD fallback: если кластера нет — берём свежие экстремумы
+    # ─────────────────────────────────────────
+    if eqh is None and recent_high is not None:
+        eqh = float(recent_high)
+        notes.append("eqh_recent_fallback")
 
-        up_targets = ups[:2]
-        dn_targets = dns[:2]
-        notes.append("ref_price_filter")
-    else:
-        # если close недоступен — оставляем первые 2 кластера
-        up_targets = sorted(hi_levels)[:2]
-        dn_targets = sorted(lo_levels, reverse=True)[:2]
-        notes.append("no_close_fallback")
+    if eql is None and recent_low is not None:
+        eql = float(recent_low)
+        notes.append("eql_recent_fallback")
 
-    # ✅ eqh/eql оставляем для совместимости (первый таргет)
-    eqh = up_targets[0] if up_targets else (_cluster_level(hi_levels, tol=tol, min_hits=1) if hi_levels else None)
-    eql = dn_targets[0] if dn_targets else (_cluster_level(lo_levels, tol=tol, min_hits=1) if lo_levels else None)
+    if eqh is not None:
+        up_targets.append(float(eqh))
+        notes.append("eqh_level")
 
-    ts = hist[0]["ts"]
+    if eql is not None:
+        dn_targets.append(float(eql))
+        notes.append("eql_level")
+
+    # alt clusters (как дополнительная цель, если отличается)
+    alt_eqh = _cluster_level(top_highs[10:], tol=tol, min_hits=2)
+    alt_eql = _cluster_level(bot_lows[10:], tol=tol, min_hits=2)
+
+    if alt_eqh and (not eqh or not _near(alt_eqh, eqh, tol)):
+        up_targets.append(float(alt_eqh))
+        notes.append("eqh_alt")
+
+    if alt_eql and (not eql or not _near(alt_eql, eql, tol)):
+        dn_targets.append(float(alt_eql))
+        notes.append("eql_alt")
+
+    # ✅ Если после всего вдруг одна сторона всё равно пустая (защита)
+    if not up_targets and recent_high is not None:
+        up_targets.append(float(recent_high))
+        notes.append("up_force_recent")
+
+    if not dn_targets and recent_low is not None:
+        dn_targets.append(float(recent_low))
+        notes.append("dn_force_recent")
+
+    # уникализация + сортировка
+    up_targets = sorted(list(dict.fromkeys(up_targets)))[:2]            # снизу вверх
+    dn_targets = sorted(list(dict.fromkeys(dn_targets)), reverse=True)[:2]  # сверху вниз (ближайшая DN первой)
 
     return LiquidityLevels(
         tf=tf,
@@ -195,7 +183,7 @@ def compute_liquidity_levels(tf: str) -> LiquidityLevels:
         eql=eql,
         up_targets=up_targets,
         dn_targets=dn_targets,
-        notes=notes[:8],
+        notes=notes[:10],
     )
 
 
@@ -258,12 +246,10 @@ def save_liquidity_levels(levels: LiquidityLevels) -> bool:
         "up_targets": levels.up_targets,
         "dn_targets": levels.dn_targets,
         "notes": levels.notes,
-        # ✅ доп поля для диагностики “устаревшей памяти”
         "source_snapshot_ts": levels.ts.isoformat(),
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ✅ никогда не сохраняем служебные поля
     payload.pop("_liq_ts", None)
 
     sql_upsert = """
@@ -328,6 +314,7 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
     for tf in tfs:
         lv = compute_liquidity_levels(tf)
 
+        # ✅ если история реально пустая — держим прежнее
         if not lv.up_targets and not lv.dn_targets and "insufficient_history" in lv.notes:
             prev = load_last_liquidity_levels(tf)
             if _has_targets(prev):
@@ -336,7 +323,7 @@ async def update_liquidity_memory(tfs: List[str]) -> List[str]:
 
         wrote = save_liquidity_levels(lv)
         if wrote:
-            out.append(f"{tf}: wrote up={lv.up_targets} dn={lv.dn_targets}")
+            out.append(f"{tf}: wrote up={lv.up_targets} dn={lv.dn_targets} notes={lv.notes}")
         else:
             out.append(f"{tf}: skip(no_change) up={lv.up_targets} dn={lv.dn_targets}")
 
