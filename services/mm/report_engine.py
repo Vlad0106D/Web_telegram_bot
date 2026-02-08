@@ -1,9 +1,10 @@
+# services/mm/report_engine.py
 from __future__ import annotations
 
 import os
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg
@@ -11,10 +12,10 @@ from psycopg.rows import dict_row
 
 from services.mm.state_store import save_state, load_last_state
 from services.mm.liquidity import load_last_liquidity_levels
-from services.mm.market_events_store import get_market_event_for_ts  # ✅ ts-aligned event
+from services.mm.market_events_store import get_market_event_for_ts  # ✅ ts-aligned + layer-aware
 from services.mm.action_engine import compute_action  # ✅ real Action Engine
 
-# ✅ NEW: Range Engine (zones + acceptance-only)
+# ✅ Range Engine (zones + acceptance-only)
 from services.mm.range_engine import apply_range_engine, RangeResult
 
 
@@ -188,68 +189,10 @@ def _merge_with_persisted(
 
 
 # ---------------------------
-# Event helpers (state vs liquidity-events separation)
+# Event helpers (STATE vs LIQ separation)  ✅ now uses store.layer filter
 # ---------------------------
 
-def _tf_seconds(tf: str) -> int:
-    return {"H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800}.get(tf, 3600)
-
-
-def _is_liq_event_type(et: Optional[str]) -> bool:
-    et = (et or "").strip()
-    if not et:
-        return False
-    # ✅ liq-layer: liq_* + local_reclaim* (даже если без liq_ префикса)
-    return et.startswith("liq_") or et.startswith("local_reclaim")
-
-
-def _fetch_event_filtered(
-    conn: psycopg.Connection,
-    *,
-    tf: str,
-    ts: datetime,
-    symbol: str,
-    max_age_bars: int,
-    want_liq: bool,
-) -> Optional[Dict[str, Any]]:
-
-    # окно по времени (оставляем твою текущую логику)
-    min_ts = ts  # fallback
-    if max_age_bars > 0:
-        min_ts = ts - timedelta(minutes=1)  # безопасный минимум
-
-    if want_liq:
-        # ✅ LIQ-layer = liq_* OR local_reclaim*
-        sql = """
-            SELECT *
-            FROM mm_market_events
-            WHERE symbol=%s AND tf=%s
-              AND ts <= %s AND ts >= %s
-              AND (event_type LIKE %s OR event_type LIKE %s)
-            ORDER BY ts DESC, id DESC
-            LIMIT 1;
-        """
-        params = (symbol, tf, ts, min_ts, "liq_%", "local_reclaim%")
-    else:
-        # ✅ STATE-layer = всё, кроме liq_* и local_reclaim*
-        sql = """
-            SELECT *
-            FROM mm_market_events
-            WHERE symbol=%s AND tf=%s
-              AND ts <= %s AND ts >= %s
-              AND (event_type NOT LIKE %s AND event_type NOT LIKE %s)
-            ORDER BY ts DESC, id DESC
-            LIMIT 1;
-        """
-        params = (symbol, tf, ts, min_ts, "liq_%", "local_reclaim%")
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()
-
-
 def _get_state_event_for_ts(
-    conn: psycopg.Connection,
     *,
     tf: str,
     ts: datetime,
@@ -257,17 +200,22 @@ def _get_state_event_for_ts(
     max_age_bars: int = 2,
 ) -> Optional[Dict[str, Any]]:
     """
-    Событие для STATE: только НЕ liq_* и НЕ local_reclaim*
+    TS-aligned событие для STATE слоя:
+      - исключаем liq_* и local_reclaim*
     """
-    # Сначала быстрый путь через store (если он вернёт liq_/local_reclaim — пере-фильтруем SQL’ом)
-    ev = get_market_event_for_ts(tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars)
-    if ev and not _is_liq_event_type(ev.get("event_type")):
-        return ev
-    return _fetch_event_filtered(conn, tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars, want_liq=False)
+    try:
+        return get_market_event_for_ts(
+            tf=tf,
+            ts=ts,
+            symbol=symbol,
+            max_age_bars=max_age_bars,
+            layer="state",
+        )
+    except Exception:
+        return None
 
 
 def _get_liq_event_for_ts(
-    conn: psycopg.Connection,
     *,
     tf: str,
     ts: datetime,
@@ -275,12 +223,19 @@ def _get_liq_event_for_ts(
     max_age_bars: int = 2,
 ) -> Optional[Dict[str, Any]]:
     """
-    Событие LIQUIDITY EVENTS: liq_* ИЛИ local_reclaim*
+    TS-aligned событие для LIQ слоя:
+      - только liq_* и local_reclaim*
     """
-    ev = get_market_event_for_ts(tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars)
-    if ev and _is_liq_event_type(ev.get("event_type")):
-        return ev
-    return _fetch_event_filtered(conn, tf=tf, ts=ts, symbol=symbol, max_age_bars=max_age_bars, want_liq=True)
+    try:
+        return get_market_event_for_ts(
+            tf=tf,
+            ts=ts,
+            symbol=symbol,
+            max_age_bars=max_age_bars,
+            layer="liq",
+        )
+    except Exception:
+        return None
 
 
 # ---------------------------
@@ -626,12 +581,8 @@ def _build_mtf_context(
             up_t = _flt_float_list(up_t)[:2]
 
             # ✅ MTF semantic filter относительно ТЕКУЩЕЙ цены primary tf
-            # DN должны быть ниже цены, UP выше цены
             dn_below = [x for x in down_t if x < float(btc_close_for_dist)]
             up_above = [x for x in up_t if x > float(btc_close_for_dist)]
-
-            # ✅ ВАЖНО: никаких fallback'ов на "сырой" список
-            # если DN нет ниже цены — DN просто не показываем
             dn_show = dn_below[:2]
             up_show = up_above[:2]
 
@@ -645,15 +596,8 @@ def _build_mtf_context(
             ev = None
             if st_ts:
                 # ✅ HTF state не должен залипать на liq_/local_reclaim
-                ev = _get_state_event_for_ts(
-                    conn,
-                    tf=tf,
-                    ts=st_ts,
-                    symbol="BTC-USDT",
-                    max_age_bars=2,
-                )
+                ev = _get_state_event_for_ts(tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
 
-            # ⚠️ для фаз/вероятностей используем ТОЛЬКО семантически корректные уровни
             st = _event_driven_state(
                 tf,
                 btc_close=btc_close_for_dist,
@@ -701,13 +645,13 @@ class MarketView:
     btc_up_targets: List[float]
     key_zone: Optional[str]
 
-    # ✅ NEW: Range (decision only)
+    # ✅ Range (decision only)
     range_state: str
-    range_rh_zone: Dict[str, float]   # {"lo":..., "hi":...}
-    range_rl_zone: Dict[str, float]   # {"lo":..., "hi":...}
+    range_rh_zone: Dict[str, float]
+    range_rl_zone: Dict[str, float]
     range_width: float
 
-    # ✅ NEW: Liquidity events (signal-layer; не влияет на state)
+    # ✅ Liquidity events (signal-layer; не влияет на state)
     liq_event_type: Optional[str]
     liq_event_side: Optional[str]
     liq_event_level: Optional[float]
@@ -772,8 +716,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         raw_dn, raw_up, key_zone0 = _targets_from_liq_levels(tf)
         raw_dn, raw_up, key_zone0 = _merge_with_persisted(tf, raw_dn, raw_up, key_zone0)
 
-        # ✅ НОРМАЛИЗАЦИЯ: не доверяем тому, что пришло "в dn/up",
-        # раскладываем уровни строго относительно текущей цены.
+        # ✅ НОРМАЛИЗАЦИЯ: раскладываем уровни строго относительно текущей цены.
         cand: List[float] = []
         for v in (raw_dn or []) + (raw_up or []):
             try:
@@ -783,17 +726,14 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             except Exception:
                 pass
 
-        # уникализация (с сохранением порядка не нужна, дальше сортируем)
         cand = list(dict.fromkeys(cand))
-
-        down_t = sorted([x for x in cand if x < btc_close], reverse=True)[:2]  # ближайшая DN первой
-        up_t = sorted([x for x in cand if x > btc_close])[:2]                  # ближайшая UP первой
+        down_t = sorted([x for x in cand if x < btc_close], reverse=True)[:2]
+        up_t = sorted([x for x in cand if x > btc_close])[:2]
 
         # ─────────────────────────────────────────
-        # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned
-        # ✅ ВАЖНО: state берём только из НЕ liq_ и НЕ local_reclaim событий
+        # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned + layer="state"
         # ─────────────────────────────────────────
-        ev = _get_state_event_for_ts(conn, tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
+        ev = _get_state_event_for_ts(tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
         st = _event_driven_state(tf, btc_close=btc_close, dn_targets=down_t, up_targets=up_t, ev=ev)
 
         state_title = st["state_title"]
@@ -807,9 +747,9 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         key_zone = st.get("key_zone") or key_zone0
 
         # ─────────────────────────────────────────
-        # ✅ LIQUIDITY EVENTS (signal-layer, report-only)
+        # ✅ LIQUIDITY EVENTS (signal-layer, report-only)  layer="liq"
         # ─────────────────────────────────────────
-        liq_ev = _get_liq_event_for_ts(conn, tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
+        liq_ev = _get_liq_event_for_ts(tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
         liq_event_type = (liq_ev.get("event_type") if liq_ev else None)
         liq_event_side = (liq_ev.get("side") if liq_ev else None)
         liq_event_level = None
@@ -899,17 +839,14 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             btc_down_targets=down_t,
             btc_up_targets=up_t,
             key_zone=key_zone,
-
             range_state=rr.state,
             range_rh_zone=rr.rh.to_dict(),
             range_rl_zone=rr.rl.to_dict(),
             range_width=float(rr.width),
-
             liq_event_type=liq_event_type,
             liq_event_side=liq_event_side,
             liq_event_level=liq_event_level,
             liq_event_zone=liq_event_zone,
-
             btc_oi=btc_oi,
             btc_oi_delta=btc_oi_d,
             btc_funding=btc_fr,
@@ -994,12 +931,10 @@ def render_report(view: MarketView) -> str:
             et_txt = "LIQ SWEEP HIGH (локальная ликвидность снята сверху)"
         elif et == "liq_sweep_low":
             et_txt = "LIQ SWEEP LOW (локальная ликвидность снята снизу)"
-        elif et in ("liq_local_reclaim", "local_reclaim", "liq_reclaim"):
-            et_txt = "LOCAL RECLAIM (локальный реклейм внутри liquidity, режим НЕ меняем)"
-        elif et in ("liq_local_reclaim_up", "local_reclaim_up", "liq_reclaim_up"):
-            et_txt = "LOCAL RECLAIM UP ✅ (локальный реклейм вверх внутри liquidity, режим НЕ меняем)"
-        elif et in ("liq_local_reclaim_down", "local_reclaim_down", "liq_reclaim_down"):
-            et_txt = "LOCAL RECLAIM DOWN ✅ (локальный реклейм вниз внутри liquidity, режим НЕ меняем)"
+        elif et == "liq_reclaim_up":
+            et_txt = "LIQ RECLAIM UP ✅ (локальный реклейм вверх внутри liquidity, режим НЕ меняем)"
+        elif et == "liq_reclaim_down":
+            et_txt = "LIQ RECLAIM DOWN ✅ (локальный реклейм вниз внутри liquidity, режим НЕ меняем)"
         else:
             et_txt = et
 
@@ -1082,5 +1017,4 @@ def render_report(view: MarketView) -> str:
     lines.append("")
     lines.append(f"ETH: {view.eth_confirmation}")
 
-    text = "\n".join(lines)
-    return text
+    return "\n".join(lines)
