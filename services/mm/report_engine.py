@@ -1,23 +1,28 @@
 # services/mm/report_engine.py
 from __future__ import annotations
 
+# stdlib
 import os
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
+# third-party
 import psycopg
 from psycopg.rows import dict_row
 
+# internal: state / events / actions
 from services.mm.state_store import save_state, load_last_state
 from services.mm.liquidity import load_last_liquidity_levels
-from services.mm.market_events_store import get_market_event_for_ts  # ✅ ts-aligned + layer-aware
-from services.mm.action_engine import compute_action  # ✅ real Action Engine
+from services.mm.market_events_store import (
+    get_market_event_for_ts,
+)
+from services.mm.action_engine import compute_action
 
-# ✅ Range Engine (zones + acceptance-only)
-from services.mm.range_engine import apply_range_engine, RangeResult
-
+# internal: range
+from services.mm.range_engine import apply_range_engine
+from services.mm.range_history_store import upsert_range_history  # ← ВОТ ТУТ
 
 SYMBOLS = ["BTC-USDT", "ETH-USDT"]
 
