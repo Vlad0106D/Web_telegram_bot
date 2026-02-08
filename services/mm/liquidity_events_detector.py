@@ -251,28 +251,36 @@ def _reclaim_already_written_for_sweep(
         return cur.fetchone() is not None
 
 
-def _liq_stale_info(tf: str, *, lastqlast_ts: datetime, liq_payload: Dict[str, Any], max_age_bars: int = 2) -> Dict[str, Any]:
+def _liq_stale_info(
+    tf: str,
+    *,
+    last_ts: datetime,
+    liq_payload: Dict[str, Any],
+    max_age_bars: int = 2,
+) -> Dict[str, Any]:
     """
     ✅ NEW: проверка устаревания liq_levels относительно текущей свечи.
     Мы НЕ блокируем детектор (чтобы не "молчать"), но помечаем stale для дебага.
     """
     liq_ts = liq_payload.get("_liq_ts")
+
     if not isinstance(liq_ts, datetime):
         return {
             "liq_levels_stale": True,
             "liq_levels_reason": "no_liq_ts",
             "liq_ts": _safe_iso(liq_ts),
-            "last_ts": _safe_iso(RZalast_ts),
+            "last_ts": _safe_iso(last_ts),
             "max_age_bars": int(max_age_bars),
         }
 
-    age_sec = (RZalast_ts - liq_ts).total_seconds()
+    age_sec = (last_ts - liq_ts).total_seconds()
     stale = bool(age_sec > (max(1, int(max_age_bars)) * _tf_seconds(tf)))
+
     return {
         "liq_levels_stale": bool(stale),
         "liq_levels_age_sec": float(age_sec),
         "liq_ts": _safe_iso(liq_ts),
-        "last_ts": _safe_iso(RZalast_ts),
+        "last_ts": _safe_iso(last_ts),
         "max_age_bars": int(max_age_bars),
     }
 
