@@ -10,7 +10,10 @@ import psycopg
 from psycopg.rows import dict_row
 
 from services.mm.liquidity import load_last_liquidity_levels
-from services.mm.market_events_store import insert_market_event, get_last_market_event
+from services.mm.market_events_store import (
+    insert_market_event,
+    get_last_market_event_by_types,  # ✅ NEW: strict "last sweep" selector
+)
 
 
 def _db_url() -> str:
@@ -195,6 +198,11 @@ def detect_and_store_market_events(tf: str) -> List[str]:
       - sweep_high -> либо reclaim_down (close < level), либо accept_above (close > level*(1+accept_tol))
 
     RECLAIM / ACCEPTANCE никогда не пишем "в той же свече", что sweep.
+
+    ✅ FIX (главный):
+    Раньше мы брали get_last_market_event(), который возвращает "лучшее по приоритету",
+    из-за чего last_ev мог быть pressure_* или decision_zone вместо последнего sweep_*.
+    Теперь берём строго ПОСЛЕДНИЙ sweep_* через get_last_market_event_by_types().
     """
     out: List[str] = []
 
@@ -224,19 +232,28 @@ def detect_and_store_market_events(tf: str) -> List[str]:
         inserted_types_this_ts: set[str] = set()
 
         # -------------------------------------------------------------------------
-        # 0) RECLAIM / ACCEPTANCE (НЕ в той же свече): смотрим по прошлому sweep_*
+        # 0) RECLAIM / ACCEPTANCE (НЕ в той же свече): смотрим по ПОСЛЕДНЕМУ sweep_*
         # -------------------------------------------------------------------------
-        last_ev = get_last_market_event(tf=tf, symbol="BTC-USDT")
-        if last_ev:
-            last_type = (last_ev.get("event_type") or "").strip()
-            last_ts = last_ev.get("ts")
-            last_level = _as_float(last_ev.get("level"))
-            last_zone = last_ev.get("zone")
+        last_sweep = get_last_market_event_by_types(
+            tf=tf,
+            symbol="BTC-USDT",
+            event_types=("sweep_low", "sweep_high"),
+            layer="state",          # ✅ sweep_* это state-layer
+            lookback_min=None,      # дефолт по tf (MM_EVENT_LOOKBACK_MIN_*)
+        )
 
-            if last_ts is not None and last_ts < last.ts and last_level is not None:
-                lvl = float(last_level)
+        if last_sweep:
+            sweep_type = (last_sweep.get("event_type") or "").strip()
+            sweep_ts = last_sweep.get("ts")
+            sweep_level = _as_float(last_sweep.get("level"))
+            sweep_zone = last_sweep.get("zone")
 
-                if last_type == "sweep_low":
+            # RECLAIM/ACCEPT нельзя писать "в той же свече"
+            if sweep_ts is not None and sweep_ts < last.ts and sweep_level is not None:
+                lvl = float(sweep_level)
+
+                if sweep_type == "sweep_low":
+                    # reclaim_up: вернулись над уровень
                     if last.close > lvl:
                         wrote_any = True
                         ok = insert_market_event(
@@ -245,11 +262,11 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                             event_type="reclaim_up",
                             side="up",
                             level=lvl,
-                            zone=last_zone,
+                            zone=sweep_zone,
                             confidence=72,
                             payload={
                                 "from_event": "sweep_low",
-                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "sweep_ts": sweep_ts.isoformat() if hasattr(sweep_ts, "isoformat") else str(sweep_ts),
                                 "level": lvl,
                                 "last_close": float(last.close),
                             },
@@ -258,6 +275,7 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                         if ok:
                             inserted_types_this_ts.add("reclaim_up")
 
+                    # accept_below: закрепились ниже уровня
                     elif last.close < lvl * (1.0 - accept_tol):
                         wrote_any = True
                         ok = insert_market_event(
@@ -266,11 +284,11 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                             event_type="accept_below",
                             side="down",
                             level=lvl,
-                            zone=last_zone,
+                            zone=sweep_zone,
                             confidence=68,
                             payload={
                                 "from_event": "sweep_low",
-                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "sweep_ts": sweep_ts.isoformat() if hasattr(sweep_ts, "isoformat") else str(sweep_ts),
                                 "level": lvl,
                                 "last_close": float(last.close),
                                 "accept_tol": accept_tol,
@@ -280,7 +298,8 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                         if ok:
                             inserted_types_this_ts.add("accept_below")
 
-                if last_type == "sweep_high":
+                if sweep_type == "sweep_high":
+                    # reclaim_down: вернулись под уровень
                     if last.close < lvl:
                         wrote_any = True
                         ok = insert_market_event(
@@ -289,11 +308,11 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                             event_type="reclaim_down",
                             side="down",
                             level=lvl,
-                            zone=last_zone,
+                            zone=sweep_zone,
                             confidence=72,
                             payload={
                                 "from_event": "sweep_high",
-                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "sweep_ts": sweep_ts.isoformat() if hasattr(sweep_ts, "isoformat") else str(sweep_ts),
                                 "level": lvl,
                                 "last_close": float(last.close),
                             },
@@ -302,6 +321,7 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                         if ok:
                             inserted_types_this_ts.add("reclaim_down")
 
+                    # accept_above: закрепились выше уровня
                     elif last.close > lvl * (1.0 + accept_tol):
                         wrote_any = True
                         ok = insert_market_event(
@@ -310,11 +330,11 @@ def detect_and_store_market_events(tf: str) -> List[str]:
                             event_type="accept_above",
                             side="up",
                             level=lvl,
-                            zone=last_zone,
+                            zone=sweep_zone,
                             confidence=68,
                             payload={
                                 "from_event": "sweep_high",
-                                "sweep_ts": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+                                "sweep_ts": sweep_ts.isoformat() if hasattr(sweep_ts, "isoformat") else str(sweep_ts),
                                 "level": lvl,
                                 "last_close": float(last.close),
                                 "accept_tol": accept_tol,
