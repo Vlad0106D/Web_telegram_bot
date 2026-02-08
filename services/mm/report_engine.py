@@ -775,6 +775,35 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         )
 
         # ─────────────────────────────────────────
+        # ✅ RANGE HISTORY (append-only)
+        # ─────────────────────────────────────────
+        try:
+            upsert_range_history(
+                ts=ts,
+                tf=tf,
+                symbol="BTC-USDT",
+                range_payload={
+                    "state": rr.state,
+                    "rh": rr.rh.to_dict(),
+                    "rl": rr.rl.to_dict(),
+                    "width": float(rr.width),
+                    "anchor_high": float(rr.anchor_high),
+                    "anchor_low": float(rr.anchor_low),
+                    "pending_dir": rr.pending_dir,
+                    "pending_count": int(rr.pending_count),
+                    "accept_bars": int(rr.accept_bars),
+                    "ts": ts.isoformat(),
+                },
+                source=("manual" if manual else "live"),
+                extra_payload={
+                    "btc_close": float(btc_close),
+                    "engine": "range_engine_v1",
+                },
+            )
+        except Exception:
+            pass
+
+        # ─────────────────────────────────────────
         # ETH CONFIRMATION
         # ─────────────────────────────────────────
         eth_conf = "нейтрален 🟡"
