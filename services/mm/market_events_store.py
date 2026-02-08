@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Literal
+from typing import Any, Dict, Optional, List, Literal, Sequence, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -20,6 +20,15 @@ def _db_url() -> str:
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _tf_seconds(tf: str) -> int:
+    return {
+        "H1": 3600,
+        "H4": 4 * 3600,
+        "D1": 24 * 3600,
+        "W1": 7 * 24 * 3600,
+    }.get(tf, 3600)
 
 
 # ---------------- Layer policy (STATE vs LIQ) ----------------
@@ -111,13 +120,46 @@ def _normalize_event_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _tf_seconds(tf: str) -> int:
-    return {
-        "H1": 3600,
-        "H4": 4 * 3600,
-        "D1": 24 * 3600,
-        "W1": 7 * 24 * 3600,
-    }.get(tf, 3600)
+def _clean_types(event_types: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for t in (event_types or []):
+        s = str(t or "").strip()
+        if not s:
+            continue
+        out.append(s)
+    # uniq keep order
+    return list(dict.fromkeys(out))
+
+
+def _in_clause_params(values: Sequence[Any]) -> Tuple[str, Tuple[Any, ...]]:
+    """
+    Возвращает (placeholders, params_tuple) для IN (%s,%s,...)
+    """
+    vals = list(values)
+    if not vals:
+        # никогда не должен вызываться с пустым списком, но на всякий случай:
+        return "(NULL)", tuple()
+    ph = ",".join(["%s"] * len(vals))
+    return f"({ph})", tuple(vals)
+
+
+def _since_by_window(
+    *,
+    tf: str,
+    max_age_bars: Optional[int] = None,
+    lookback_min: Optional[int] = None,
+) -> datetime:
+    """
+    Унифицированное окно поиска:
+      - если задан max_age_bars -> bars * tf_seconds
+      - иначе lookback_min (или дефолт по tf)
+    """
+    if max_age_bars is not None:
+        sec = max(1, int(max_age_bars)) * _tf_seconds(tf)
+        return _now_utc() - timedelta(seconds=sec)
+
+    lb = int(lookback_min) if lookback_min is not None else _lookback_minutes(tf)
+    return _now_utc() - timedelta(minutes=max(60, lb))
 
 
 # ---------------- Public API ----------------
@@ -129,6 +171,7 @@ def get_last_market_event(
 ) -> Optional[Dict[str, Any]]:
     """
     Возвращает "последнее валидное событие" в рамках слоя.
+    ВАЖНО: это НЕ "последнее по времени", а "лучшее по приоритету" в окне.
 
     layer:
       - any   : любые события (как раньше)
@@ -204,6 +247,7 @@ def get_market_event_for_ts(
 ) -> Optional[Dict[str, Any]]:
     """
     Возвращает событие, релевантное КОНКРЕТНОЙ свече ts, в рамках слоя.
+    ВАЖНО: это НЕ "последнее по времени", а "лучшее по приоритету" в окне [ts-max_age, ts].
 
     layer:
       - any   : любые события (как раньше)
@@ -270,6 +314,126 @@ def get_market_event_for_ts(
         et = (ev.get("event_type") or "").strip() or None
         if _layer_allows(et, layer):
             return ev
+
+    return None
+
+
+# -------------------------------------------------------------------------
+# ✅ NEW: "последнее по времени" событие ОПРЕДЕЛЁННЫХ типов (без приоритетов)
+# Используется детекторами sweep→reclaim/accept, где важно именно "последний sweep".
+# -------------------------------------------------------------------------
+
+def get_last_market_event_by_types(
+    *,
+    tf: str,
+    event_types: Sequence[str],
+    symbol: str = "BTC-USDT",
+    layer: Literal["any", "state", "liq"] = "any",
+    max_age_bars: Optional[int] = None,
+    lookback_min: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает ПОСЛЕДНЕЕ по времени событие из списка типов event_types.
+
+    В отличие от get_last_market_event(), здесь НЕТ "приоритетов".
+    Это критично для логики:
+      - найти последний sweep_*,
+      - и только от него строить reclaim/accept.
+
+    Окно:
+      - если max_age_bars задан -> bars*tf_seconds
+      - иначе lookback_min (или дефолт по tf)
+    """
+    types = _clean_types(event_types)
+    if not types:
+        return None
+
+    since = _since_by_window(tf=tf, max_age_bars=max_age_bars, lookback_min=lookback_min)
+    in_sql, in_params = _in_clause_params(types)
+
+    sql = f"""
+    SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
+    FROM mm_market_events
+    WHERE symbol=%s
+      AND tf=%s
+      AND ts >= %s
+      AND event_type IN {in_sql}
+    ORDER BY ts DESC, id DESC
+    LIMIT 200;
+    """
+
+    params = (symbol, tf, since) + in_params
+
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+
+    for r in rows:
+        ev = _normalize_event_row(r)
+        et = (ev.get("event_type") or "").strip() or None
+        if not _layer_allows(et, layer):
+            continue
+        return ev
+
+    return None
+
+
+def get_market_event_for_ts_by_types(
+    *,
+    tf: str,
+    ts: datetime,
+    event_types: Sequence[str],
+    symbol: str = "BTC-USDT",
+    max_age_bars: int = 2,
+    layer: Literal["any", "state", "liq"] = "any",
+) -> Optional[Dict[str, Any]]:
+    """
+    Возвращает ПОСЛЕДНЕЕ по времени событие из event_types
+    в окне [ts - max_age_bars*bar, ts], с учётом layer.
+
+    Это удобно, если нужно "что было на этой свече/рядом", но строго по типам.
+    """
+    if ts is None:
+        return None
+
+    types = _clean_types(event_types)
+    if not types:
+        return None
+
+    bar_sec = _tf_seconds(tf)
+    lookback_sec = max(1, int(max_age_bars)) * bar_sec
+    since = ts - timedelta(seconds=lookback_sec)
+
+    in_sql, in_params = _in_clause_params(types)
+
+    sql = f"""
+    SELECT id, ts, tf, symbol, event_type, side, zone, level, confidence, payload_json
+    FROM mm_market_events
+    WHERE symbol=%s
+      AND tf=%s
+      AND ts >= %s
+      AND ts <= %s
+      AND event_type IN {in_sql}
+    ORDER BY ts DESC, id DESC
+    LIMIT 200;
+    """
+
+    params = (symbol, tf, since, ts) + in_params
+
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+
+    for r in rows:
+        ev = _normalize_event_row(r)
+        et = (ev.get("event_type") or "").strip() or None
+        if not _layer_allows(et, layer):
+            continue
+        return ev
 
     return None
 
