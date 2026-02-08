@@ -354,7 +354,7 @@ def _event_driven_state(
     btc_close: float,
     dn_targets: List[float],
     up_targets: List[float],
-    ev: Optional[Dict[str, Any]] = None,   # ✅ event injected (ts-aligned)
+    ev: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if not ev:
         prob_down, prob_up = _probs_from_context("wait", price=btc_close, dn_targets=dn_targets, up_targets=up_targets)
@@ -580,7 +580,6 @@ def _build_mtf_context(
             down_t = _flt_float_list(down_t)[:2]
             up_t = _flt_float_list(up_t)[:2]
 
-            # ✅ MTF semantic filter относительно ТЕКУЩЕЙ цены primary tf
             dn_below = [x for x in down_t if x < float(btc_close_for_dist)]
             up_above = [x for x in up_t if x > float(btc_close_for_dist)]
             dn_show = dn_below[:2]
@@ -595,7 +594,6 @@ def _build_mtf_context(
 
             ev = None
             if st_ts:
-                # ✅ HTF state не должен залипать на liq_/local_reclaim
                 ev = _get_state_event_for_ts(tf=tf, ts=st_ts, symbol="BTC-USDT", max_age_bars=2)
 
             st = _event_driven_state(
@@ -716,7 +714,6 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         raw_dn, raw_up, key_zone0 = _targets_from_liq_levels(tf)
         raw_dn, raw_up, key_zone0 = _merge_with_persisted(tf, raw_dn, raw_up, key_zone0)
 
-        # ✅ НОРМАЛИЗАЦИЯ: раскладываем уровни строго относительно текущей цены.
         cand: List[float] = []
         for v in (raw_dn or []) + (raw_up or []):
             try:
@@ -731,7 +728,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         up_t = sorted([x for x in cand if x > btc_close])[:2]
 
         # ─────────────────────────────────────────
-        # EVENT → STATE (PRIMARY TF)  ✅ ts-aligned + layer="state"
+        # EVENT → STATE (PRIMARY TF)
         # ─────────────────────────────────────────
         ev = _get_state_event_for_ts(tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
         st = _event_driven_state(tf, btc_close=btc_close, dn_targets=down_t, up_targets=up_t, ev=ev)
@@ -747,7 +744,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         key_zone = st.get("key_zone") or key_zone0
 
         # ─────────────────────────────────────────
-        # ✅ LIQUIDITY EVENTS (signal-layer, report-only)  layer="liq"
+        # LIQUIDITY EVENTS (report-only)
         # ─────────────────────────────────────────
         liq_ev = _get_liq_event_for_ts(tf=tf, ts=ts, symbol="BTC-USDT", max_age_bars=2)
         liq_event_type = (liq_ev.get("event_type") if liq_ev else None)
@@ -760,7 +757,7 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
         liq_event_zone = (liq_ev.get("zone") if liq_ev else None)
 
         # ─────────────────────────────────────────
-        # ✅ RANGE ENGINE (zones + acceptance-only, stateful)
+        # RANGE ENGINE (zones + acceptance-only, stateful)
         # ─────────────────────────────────────────
         saved_payload = load_last_state(tf=tf) or {}
         rr: RangeResult
@@ -803,9 +800,11 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 prob_down = max(55, prob_down - 8)
                 prob_up = 100 - prob_down
 
-        # Save state BEFORE compute_action()
+        # ─────────────────────────────────────────
+        # SAVE STATE (persist RANGE fact, then patch)
+        # ─────────────────────────────────────────
         try:
-            payload = {
+            payload: Dict[str, Any] = {
                 "state_title": state_title,
                 "state_icon": state_icon,
                 "phase": phase,
@@ -816,8 +815,20 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
                 "key_zone": key_zone,
                 "eth_confirmation": eth_conf,
                 "event_type": st.get("event_type"),
+
+                # ✅ RANGE persisted всегда (иначе в БД null)
+                "range_state": rr.state,
+                "rh_lo": rr.rh.lo,
+                "rh_hi": rr.rh.hi,
+                "rl_lo": rr.rl.lo,
+                "rl_hi": rr.rl.hi,
+                "range_width": float(rr.width),
             }
-            payload.update(range_patch)
+
+            # patch (если движок возвращает дополнительные флаги/переходы)
+            if isinstance(range_patch, dict):
+                payload.update(range_patch)
+
             save_state(tf=tf, ts=ts, payload=payload)
         except Exception:
             pass
@@ -839,30 +850,37 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             btc_down_targets=down_t,
             btc_up_targets=up_t,
             key_zone=key_zone,
+
             range_state=rr.state,
             range_rh_zone=rr.rh.to_dict(),
             range_rl_zone=rr.rl.to_dict(),
             range_width=float(rr.width),
+
             liq_event_type=liq_event_type,
             liq_event_side=liq_event_side,
             liq_event_level=liq_event_level,
             liq_event_zone=liq_event_zone,
+
             btc_oi=btc_oi,
             btc_oi_delta=btc_oi_d,
             btc_funding=btc_fr,
             btc_funding_label=btc_fr_lbl,
+
             eth_oi=eth_oi,
             eth_oi_delta=eth_oi_d,
             eth_funding=eth_fr,
             eth_funding_label=eth_fr_lbl,
+
             execution=execution,
             whats_next=whats_next,
             invalidation=invalidation,
             eth_confirmation=eth_conf,
+
             action=act.action,
             action_confidence=int(act.confidence),
             action_reason=str(act.reason),
             action_event_type=act.event_type,
+
             mtf_context=mtf_context,
         )
 
@@ -888,7 +906,6 @@ def render_report(view: MarketView) -> str:
     lines.append(f"• Reason: {view.action_reason}")
     lines.append("")
 
-    # ✅ RANGE как отдельная сущность (decision only)
     lines.append("RANGE (decision only):")
     rh_lo = view.range_rh_zone.get("lo")
     rh_hi = view.range_rh_zone.get("hi")
@@ -919,7 +936,6 @@ def render_report(view: MarketView) -> str:
     lines.append(f"• Zone width: ~{_fmt_price(view.range_width)}")
     lines.append("")
 
-    # ✅ LIQUIDITY EVENTS (signal-layer)
     lines.append("LIQUIDITY EVENTS (signal only):")
     if view.liq_event_type:
         et = str(view.liq_event_type)
@@ -962,8 +978,7 @@ def render_report(view: MarketView) -> str:
         lines.append("")
         lines.append("MTF контекст (старшие ТФ):")
         for c in view.mtf_context:
-            tf2 = str(c.get("tf") or "")
-            title2 = str(c.get("title") or tf2)
+            title2 = str(c.get("title") or c.get("tf") or "")
             st_title = str(c.get("state_title") or "—")
             st_icon = str(c.get("state_icon") or "")
             prob_dn = int(c.get("prob_down") or 0)
