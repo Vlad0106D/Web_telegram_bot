@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event (now supports layer)
+from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event (supports layer)
 from services.mm.state_store import load_last_state
 
 
@@ -165,7 +165,11 @@ def _mtf_filter(*, tf: str, desired_action: ActionType) -> Tuple[bool, str]:
 
 # ---------------- Range gating (mode) ----------------
 def _range_state(st: Dict[str, Any]) -> str:
-    rs = (st or {}).get("range_state")
+    """
+    ✅ FIX: range state лежит в payload['range']['state'], а не в st['range_state'].
+    """
+    r = (st or {}).get("range") or {}
+    rs = r.get("state")
     return str(rs).strip() if rs is not None else ""
 
 
@@ -228,16 +232,9 @@ def compute_action(tf: str) -> ActionDecision:
       market_ev берём layer='state' (исключаем liq_* и local_reclaim*)
       liq_ev   берём layer='liq'
     """
-
     st = load_last_state(tf=tf)
     if not st:
-        return ActionDecision(
-            tf=tf,
-            action="NONE",
-            confidence=0,
-            reason="Нет сохранённого mm_state",
-            event_type=None,
-        )
+        return ActionDecision(tf=tf, action="NONE", confidence=0, reason="Нет сохранённого mm_state", event_type=None)
 
     prob_up = int(st.get("prob_up", 0))
     prob_down = int(st.get("prob_down", 0))
@@ -289,8 +286,9 @@ def compute_action(tf: str) -> ActionDecision:
     ok_r_long, why_r_long = _range_filter(st=st, desired_action="LONG_ALLOWED")
     ok_r_short, why_r_short = _range_filter(st=st, desired_action="SHORT_ALLOWED")
 
-    long_events = ("reclaim_up", "accept_above", "decision_zone")
-    short_events = ("reclaim_down", "accept_below", "decision_zone")
+    # ✅ FIX: decision_zone не кладём в общий список, потому что он направленный по side.
+    long_events = ("reclaim_up", "accept_above")
+    short_events = ("reclaim_down", "accept_below")
 
     # -----------------------------
     # 0) WAIT: allow local reclaim / sweep as "signal-layer"
@@ -351,7 +349,7 @@ def compute_action(tf: str) -> ActionDecision:
                 event_type=liq_type,
             )
 
-        # sweeps (как было)
+        # sweeps
         if liq_type == "liq_sweep_low":
             if ok_r_long:
                 ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
@@ -406,11 +404,74 @@ def compute_action(tf: str) -> ActionDecision:
                 event_type=liq_type,
             )
 
+        return ActionDecision(tf=tf, action="NONE", confidence=0, reason="Состояние WAIT", event_type=ev_type)
+
+    # -----------------------------
+    # 0.5) decision_zone (state-layer) — направленный по side
+    # -----------------------------
+    if ev_type == "decision_zone":
+        # side="down" -> RANGE LOW -> ждём reclaim_up -> LONG bias
+        if side == "down":
+            if not ok_r_long:
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=prob_up_eff,
+                    reason=why_r_long,
+                    event_type=ev_type,
+                )
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
+            if ok_mtf and prob_up_eff >= 55:
+                extra = f" | liq={liq_type}" if liq_type else ""
+                return ActionDecision(
+                    tf=tf,
+                    action="LONG_ALLOWED",
+                    confidence=min(85, prob_up_eff),
+                    reason=f"decision_zone(side=down) + prob_up={prob_up_eff}{extra} | {why_r_long} | {why_mtf}",
+                    event_type=ev_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"decision_zone(side=down) blocked | {why_mtf}",
+                event_type=ev_type,
+            )
+
+        # side="up" -> RANGE HIGH -> ждём reclaim_down -> SHORT bias
+        if side == "up":
+            if not ok_r_short:
+                return ActionDecision(
+                    tf=tf,
+                    action="NONE",
+                    confidence=prob_down_eff,
+                    reason=why_r_short,
+                    event_type=ev_type,
+                )
+            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
+            if ok_mtf and prob_down_eff >= 55:
+                extra = f" | liq={liq_type}" if liq_type else ""
+                return ActionDecision(
+                    tf=tf,
+                    action="SHORT_ALLOWED",
+                    confidence=min(85, prob_down_eff),
+                    reason=f"decision_zone(side=up) + prob_down={prob_down_eff}{extra} | {why_r_short} | {why_mtf}",
+                    event_type=ev_type,
+                )
+            return ActionDecision(
+                tf=tf,
+                action="NONE",
+                confidence=max(prob_up_eff, prob_down_eff),
+                reason=f"decision_zone(side=up) blocked | {why_mtf}",
+                event_type=ev_type,
+            )
+
+        # если side неизвестен — безопасно ничего не разрешаем
         return ActionDecision(
             tf=tf,
             action="NONE",
-            confidence=0,
-            reason="Состояние WAIT",
+            confidence=max(prob_up_eff, prob_down_eff),
+            reason="decision_zone без side — пропуск",
             event_type=ev_type,
         )
 
@@ -419,13 +480,7 @@ def compute_action(tf: str) -> ActionDecision:
     # -----------------------------
     if prob_up_eff >= 55 and ev_type in long_events and side in ("up", None):
         if not ok_r_long:
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=prob_up_eff,
-                reason=why_r_long,
-                event_type=ev_type,
-            )
+            return ActionDecision(tf=tf, action="NONE", confidence=prob_up_eff, reason=why_r_long, event_type=ev_type)
         ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
         if ok_mtf:
             extra = f" | liq={liq_type}" if liq_type else ""
@@ -436,13 +491,7 @@ def compute_action(tf: str) -> ActionDecision:
                 reason=f"{ev_type} + prob_up={prob_up_eff}{extra} | {why_r_long} | {why_mtf}",
                 event_type=ev_type,
             )
-        return ActionDecision(
-            tf=tf,
-            action="NONE",
-            confidence=prob_up_eff,
-            reason=why_mtf,
-            event_type=ev_type,
-        )
+        return ActionDecision(tf=tf, action="NONE", confidence=prob_up_eff, reason=why_mtf, event_type=ev_type)
 
     # -----------------------------
     # 2) Market-driven SHORT
@@ -450,11 +499,7 @@ def compute_action(tf: str) -> ActionDecision:
     if prob_down_eff >= 55 and ev_type in short_events and side in ("down", None):
         if not ok_r_short:
             return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=prob_down_eff,
-                reason=why_r_short,
-                event_type=ev_type,
+                tf=tf, action="NONE", confidence=prob_down_eff, reason=why_r_short, event_type=ev_type
             )
         ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
         if ok_mtf:
@@ -466,13 +511,7 @@ def compute_action(tf: str) -> ActionDecision:
                 reason=f"{ev_type} + prob_down={prob_down_eff}{extra} | {why_r_short} | {why_mtf}",
                 event_type=ev_type,
             )
-        return ActionDecision(
-            tf=tf,
-            action="NONE",
-            confidence=prob_down_eff,
-            reason=why_mtf,
-            event_type=ev_type,
-        )
+        return ActionDecision(tf=tf, action="NONE", confidence=prob_down_eff, reason=why_mtf, event_type=ev_type)
 
     # -----------------------------
     # 3) Local reclaim can generate action if market event didn't
