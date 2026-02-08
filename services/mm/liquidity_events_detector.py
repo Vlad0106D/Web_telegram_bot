@@ -311,7 +311,7 @@ def detect_and_store_liquidity_events(tf: str) -> List[str]:
         inserted_types_this_ts: set[str] = set()
 
         # ✅ stale-check info (для логов + payload событий)
-        stale_info = _liq_stale_info(tf, RZalast_ts=last.ts, liq_payload=liq_payload, max_age_bars=2)
+        stale_info = _liq_stale_info(tf, last_ts=last.ts, liq_payload=liq_payload, max_age_bars=2)
         if stale_info.get("liq_levels_stale"):
             out.append(f"{tf} liq_levels: STALE liq_ts={stale_info.get('liq_ts')} last_ts={stale_info.get('last_ts')}")
 
