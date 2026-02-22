@@ -91,6 +91,11 @@ async def _post_init(app: Application) -> None:
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
         BotCommand("mm_snapshots", "MM: записать live снапшоты в БД (закрытые свечи)"),
+
+        # === OUTCOMES / EDGE ===
+        BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
+        BotCommand("edge_refresh", "Обновить Edge витрину (REFRESH MV)"),
+
         BotCommand("menu", "Показать меню-кнопки внутри чата"),
     ]
 
