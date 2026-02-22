@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict
 
+from decimal import Decimal
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -79,6 +81,26 @@ def _parse_last_sent_at(raw: Any) -> Optional[datetime]:
         return None
 
 
+def _json_sanitize(obj: Any) -> Any:
+    """
+    Делает объект JSON-совместимым:
+    - Decimal -> float
+    - datetime -> isoformat()
+    - dict/list -> рекурсивно
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, datetime):
+        return obj.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(v) for v in obj]
+    return obj
+
+
 # ==========================================================
 # SAVE ALERT TO DB
 # ==========================================================
@@ -97,7 +119,7 @@ def _save_outcome_alert(
     """
 
     payload: Dict[str, Any] = {
-        "current_h1_ts": edge.current_h1_ts.isoformat(),
+        "current_h1_ts": edge.current_h1_ts,   # пусть санитайзер сделает iso
         "btc_d1_regime": edge.btc_d1_regime,
         "h1_event": edge.h1_event,
         "edge_score": edge.edge_score,
@@ -106,8 +128,10 @@ def _save_outcome_alert(
         "avg_mfe": edge.avg_mfe,
         "avg_mae": edge.avg_mae,
         "n": edge.n,
-        "refreshed_at": edge.refreshed_at.isoformat(),
+        "refreshed_at": edge.refreshed_at,     # пусть санитайзер сделает iso
     }
+
+    payload = _json_sanitize(payload)
 
     sql = """
     INSERT INTO outcomes_alerts (
@@ -139,7 +163,7 @@ def _save_outcome_alert(
                     (
                         "BTC-USDT",
                         "H1",
-                        edge.current_h1_ts,
+                        edge.current_h1_ts,   # base_ts в timestamptz — ок
                         "edge_alert",
                         ctx_key,
                         int(edge.edge_score),
@@ -208,7 +232,7 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
 
     changes_text = "; ".join(changes) if changes else ""
 
-    # ✅ СНАЧАЛА сохраняем в БД
+    # ✅ СНАЧАЛА сохраняем в БД (теперь не упадёт на Decimal)
     _save_outcome_alert(
         edge=edge,
         ctx_key=key,
