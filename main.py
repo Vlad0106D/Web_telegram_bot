@@ -15,6 +15,9 @@ from bot.watcher import schedule_watcher_jobs
 # === MM AUTO ===
 from services.mm.auto import schedule_mm_auto
 
+# === OUTCOMES / EDGE AUTO ===
+from services.outcomes.auto import schedule_edge_auto
+
 
 class RedactTelegramTokenFilter(logging.Filter):
     """
@@ -174,6 +177,13 @@ def main() -> None:
         log.info("MM auto scheduled | jobs: %s", ", ".join(mm_jobs) if mm_jobs else "[]")
     except Exception:
         log.exception("Failed to schedule MM auto jobs")
+
+    # === EDGE AUTO ===
+    try:
+        edge_jobs = schedule_edge_auto(app)
+        log.info("EDGE auto scheduled | jobs: %s", ", ".join(edge_jobs) if edge_jobs else "[]")
+    except Exception:
+        log.exception("Failed to schedule EDGE auto jobs")
 
     # Запуск polling
     app.run_polling(drop_pending_updates=True)
