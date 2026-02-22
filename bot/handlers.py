@@ -35,6 +35,9 @@ from services.true_trading import get_tt
 from services.mm.snapshots import run_snapshots_once
 from bot.mm_commands import register_mm_commands
 
+# === OUTCOMES / EDGE ===
+from bot.edge_commands import register_edge_commands
+
 log = logging.getLogger(__name__)
 
 
@@ -54,6 +57,9 @@ def _menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
         [KeyboardButton("/mm_status"), KeyboardButton("/mm_report")],
         [KeyboardButton("/mm_snapshots")],
+
+        # Edge
+        [KeyboardButton("/edge_now"), KeyboardButton("/edge_refresh")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -105,6 +111,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /mm_status — статус MM\n"
         "• /mm_report — ручной MM отчёт\n"
         "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1)\n"
+        "• /edge_now — Edge Engine: текущая оценка 0–100\n"
+        "• /edge_refresh — обновить Edge витрину\n"
         "• /menu — показать клавиатуру команд\n"
     )
     await update.message.reply_text(text, reply_markup=_menu_keyboard())
@@ -116,6 +124,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
+        "/edge_now, /edge_refresh, "
         "/menu"
     )
 
@@ -327,6 +336,9 @@ def register_handlers(app: Application) -> None:
 
     # MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
     register_mm_commands(app)
+
+    # Edge команды (/edge_now, /edge_refresh)
+    register_edge_commands(app)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
     app.add_handler(CallbackQueryHandler(on_callback))
