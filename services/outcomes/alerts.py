@@ -3,20 +3,18 @@ from __future__ import annotations
 
 import os
 import logging
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
+from typing import Any, Optional
 
 from telegram.ext import Application
 
-from services.outcomes.edge_engine import get_edge_now, render_edge_now
+from services.outcomes.edge_engine import get_edge_now, render_edge_now, EdgeNow
 
 log = logging.getLogger(__name__)
 
-
 EDGE_ALERT_ENABLED_ENV = (os.getenv("EDGE_ALERT_ENABLED", "1").strip() == "1")
-EDGE_ALERT_MIN_DELTA = int((os.getenv("EDGE_ALERT_MIN_DELTA", "8").strip() or "8"))  # min изменение score
-EDGE_ALERT_COOLDOWN_SEC = int((os.getenv("EDGE_ALERT_COOLDOWN_SEC", "600").strip() or "600"))  # антиспам 10 мин
+EDGE_ALERT_MIN_DELTA = int((os.getenv("EDGE_ALERT_MIN_DELTA", "8").strip() or "8"))  # мин. изменение score
+EDGE_ALERT_COOLDOWN_SEC = int((os.getenv("EDGE_ALERT_COOLDOWN_SEC", "600").strip() or "600"))  # антиспам
 
 
 def _now_utc() -> datetime:
@@ -36,19 +34,32 @@ def _band(score: int) -> str:
     return "очень слабый"
 
 
-def _ctx_key(edge: Dict[str, Any]) -> str:
-    # ожидаем, что edge содержит current_h1_ts, btc_d1_regime, h1_event
-    h1_ts = str(edge.get("current_h1_ts") or "")
-    d1 = str(edge.get("btc_d1_regime") or "")
-    ev = str(edge.get("h1_event") or edge.get("btc_h1_event") or "")
-    return f"{h1_ts}|{d1}|{ev}"
-
-
-def _safe_int(x, default: int = 0) -> int:
+def _safe_int(x: Any, default: int = 0) -> int:
     try:
         return int(x)
     except Exception:
         return default
+
+
+def _ctx_key(edge: EdgeNow) -> str:
+    # ключ “контекста” — если он меняется, алерт допустим
+    h1_ts = edge.current_h1_ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    d1 = (edge.btc_d1_regime or "").strip()
+    ev = (edge.h1_event or "").strip()
+    return f"{h1_ts}|{d1}|{ev}"
+
+
+def _parse_last_sent_at(raw: Any) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        s = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
@@ -65,7 +76,6 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     if not EDGE_ALERT_ENABLED_ENV:
         return False
 
-    edge = None
     try:
         edge = get_edge_now()
     except Exception:
@@ -75,25 +85,23 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     if not edge:
         return False
 
-    score = _safe_int(edge.get("edge_score"), 0)
+    score = _safe_int(edge.edge_score, 0)
     band = _band(score)
     key = _ctx_key(edge)
 
     last_key = app.bot_data.get("edge_last_ctx_key")
     last_score = _safe_int(app.bot_data.get("edge_last_score"), -9999)
     last_band = app.bot_data.get("edge_last_band")
-    last_sent_at = app.bot_data.get("edge_last_sent_at")
+    last_sent_at = _parse_last_sent_at(app.bot_data.get("edge_last_sent_at"))
 
-    # cooldown
-    try:
-        if last_sent_at:
-            last_dt = datetime.fromisoformat(str(last_sent_at).replace("Z", "+00:00"))
-            if (_now_utc() - last_dt).total_seconds() < EDGE_ALERT_COOLDOWN_SEC:
-                # если контекст не поменялся — не спамим
+    # cooldown: если контекст тот же — не спамим
+    if last_sent_at:
+        try:
+            if (_now_utc() - last_sent_at).total_seconds() < EDGE_ALERT_COOLDOWN_SEC:
                 if key == last_key:
                     return False
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     changed_ctx = (key != last_key) if last_key else True
     delta = score - last_score
@@ -103,7 +111,7 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     if not (changed_ctx or changed_band or strong_delta):
         return False
 
-    # Формируем короткий алерт: берем готовый render_edge_now и добавляем "что поменялось"
+    # Заголовок "что поменялось"
     changes = []
     if last_key and changed_ctx:
         changes.append("сменился контекст")
