@@ -4,7 +4,11 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Dict
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from telegram.ext import Application
 
@@ -13,16 +17,30 @@ from services.outcomes.edge_engine import get_edge_now, render_edge_now, EdgeNow
 log = logging.getLogger(__name__)
 
 EDGE_ALERT_ENABLED_ENV = (os.getenv("EDGE_ALERT_ENABLED", "1").strip() == "1")
-EDGE_ALERT_MIN_DELTA = int((os.getenv("EDGE_ALERT_MIN_DELTA", "8").strip() or "8"))  # мин. изменение score
-EDGE_ALERT_COOLDOWN_SEC = int((os.getenv("EDGE_ALERT_COOLDOWN_SEC", "600").strip() or "600"))  # антиспам
+EDGE_ALERT_MIN_DELTA = int((os.getenv("EDGE_ALERT_MIN_DELTA", "8").strip() or "8"))
+EDGE_ALERT_COOLDOWN_SEC = int((os.getenv("EDGE_ALERT_COOLDOWN_SEC", "600").strip() or "600"))
+
+
+# ==========================================================
+# DB
+# ==========================================================
+
+def _db_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is empty")
+    return url
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+# ==========================================================
+# helpers
+# ==========================================================
+
 def _band(score: int) -> str:
-    # читабельные диапазоны
     if score >= 80:
         return "сильный"
     if score >= 65:
@@ -42,7 +60,6 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 
 def _ctx_key(edge: EdgeNow) -> str:
-    # ключ “контекста” — если он меняется, алерт допустим
     h1_ts = edge.current_h1_ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
     d1 = (edge.btc_d1_regime or "").strip()
     ev = (edge.h1_event or "").strip()
@@ -62,17 +79,86 @@ def _parse_last_sent_at(raw: Any) -> Optional[datetime]:
         return None
 
 
-async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
-    """
-    Проверяет текущий edge и присылает авто-алерт ТОЛЬКО если контекст сменился
-    или edge существенно усилился/ослаб.
+# ==========================================================
+# SAVE ALERT TO DB
+# ==========================================================
 
-    Хранит состояние в app.bot_data:
-      - edge_last_ctx_key
-      - edge_last_score
-      - edge_last_band
-      - edge_last_sent_at (utc iso)
+def _save_outcome_alert(
+    *,
+    edge: EdgeNow,
+    ctx_key: str,
+    band: str,
+    delta: int,
+    changes_text: str,
+) -> None:
     """
+    Сохраняем алерт в outcomes_alerts.
+    Дубликаты режем уникальным индексом.
+    """
+
+    payload: Dict[str, Any] = {
+        "current_h1_ts": edge.current_h1_ts.isoformat(),
+        "btc_d1_regime": edge.btc_d1_regime,
+        "h1_event": edge.h1_event,
+        "edge_score": edge.edge_score,
+        "winrate": edge.winrate,
+        "avg_ret": edge.avg_ret,
+        "avg_mfe": edge.avg_mfe,
+        "avg_mae": edge.avg_mae,
+        "n": edge.n,
+        "refreshed_at": edge.refreshed_at.isoformat(),
+    }
+
+    sql = """
+    INSERT INTO outcomes_alerts (
+        symbol,
+        base_tf,
+        base_ts,
+        alert_type,
+        ctx_key,
+        edge_score,
+        edge_band,
+        delta,
+        changes,
+        payload_json
+    )
+    VALUES (
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (symbol, base_tf, base_ts, alert_type, ctx_key)
+    DO NOTHING;
+    """
+
+    try:
+        with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+            conn.execute("SET TIME ZONE 'UTC';")
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        "BTC-USDT",
+                        "H1",
+                        edge.current_h1_ts,
+                        "edge_alert",
+                        ctx_key,
+                        int(edge.edge_score),
+                        band,
+                        int(delta),
+                        changes_text,
+                        Jsonb(payload),
+                    ),
+                )
+            conn.commit()
+    except Exception:
+        log.exception("edge_alert: failed to save outcomes_alert")
+
+
+# ==========================================================
+# MAIN LOGIC
+# ==========================================================
+
+async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     if not EDGE_ALERT_ENABLED_ENV:
         return False
 
@@ -94,7 +180,7 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     last_band = app.bot_data.get("edge_last_band")
     last_sent_at = _parse_last_sent_at(app.bot_data.get("edge_last_sent_at"))
 
-    # cooldown: если контекст тот же — не спамим
+    # cooldown
     if last_sent_at:
         try:
             if (_now_utc() - last_sent_at).total_seconds() < EDGE_ALERT_COOLDOWN_SEC:
@@ -111,7 +197,6 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
     if not (changed_ctx or changed_band or strong_delta):
         return False
 
-    # Заголовок "что поменялось"
     changes = []
     if last_key and changed_ctx:
         changes.append("сменился контекст")
@@ -121,9 +206,20 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
         sign = "+" if delta >= 0 else ""
         changes.append(f"edge {sign}{delta} (было {last_score}, стало {score})")
 
+    changes_text = "; ".join(changes) if changes else ""
+
+    # ✅ СНАЧАЛА сохраняем в БД
+    _save_outcome_alert(
+        edge=edge,
+        ctx_key=key,
+        band=band,
+        delta=delta,
+        changes_text=changes_text,
+    )
+
     header = "📣 <b>BTC — Edge Alert</b>\n"
     if changes:
-        header += "Изменения: " + "; ".join(changes) + "\n\n"
+        header += "Изменения: " + changes_text + "\n\n"
 
     text = header + render_edge_now(edge)
 
@@ -133,7 +229,7 @@ async def maybe_send_edge_alert(app: Application, *, chat_id: int) -> bool:
         log.exception("edge_alert: send_message failed")
         return False
 
-    # сохраняем состояние
+    # обновляем runtime-состояние
     app.bot_data["edge_last_ctx_key"] = key
     app.bot_data["edge_last_score"] = score
     app.bot_data["edge_last_band"] = band
