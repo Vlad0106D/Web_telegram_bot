@@ -30,7 +30,6 @@ class RedactTelegramTokenFilter(logging.Filter):
             if "api.telegram.org/bot" in msg and TOKEN in msg:
                 record.msg = record.msg.replace(TOKEN, "***REDACTED***")
         except Exception:
-            # никогда не ломаем логирование из-за фильтра
             pass
         return True
 
@@ -40,7 +39,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
-# применяем фильтр к httpx и корневому логгеру
 logging.getLogger().addFilter(RedactTelegramTokenFilter())
 logging.getLogger("httpx").addFilter(RedactTelegramTokenFilter())
 
@@ -87,32 +85,37 @@ async def _post_init(app: Application) -> None:
     commands: List[BotCommand] = [
         BotCommand("start", "Запуск и краткая справка"),
         BotCommand("help", "Помощь и список команд"),
-        BotCommand("list", "Показать список доступных тикеров/ресурсов"),
+        BotCommand("menu", "Меню-кнопки (категории)"),
+
+        BotCommand("list", "Избранные пары"),
         BotCommand("find", "Поиск по тикеру или инструменту"),
-        BotCommand("check", "Проверить состояние/диагностику"),
+        BotCommand("check", "Проверить/проанализировать избранное"),
+
         BotCommand("watch_on", "Включить вотчер (уведомления)"),
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
-        BotCommand("mm_snapshots", "MM: записать live снапшоты в БД (закрытые свечи)"),
 
-        # === OUTCOMES / EDGE ===
+        BotCommand("tt_on", "True Trading: включить"),
+        BotCommand("tt_off", "True Trading: выключить"),
+        BotCommand("tt_status", "True Trading: статус"),
+
+        # MM
+        BotCommand("mm_on", "MM: включить авто"),
+        BotCommand("mm_off", "MM: выключить авто"),
+        BotCommand("mm_status", "MM: статус"),
+        BotCommand("mm_report", "MM: ручной отчёт"),
+        BotCommand("mm_snapshots", "MM: записать live снапшоты в БД"),
+
+        # Outcomes / Edge
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
-        BotCommand("edge_refresh", "Обновить Edge витрину (REFRESH MV)"),
-
-        BotCommand("menu", "Показать меню-кнопки внутри чата"),
+        BotCommand("edge_refresh", "Edge Engine: обновить витрину (REFRESH MV)"),
     ]
 
     await app.bot.set_my_commands(commands)
-    log.info(
-        "Bot commands set globally: %s",
-        ", ".join(f"/{c.command}" for c in commands),
-    )
+    log.info("Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands))
 
 
 async def _on_error(update, context) -> None:
-    """
-    Глобальный error handler.
-    """
     err = context.error
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
     upd_txt = repr(update) if update is not None else "<job/None>"
@@ -136,14 +139,13 @@ def main() -> None:
         .build()
     )
 
-    # глобальный error handler
     app.add_error_handler(_on_error)
 
-    # Базовые хендлеры
+    # Handlers (внутри регистрируются MM + Outcomes команды тоже)
     register_handlers(app)
     log.info("Handlers registered via bot.handlers.register_handlers()")
 
-    # Планирование вотчера (основного, не MM)
+    # Watcher (основной, не MM)
     tfs = _normalize_tfs(WATCHER_TFS)
     log.info(
         "WATCHER_ENABLED=%s | WATCHER_INTERVAL_SEC=%s | WATCHER_TFS=%r -> %s",
@@ -178,14 +180,14 @@ def main() -> None:
     except Exception:
         log.exception("Failed to schedule MM auto jobs")
 
-    # === EDGE AUTO ===
+    # === OUTCOMES / EDGE AUTO ===
     try:
         edge_jobs = schedule_edge_auto(app)
-        log.info("EDGE auto scheduled | jobs: %s", ", ".join(edge_jobs) if edge_jobs else "[]")
+        log.info("Edge auto scheduled | jobs: %s", ", ".join(edge_jobs) if edge_jobs else "[]")
     except Exception:
-        log.exception("Failed to schedule EDGE auto jobs")
+        log.exception("Failed to schedule Edge auto jobs")
 
-    # Запуск polling
+    # Polling
     app.run_polling(drop_pending_updates=True)
 
 
