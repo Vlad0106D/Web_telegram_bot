@@ -35,36 +35,74 @@ from services.true_trading import get_tt
 from services.mm.snapshots import run_snapshots_once
 from bot.mm_commands import register_mm_commands
 
-# === OUTCOMES / EDGE ===
+# === Outcomes / Edge ===
 from bot.edge_commands import register_edge_commands
 
 log = logging.getLogger(__name__)
 
+# ----------------- MENU "folders" -----------------
+MENU_ROOT = "root"
+MENU_MAIN = "main"
+MENU_MM = "mm"
+MENU_OUT = "outcomes"
 
-# ------------ Кнопка "Меню" ------------
-def _menu_keyboard() -> ReplyKeyboardMarkup:
+BTN_MAIN = "⚙️ Основное"
+BTN_MM = "🧠 MM"
+BTN_OUT = "📊 Outcomes"
+BTN_BACK = "⬅️ Назад"
+
+
+def _set_menu_mode(context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
+    context.user_data["menu_mode"] = mode
+
+
+def _get_menu_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("menu_mode", MENU_ROOT)
+
+
+def _kbd_root() -> ReplyKeyboardMarkup:
     rows: List[List[KeyboardButton]] = [
-        [KeyboardButton("/list"), KeyboardButton("/find")],
-        [KeyboardButton("/check")],
-
-        [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
-        [KeyboardButton("/watch_status")],
-
-        [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
-        [KeyboardButton("/tt_status")],
-
-        # MM
-        [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
-        [KeyboardButton("/mm_status"), KeyboardButton("/mm_report")],
-        [KeyboardButton("/mm_snapshots")],
-
-        # Edge
-        [KeyboardButton("/edge_now"), KeyboardButton("/edge_refresh")],
+        [KeyboardButton(BTN_MAIN), KeyboardButton(BTN_MM)],
+        [KeyboardButton(BTN_OUT)],
+        [KeyboardButton("/menu")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
-# ------------ Вспомогательные клавиатуры ------------
+def _kbd_main() -> ReplyKeyboardMarkup:
+    rows: List[List[KeyboardButton]] = [
+        [KeyboardButton("/list"), KeyboardButton("/find")],
+        [KeyboardButton("/check")],
+        [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
+        [KeyboardButton("/watch_status")],
+        [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
+        [KeyboardButton("/tt_status")],
+        [KeyboardButton(BTN_BACK)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _kbd_mm() -> ReplyKeyboardMarkup:
+    rows: List[List[KeyboardButton]] = [
+        [KeyboardButton("/mm_on"), KeyboardButton("/mm_off")],
+        [KeyboardButton("/mm_status"), KeyboardButton("/mm_report")],
+        [KeyboardButton("/mm_snapshots")],
+        [KeyboardButton(BTN_BACK)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _kbd_outcomes() -> ReplyKeyboardMarkup:
+    rows: List[List[KeyboardButton]] = [
+        [KeyboardButton("/edge_now"), KeyboardButton("/edge_refresh")],
+        # будущие команды сюда же:
+        # [KeyboardButton("/edge_table"), KeyboardButton("/edge_cmp")],
+        [KeyboardButton(BTN_BACK)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+# ------------ Inline KB helpers ------------
 def _favorites_inline_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     rows = []
     for s in symbols:
@@ -93,44 +131,41 @@ def _search_results_kb(symbols: List[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ------------ Команды ------------
+# ------------ Commands ------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет!\n"
+        "Привет!\n\n"
+        "Основное:\n"
         "• /list — избранные пары\n"
         "• /find ‹строка› — поиск пары\n"
         "• /check — анализ избранного\n"
-        "• /watch_on — включить вотчер\n"
-        "• /watch_off — выключить вотчер\n"
-        "• /watch_status — статус вотчера\n"
-        "• /tt_on — включить True Trading\n"
-        "• /tt_off — выключить True Trading\n"
-        "• /tt_status — статус True Trading\n"
-        "• /mm_on — включить MM авто\n"
-        "• /mm_off — выключить MM авто\n"
-        "• /mm_status — статус MM\n"
-        "• /mm_report — ручной MM отчёт\n"
-        "• /mm_snapshots — MM: записать live снапшоты (BTC/ETH, H1/H4/D1/W1)\n"
-        "• /edge_now — Edge Engine: текущая оценка 0–100\n"
-        "• /edge_refresh — обновить Edge витрину\n"
-        "• /menu — показать клавиатуру команд\n"
+        "• /watch_on /watch_off /watch_status — вотчер\n"
+        "• /tt_on /tt_off /tt_status — True Trading\n\n"
+        "MM:\n"
+        "• /mm_on /mm_off /mm_status /mm_report\n"
+        "• /mm_snapshots — запись снапшотов\n\n"
+        "Outcomes:\n"
+        "• /edge_now — текущая оценка (0–100)\n"
+        "• /edge_refresh — обновить витрину\n\n"
+        "• /menu — показать меню-кнопки\n"
     )
-    await update.message.reply_text(text, reply_markup=_menu_keyboard())
+    _set_menu_mode(context, MENU_ROOT)
+    await update.message.reply_text(text, reply_markup=_kbd_root())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды: /start, /help, /list, /find, /check, "
+        "Команды: /start, /help, /menu, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
-        "/edge_now, /edge_refresh, "
-        "/menu"
+        "/edge_now, /edge_refresh"
     )
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Меню команд:", reply_markup=_menu_keyboard())
+    _set_menu_mode(context, MENU_ROOT)
+    await update.message.reply_text("Меню:", reply_markup=_kbd_root())
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -155,28 +190,6 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["await_find_reply_to"] = msg.message_id
 
 
-async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    awaited_id = context.user_data.get("await_find_reply_to")
-    if not awaited_id:
-        return
-    if not update.message or not update.message.reply_to_message:
-        return
-    if update.message.reply_to_message.message_id != awaited_id:
-        return
-
-    q = update.message.text.strip()
-    context.user_data.pop("await_find_reply_to", None)
-    if not q:
-        await update.message.reply_text("Пустой запрос.")
-        return
-
-    syms = await search_symbols(q)
-    await update.message.reply_text(
-        f"Результаты по «{q}»:",
-        reply_markup=_search_results_kb(syms),
-    )
-
-
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     favs = get_favorites()
     if not favs:
@@ -194,7 +207,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
 
 
-# ------------ MM (ручной запуск снапшотов) ------------
+# ------------ MM snapshots (manual) ------------
 async def cmd_mm_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("MM: пишу live снапшоты в БД (закрытые свечи)…")
     try:
@@ -208,7 +221,7 @@ async def cmd_mm_snapshots(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"❌ MM snapshots: ошибка — {e}")
 
 
-# ------------ Вотчер ------------
+# ------------ Watcher ------------
 async def cmd_watch_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     created = schedule_watcher_jobs(
         app=context.application,
@@ -278,7 +291,57 @@ async def cmd_tt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-# ------------ Callback-кнопки ------------
+# ------------ Menu buttons handler ------------
+async def _on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    txt = update.message.text.strip()
+
+    if txt == BTN_MAIN:
+        _set_menu_mode(context, MENU_MAIN)
+        await update.message.reply_text("⚙️ Основное:", reply_markup=_kbd_main())
+        return
+
+    if txt == BTN_MM:
+        _set_menu_mode(context, MENU_MM)
+        await update.message.reply_text("🧠 MM:", reply_markup=_kbd_mm())
+        return
+
+    if txt == BTN_OUT:
+        _set_menu_mode(context, MENU_OUT)
+        await update.message.reply_text("📊 Outcomes:", reply_markup=_kbd_outcomes())
+        return
+
+    if txt == BTN_BACK:
+        _set_menu_mode(context, MENU_ROOT)
+        await update.message.reply_text("Меню:", reply_markup=_kbd_root())
+        return
+
+
+# ------------ Find reply handler ------------
+async def _on_text_find_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    awaited_id = context.user_data.get("await_find_reply_to")
+    if not awaited_id:
+        return
+    if not update.message or not update.message.reply_to_message:
+        return
+    if update.message.reply_to_message.message_id != awaited_id:
+        return
+
+    q = update.message.text.strip()
+    context.user_data.pop("await_find_reply_to", None)
+    if not q:
+        await update.message.reply_text("Пустой запрос.")
+        return
+
+    syms = await search_symbols(q)
+    await update.message.reply_text(
+        f"Результаты по «{q}»:",
+        reply_markup=_search_results_kb(syms),
+    )
+
+
+# ------------ Callback buttons ------------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q:
@@ -312,7 +375,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.message.reply_text(f"{sym} добавлена в избранное ✅")
 
 
-# ------------ Регистрация ------------
+# ------------ Registration ------------
 def register_handlers(app: Application) -> None:
     log.info("Registering bot handlers")
 
@@ -337,8 +400,14 @@ def register_handlers(app: Application) -> None:
     # MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
     register_mm_commands(app)
 
-    # Edge команды (/edge_now, /edge_refresh)
+    # Outcomes команды (/edge_now, /edge_refresh)
     register_edge_commands(app)
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply))
+    # Menu buttons (must be BEFORE generic text handlers)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_menu_buttons), group=0)
+
+    # Find reply
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text_find_reply), group=1)
+
+    # Inline callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
