@@ -18,7 +18,7 @@ from services.mm.auto import schedule_mm_auto
 # === OUTCOMES / EDGE AUTO ===
 from services.outcomes.auto import schedule_edge_auto
 
-# === OUTCOMES / DERIV AUTO === ✅ NEW
+# === OUTCOMES / DERIV AUTO ===
 from services.outcomes.deriv_auto import schedule_deriv_auto
 
 
@@ -113,8 +113,9 @@ async def _post_init(app: Application) -> None:
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
         BotCommand("edge_refresh", "Edge Engine: обновить витрину (REFRESH MV)"),
 
-        # Outcomes / Derivatives ✅ NEW
-        # (Команды добавим позже через handlers, сейчас только авто-планировщик)
+        # Outcomes / Derivatives (funding+OI)
+        BotCommand("deriv_now", "Deriv Edge: текущая оценка (funding+OI)"),
+        BotCommand("deriv_refresh", "Deriv Edge: обновить витрину (REFRESH MV)"),
     ]
 
     await app.bot.set_my_commands(commands)
@@ -193,7 +194,7 @@ def main() -> None:
     except Exception:
         log.exception("Failed to schedule Edge auto jobs")
 
-    # === OUTCOMES / DERIV AUTO === ✅ NEW
+    # === OUTCOMES / DERIV AUTO ===
     try:
         deriv_jobs = schedule_deriv_auto(app)
         log.info("Deriv auto scheduled | jobs: %s", ", ".join(deriv_jobs) if deriv_jobs else "[]")
