@@ -38,6 +38,9 @@ from bot.mm_commands import register_mm_commands
 # === Outcomes / Edge ===
 from bot.edge_commands import register_edge_commands
 
+# ✅ Outcomes / Deriv (funding+OI) ===
+from bot.deriv_commands import register_deriv_commands
+
 log = logging.getLogger(__name__)
 
 # ----------------- MENU "folders" -----------------
@@ -94,9 +97,10 @@ def _kbd_mm() -> ReplyKeyboardMarkup:
 
 def _kbd_outcomes() -> ReplyKeyboardMarkup:
     rows: List[List[KeyboardButton]] = [
+        # Edge
         [KeyboardButton("/edge_now"), KeyboardButton("/edge_refresh")],
-        # будущие команды сюда же:
-        # [KeyboardButton("/edge_table"), KeyboardButton("/edge_cmp")],
+        # ✅ Deriv
+        [KeyboardButton("/deriv_now"), KeyboardButton("/deriv_refresh")],
         [KeyboardButton(BTN_BACK)],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -145,8 +149,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /mm_on /mm_off /mm_status /mm_report\n"
         "• /mm_snapshots — запись снапшотов\n\n"
         "Outcomes:\n"
-        "• /edge_now — текущая оценка (0–100)\n"
-        "• /edge_refresh — обновить витрину\n\n"
+        "• /edge_now — Edge (0–100)\n"
+        "• /edge_refresh — обновить витрину Edge\n"
+        "• /deriv_now — Deriv (funding+OI)\n"
+        "• /deriv_refresh — обновить витрину Deriv\n\n"
         "• /menu — показать меню-кнопки\n"
     )
     _set_menu_mode(context, MENU_ROOT)
@@ -159,7 +165,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
-        "/edge_now, /edge_refresh"
+        "/edge_now, /edge_refresh, "
+        "/deriv_now, /deriv_refresh"
     )
 
 
@@ -402,6 +409,9 @@ def register_handlers(app: Application) -> None:
 
     # Outcomes команды (/edge_now, /edge_refresh)
     register_edge_commands(app)
+
+    # ✅ Deriv команды (/deriv_now, /deriv_refresh)
+    register_deriv_commands(app)
 
     # Menu buttons (must be BEFORE generic text handlers)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_menu_buttons), group=0)
