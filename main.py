@@ -18,6 +18,9 @@ from services.mm.auto import schedule_mm_auto
 # === OUTCOMES / EDGE AUTO ===
 from services.outcomes.auto import schedule_edge_auto
 
+# === OUTCOMES / DERIV AUTO === ✅ NEW
+from services.outcomes.deriv_auto import schedule_deriv_auto
+
 
 class RedactTelegramTokenFilter(logging.Filter):
     """
@@ -109,6 +112,9 @@ async def _post_init(app: Application) -> None:
         # Outcomes / Edge
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
         BotCommand("edge_refresh", "Edge Engine: обновить витрину (REFRESH MV)"),
+
+        # Outcomes / Derivatives ✅ NEW
+        # (Команды добавим позже через handlers, сейчас только авто-планировщик)
     ]
 
     await app.bot.set_my_commands(commands)
@@ -186,6 +192,13 @@ def main() -> None:
         log.info("Edge auto scheduled | jobs: %s", ", ".join(edge_jobs) if edge_jobs else "[]")
     except Exception:
         log.exception("Failed to schedule Edge auto jobs")
+
+    # === OUTCOMES / DERIV AUTO === ✅ NEW
+    try:
+        deriv_jobs = schedule_deriv_auto(app)
+        log.info("Deriv auto scheduled | jobs: %s", ", ".join(deriv_jobs) if deriv_jobs else "[]")
+    except Exception:
+        log.exception("Failed to schedule Deriv auto jobs")
 
     # Polling
     app.run_polling(drop_pending_updates=True)
