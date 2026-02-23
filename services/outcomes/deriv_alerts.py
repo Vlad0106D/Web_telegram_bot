@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional, Dict
 
+from decimal import Decimal
+
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -59,6 +61,50 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _json_safe(obj: Any) -> Any:
+    """
+    Делает объект JSON-совместимым:
+    - Decimal -> float
+    - datetime -> isoformat
+    - dict/list/tuple -> рекурсивно
+    Остальное отдаём как есть (если json не съест — увидим в логах).
+    """
+    if obj is None:
+        return None
+
+    if isinstance(obj, Decimal):
+        try:
+            return float(obj)
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, datetime):
+        try:
+            dt = obj
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+
+    return obj
+
+
 def _ctx_key(d: DerivNow) -> str:
     """
     Контекст деривативов: текущий бар + бакеты.
@@ -90,28 +136,31 @@ def _save_outcome_alert(
     changes_text: str,
 ) -> None:
     payload: Dict[str, Any] = {
-        "current_h1_ts": d.current_h1_ts.isoformat(),
-        "funding_rate": float(d.funding_rate),
-        "oi": float(d.oi),
-        "oi_delta": float(d.oi_delta),
+        "current_h1_ts": d.current_h1_ts,  # оставляем как datetime -> _json_safe
+        "funding_rate": d.funding_rate,
+        "oi": d.oi,
+        "oi_delta": d.oi_delta,
         "funding_bucket": d.funding_bucket,
         "oi_bucket": d.oi_bucket,
-        "deriv_score": int(d.deriv_score),
-        "winrate": float(d.winrate),
-        "avg_ret": float(d.avg_ret),
-        "avg_mfe": float(d.avg_mfe),
-        "avg_mae": float(d.avg_mae),
-        "rr_ratio": float(d.rr_ratio),
-        "n": int(d.n),
+        "deriv_score": d.deriv_score,
+        "winrate": d.winrate,
+        "avg_ret": d.avg_ret,
+        "avg_mfe": d.avg_mfe,
+        "avg_mae": d.avg_mae,
+        "rr_ratio": d.rr_ratio,
+        "n": d.n,
         "ranks": {
-            "rank_by_avg_ret": int(d.rank_by_avg_ret),
-            "rank_by_winrate": int(d.rank_by_winrate),
-            "rank_by_rr": int(d.rank_by_rr),
-            "rank_by_n": int(d.rank_by_n),
-            "total_buckets": int(d.total_buckets),
+            "rank_by_avg_ret": d.rank_by_avg_ret,
+            "rank_by_winrate": d.rank_by_winrate,
+            "rank_by_rr": d.rank_by_rr,
+            "rank_by_n": d.rank_by_n,
+            "total_buckets": d.total_buckets,
         },
-        "refreshed_at": d.refreshed_at.isoformat(),
+        "refreshed_at": d.refreshed_at,  # datetime -> _json_safe
     }
+
+    # финальная “страховка” от Decimal/datetime/и т.п.
+    payload_safe = _json_safe(payload)
 
     sql = """
     INSERT INTO outcomes_alerts (
@@ -146,11 +195,11 @@ def _save_outcome_alert(
                         d.current_h1_ts,
                         "deriv_alert",
                         ctx_key,
-                        int(d.deriv_score),
+                        _safe_int(d.deriv_score, 0),
                         band,
                         int(delta),
                         changes_text,
-                        Jsonb(payload),
+                        Jsonb(payload_safe),
                     ),
                 )
             conn.commit()
@@ -213,6 +262,8 @@ async def maybe_send_deriv_alert(app: Application, *, chat_id: int) -> bool:
         changes.append(f"score {sign}{delta} (было {last_score}, стало {score})")
 
     changes_text = "; ".join(changes) if changes else ""
+
+    # ✅ сначала сохраняем в БД (и это не должно падать на Decimal)
     _save_outcome_alert(d=d, ctx_key=key, band=band, delta=delta, changes_text=changes_text)
 
     header = "📣 <b>BTC — Deriv Alert</b>\n"
