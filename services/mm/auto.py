@@ -18,6 +18,7 @@ from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
 from services.mm.liquidity_events_detector import detect_and_store_liquidity_events  # ✅ NEW
 from services.mm.action_engine import compute_action  # ✅ MTF-aware decision
+from services.outcomes.backfill import backfill_outcomes_once  # ✅ auto outcomes
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,12 @@ MM_AUTO_CHECK_SEC = int((os.getenv("MM_AUTO_CHECK_SEC", "60").strip() or "60"))
 
 # опционально: мягкая защита от overlap-логов (можно выключить MM_AUTO_MIN_INTERVAL_SEC=0)
 MM_AUTO_MIN_INTERVAL_SEC = int((os.getenv("MM_AUTO_MIN_INTERVAL_SEC", "0").strip() or "0"))
+
+# Outcomes auto
+OUTCOMES_AUTO_ENABLED_ENV = (os.getenv("OUTCOMES_AUTO_ENABLED", "1").strip() == "1")
+OUTCOMES_AUTO_LIMIT_PER_HORIZON = int(
+    (os.getenv("OUTCOMES_AUTO_LIMIT_PER_HORIZON", "100").strip() or "100")
+)
 
 
 def _read_chat_id() -> Optional[int]:
@@ -431,6 +438,29 @@ def _evaluate_pending(conn: psycopg.Connection, *, tf: str, latest_ts: datetime,
     return updated
 
 
+def _run_outcomes_auto_if_needed(candidates: List[Tuple[str, datetime]]) -> None:
+    """
+    Автоматически досчитывает mm_outcomes после появления новой H1 свечи.
+
+    ВАЖНО:
+    - backfill_outcomes_once безопасен: ON CONFLICT DO NOTHING
+    - считает только то, для чего уже есть future snapshot
+    - если новых данных нет, просто вставит 0
+    """
+    if not OUTCOMES_AUTO_ENABLED_ENV:
+        return
+
+    has_h1 = any(tf == "H1" for tf, _ in candidates)
+    if not has_h1:
+        return
+
+    try:
+        res = backfill_outcomes_once(limit_per_horizon=OUTCOMES_AUTO_LIMIT_PER_HORIZON)
+        log.info("MM auto: outcomes backfill result=%s", res)
+    except Exception:
+        log.exception("MM auto: outcomes backfill failed")
+
+
 async def _mm_auto_tick(app: Application) -> None:
     if not _mm_is_enabled(app):
         return
@@ -472,6 +502,10 @@ async def _mm_auto_tick(app: Application) -> None:
 
         if not candidates:
             return
+
+        # 1.5) OUTCOMES AUTO
+        # После появления новой H1 свечи досчитываем outcomes для уже созревших горизонтов.
+        _run_outcomes_auto_if_needed(candidates)
 
         # Обрабатываем каждый TF отдельно, и только после успеха отмечаем seen
         for tf, initial_ts in candidates:
