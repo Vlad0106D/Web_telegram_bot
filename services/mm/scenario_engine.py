@@ -69,7 +69,7 @@ def _dedupe_chain(events: Sequence[dict]) -> List[str]:
             "liq_reclaim_up",
             "liq_reclaim_down",
         }:
-            label = event_type.removeprefix("liq_")
+            label = event_type.removeprefix("liq_").replace("_", " ")
         if label and (not result or result[-1] != label):
             result.append(label)
     return result[-5:]
@@ -194,38 +194,70 @@ def build_scenario(
 ) -> MarketScenario:
     event_score, event_reasons = _event_bias(events)
     zone_score, zone_reasons = _zone_bias(zones, price)
-    deriv_adjustment = 0
-    deriv_reasons: List[str] = []
-    if deriv_score is not None:
-        if deriv_score >= 65:
-            deriv_adjustment = min(15, round((deriv_score - 50) * 0.35))
-            deriv_reasons.append("деривативный контекст поддерживает рост")
-        elif deriv_score <= 35:
-            deriv_adjustment = max(-15, round((deriv_score - 50) * 0.35))
-            deriv_reasons.append("деривативный контекст против лонгов")
-    signed = event_score + zone_score + deriv_adjustment
-    if signed >= 10:
+    structural_score = event_score + zone_score
+    if structural_score >= 10:
         bias: Bias = "long"
-    elif signed <= -10:
+    elif structural_score <= -10:
         bias = "short"
     else:
         bias = "neutral"
+
+    deriv_adjustment = 0
+    deriv_reasons: List[str] = []
+    # Derivatives may confirm or weaken structure, but may never create a bias.
+    if deriv_score is not None and bias != "neutral":
+        if deriv_score >= 65:
+            raw = min(8, round((deriv_score - 50) * 0.20))
+            deriv_adjustment = raw if bias == "long" else -raw
+            deriv_reasons.append(
+                "Deriv подтверждает структуру"
+                if bias == "long"
+                else "Deriv расходится с шортовой структурой"
+            )
+        elif deriv_score <= 35:
+            raw = max(-8, round((deriv_score - 50) * 0.20))
+            deriv_adjustment = raw if bias == "long" else -raw
+            deriv_reasons.append(
+                "Deriv расходится с лонговой структурой"
+                if bias == "long"
+                else "Deriv подтверждает структуру"
+            )
+    signed = structural_score + deriv_adjustment
     direction = (
         _clamp(50 + abs(signed)) if bias != "neutral" else _clamp(50 + abs(signed) / 2)
     )
     chain = _dedupe_chain(events)
+    bullish = {"reclaim up", "accept above", "pressure up"}
+    bearish = {"reclaim down", "accept below", "pressure down"}
+    conflicting = bool(bullish.intersection(chain) and bearish.intersection(chain))
+    conflict_reasons = (
+        ["цепочка противоречивая — подтверждения направления нет"]
+        if conflicting
+        else []
+    )
     confluence = (
         18
         if any("reclaim" in x or "accept" in x for x in chain)
         else (8 if chain else 0)
     )
-    setup = _clamp(25 + abs(event_score) + abs(zone_score) + confluence)
+    setup = _clamp(
+        25
+        + abs(event_score)
+        + abs(zone_score)
+        + confluence
+        - (20 if conflicting else 0)
+    )
     targets, alternatives, invalidation, entry_low, entry_high = _derive_levels(
         bias, zones, price
     )
     entry = _entry_score(bias, price, targets[0] if targets else None, invalidation)
+    has_trade_plan = bool(targets and invalidation is not None)
+    if not has_trade_plan:
+        setup = min(setup, 49)
     if bias == "neutral":
         state: State = "no_trade"
+    elif not has_trade_plan:
+        state = "context_update"
     elif setup >= 68 and entry >= 65:
         state = "setup_ready"
     elif setup >= 55:
@@ -245,7 +277,7 @@ def build_scenario(
         primary_probability=probability,
         state=state,
         event_chain=chain,
-        reasons=(event_reasons + zone_reasons + deriv_reasons)[:5],
+        reasons=(event_reasons + zone_reasons + conflict_reasons + deriv_reasons)[:5],
         targets=targets,
         alternative_targets=alternatives,
         invalidation_price=invalidation,
@@ -362,6 +394,14 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
                     f"Deriv {deriv_score}/100 | funding={deriv.funding_bucket} | "
                     f"OIΔ={deriv.oi_bucket}"
                 )
+                if (
+                    deriv.funding_bucket == "funding_high"
+                    and deriv.oi_bucket == "oi_delta_low"
+                ):
+                    deriv_note += (
+                        "\n⚠️ Высокий funding при снижении OI: "
+                        "подтверждение цены обязательно"
+                    )
         except Exception:
             deriv_note = "Deriv временно недоступен; сценарий рассчитан без него"
     return build_scenario(
