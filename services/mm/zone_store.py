@@ -47,7 +47,34 @@ def fetch_candles(
     ]
 
 
-def _upsert_zone(conn: psycopg.Connection, zone: LiquidityZone) -> int:
+def _zone_values(zone: LiquidityZone) -> tuple:
+    return (
+        zone.zone_key,
+        ALGORITHM_VERSION,
+        zone.symbol,
+        zone.tf,
+        zone.side,
+        zone.lower_price,
+        zone.upper_price,
+        zone.center_price,
+        zone.strength,
+        zone.created_ts,
+        zone.confirmed_ts,
+        zone.last_event_ts,
+        zone.closed_ts,
+        zone.status,
+        zone.touches,
+        zone.sweep_depth_pct,
+        Jsonb({"event_count": len(zone.events)}),
+    )
+
+
+def persist_zones(
+    conn: psycopg.Connection, zones: Sequence[LiquidityZone]
+) -> Dict[str, int]:
+    if not zones:
+        return {"zones": 0, "events": 0}
+
     sql = """
     INSERT INTO liquidity_zones (
       zone_key, algorithm_version, symbol, tf, side, lower_price, upper_price,
@@ -61,65 +88,46 @@ def _upsert_zone(conn: psycopg.Connection, zone: LiquidityZone) -> int:
       status=EXCLUDED.status, touches=EXCLUDED.touches,
       sweep_depth_pct=EXCLUDED.sweep_depth_pct, meta_json=EXCLUDED.meta_json,
       updated_at=now()
-    RETURNING id;
+    ;
     """
-    meta = {"event_count": len(zone.events)}
     with conn.cursor() as cur:
+        cur.executemany(sql, [_zone_values(zone) for zone in zones])
         cur.execute(
-            sql,
-            (
-                zone.zone_key,
-                ALGORITHM_VERSION,
-                zone.symbol,
-                zone.tf,
-                zone.side,
-                zone.lower_price,
-                zone.upper_price,
-                zone.center_price,
-                zone.strength,
-                zone.created_ts,
-                zone.confirmed_ts,
-                zone.last_event_ts,
-                zone.closed_ts,
-                zone.status,
-                zone.touches,
-                zone.sweep_depth_pct,
-                Jsonb(meta),
-            ),
+            """SELECT id, zone_key FROM liquidity_zones
+               WHERE algorithm_version=%s AND zone_key = ANY(%s)""",
+            (ALGORITHM_VERSION, [zone.zone_key for zone in zones]),
         )
-        return int(cur.fetchone()["id"])
+        ids = {row["zone_key"]: int(row["id"]) for row in cur.fetchall()}
 
-
-def persist_zones(
-    conn: psycopg.Connection, zones: Sequence[LiquidityZone]
-) -> Dict[str, int]:
-    zone_count = event_count = 0
+    event_rows = []
     for zone in zones:
-        zone_id = _upsert_zone(conn, zone)
-        zone_count += 1
+        zone_id = ids[zone.zone_key]
         for event in zone.events:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO liquidity_zone_events (
-                      zone_id, algorithm_version, symbol, tf, event_ts,
-                      event_type, price, payload_json
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (zone_id, event_type, event_ts) DO NOTHING;
-                    """,
-                    (
-                        zone_id,
-                        ALGORITHM_VERSION,
-                        zone.symbol,
-                        zone.tf,
-                        event.event_ts,
-                        event.event_type,
-                        event.price,
-                        Jsonb(event.payload),
-                    ),
+            event_rows.append(
+                (
+                    zone_id,
+                    ALGORITHM_VERSION,
+                    zone.symbol,
+                    zone.tf,
+                    event.event_ts,
+                    event.event_type,
+                    event.price,
+                    Jsonb(event.payload),
                 )
-                event_count += cur.rowcount
-    return {"zones": zone_count, "events": event_count}
+            )
+    event_count = 0
+    if event_rows:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO liquidity_zone_events (
+                     zone_id, algorithm_version, symbol, tf, event_ts,
+                     event_type, price, payload_json
+                   ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (zone_id, event_type, event_ts) DO NOTHING""",
+                event_rows,
+            )
+            event_count = max(0, cur.rowcount)
+    return {"zones": len(zones), "events": event_count}
 
 
 def rebuild_zones(
