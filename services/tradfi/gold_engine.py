@@ -188,7 +188,7 @@ def render_gold(a: Dict) -> str:
               f"Сверху: {_p(a['above'])}", f"Снизу: {_p(a['below'])}"]
     if a["stop"] is not None:
         risk = abs(a["price"]-a["stop"]) + .12
-        lines += ["", "🎯 REFERENCE-ПЛАН", f"Stop: {_p(a['stop'])}", f"Цель: {_p(a['target'])}",
+        lines += ["", "🎯 ПЛАН ПРИ ПОДТВЕРЖДЕНИИ" if a["decision"] in ("WAIT", "SETUP WATCH") else "🎯 АКТИВНЫЙ ПЛАН", f"Stop: {_p(a['stop'])}", f"Цель: {_p(a['target'])}",
                   f"Риск 0.01 lot: около ${risk:.2f} + проскальзывание"]
     if a["impulse"] > 2:
         lines += ["", f"⚡ Вход заблокирован: M1 импульс {a['impulse']:.1f}× ATR"]

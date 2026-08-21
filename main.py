@@ -20,6 +20,7 @@ from services.outcomes.auto import schedule_edge_auto
 
 # === OUTCOMES / DERIV AUTO ===
 from services.outcomes.deriv_auto import schedule_deriv_auto
+from services.tradfi.auto import schedule_gold_auto
 
 
 class RedactTelegramTokenFilter(logging.Filter):
@@ -209,6 +210,16 @@ def main() -> None:
         )
     except Exception:
         log.exception("Failed to schedule Deriv auto jobs")
+
+    # === TRADFI GOLD AUTO ===
+    try:
+        tradfi_jobs = schedule_gold_auto(app)
+        log.info(
+            "TradFi gold auto scheduled | jobs: %s",
+            ", ".join(tradfi_jobs) if tradfi_jobs else "[]",
+        )
+    except Exception:
+        log.exception("Failed to schedule TradFi gold auto")
 
     # Polling
     app.run_polling(drop_pending_updates=True)
