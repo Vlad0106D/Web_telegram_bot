@@ -68,7 +68,9 @@ def _payload(a: Dict) -> Dict:
         "contexts": a["contexts"], "parts": a["parts"], "above": a["above"],
         "below": a["below"], "stop": a["stop"], "target": a["target"],
         "atr5": a["atr5"], "impulse": a["impulse"], "stale": a["stale"],
-        "trigger": a["trigger_text"],
+        "trigger": a["trigger_text"], "higher_bias": a.get("higher_bias"),
+        "setup_type": a.get("setup_type"), "long_score": a.get("long_score"),
+        "short_score": a.get("short_score"), "event_chain": a.get("event_chain", []),
     }
 
 
@@ -157,8 +159,10 @@ def render_alert(kind: str, a: Dict) -> str:
     lines = [
         f"🥇 XAUUSD+ — {titles[kind]}",
         f"🕒 {a['now']:%d.%m.%Y %H:%M UTC} │ OKX reference {price(a['price'])}",
-        f"Направление: {a['direction']} │ Entry: {a['score']}/100",
-        f"M1: {a['trigger_text']}",
+        f"Старший bias: {a.get('higher_bias', '—')}",
+        f"Локально: {a['direction']} │ {a.get('setup_type', '—')} │ Entry: {a['score']}/100",
+        f"Long {a.get('long_score', 0)}/100 │ Short {a.get('short_score', 0)}/100",
+        f"Цепочка: {a['trigger_text']}",
     ]
     if kind == "ENTRY_CONFIRMED":
         lines += [f"Stop: {price(a['stop'])}", f"Цель: {price(a['target'])}"]
