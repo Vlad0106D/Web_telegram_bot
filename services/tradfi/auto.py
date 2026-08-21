@@ -122,6 +122,26 @@ def detect_alert(previous: Optional[Dict], current: Dict) -> Optional[str]:
     return None
 
 
+
+def should_persist(previous: Optional[Dict], current: Dict, alert_kind: Optional[str]) -> bool:
+    """Keep five-minute baselines and every meaningful state change."""
+    if previous is None or alert_kind is not None:
+        return True
+    if current["now"].minute % 5 == 0:
+        return True
+    if abs(int(current["score"]) - int(previous["score"])) >= 5:
+        return True
+    if current["direction"] != previous["direction"]:
+        return True
+    if current["decision"] != previous["decision"]:
+        return True
+    if current["trigger_text"] != previous.get("trigger_text"):
+        return True
+    old_basis, basis = previous.get("basis"), current.get("basis")
+    if old_basis is not None and basis is not None and abs(basis - old_basis) >= .05:
+        return True
+    return False
+
 def render_alert(kind: str, a: Dict) -> str:
     titles = {
         "SETUP_WATCH": "👀 СЕТАП ФОРМИРУЕТСЯ",
@@ -157,12 +177,13 @@ async def gold_auto_tick(app: Application) -> None:
         return
     try:
         assessment = await assess_gold_now()
-        try:
-            await asyncio.to_thread(persist_assessment, assessment)
-        except Exception:
-            log.exception("TradFi gold assessment persistence failed")
         previous = app.bot_data.get("tradfi_gold_last")
         kind = detect_alert(previous, assessment)
+        if should_persist(previous, assessment, kind):
+            try:
+                await asyncio.to_thread(persist_assessment, assessment)
+            except Exception:
+                log.exception("TradFi gold assessment persistence failed")
         app.bot_data["tradfi_gold_last"] = assessment
         if kind and _chat_id():
             await app.bot.send_message(chat_id=_chat_id(), text=render_alert(kind, assessment))
