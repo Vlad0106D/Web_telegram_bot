@@ -60,13 +60,14 @@ class ScenarioTests(unittest.TestCase):
             events=[{"side": "lower", "event_type": "reclaim", "event_ts": NOW}],
         )
         text = render_scenario(result)
-        self.assertIn("Direction:", text)
-        self.assertIn("Setup:", text)
-        self.assertIn("Entry:", text)
+        self.assertIn("Direction ", text)
+        self.assertIn("Setup ", text)
+        self.assertIn("Entry ", text)
+        self.assertIn("⚙️ ACTION ENGINE (v1)", text)
         self.assertIn("Инвалидация:", text)
-        self.assertIn("Карта ликвидности:", text)
-        self.assertIn("Сверху:", text)
-        self.assertIn("Снизу:", text)
+        self.assertIn("🧲 ЛИКВИДНОСТЬ", text)
+        self.assertIn("Ближайшая сверху:", text)
+        self.assertIn("Ближайшая снизу:", text)
 
     def test_deriv_cannot_create_bias_without_market_structure(self):
         result = build_scenario(
@@ -138,10 +139,38 @@ class ScenarioTests(unittest.TestCase):
             }
         ]
         text = render_scenario(result)
-        self.assertIn("Историческая структура H1 (не торговые цели):", text)
-        self.assertIn("Старшие зоны H4/D1:", text)
+        self.assertIn("Ближайшая снизу:", text)
+        self.assertIn("историческая структура", text)
+        self.assertIn("Старшие уровни:", text)
         self.assertIn("95.00 | -5.00% | H1", text)
         self.assertIn("90.00 | -10.00% | H4", text)
+
+    def test_render_uses_timeframe_specific_title_and_action_engine(self):
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H4",
+            ts=NOW,
+            price=100,
+            zones=[
+                {"side": "upper", "center_price": 105.0, "strength": 70},
+                {"side": "lower", "center_price": 95.0, "strength": 70},
+            ],
+            events=[{"side": "lower", "event_type": "reclaim", "event_ts": NOW}],
+        )
+        result.action_decision = "LONG_ALLOWED"
+        result.action_confidence = 72
+        result.action_event = "liq_reclaim_up"
+        result.action_reason = "MTF confirmed"
+        result.mtf_context = [
+            {"tf": "H4", "title": "ДАВЛЕНИЕ ВВЕРХ", "prob_up": 60, "prob_down": 40},
+            {"tf": "D1", "title": "ОЖИДАНИЕ", "prob_up": 52, "prob_down": 48},
+        ]
+        text = render_scenario(result)
+        self.assertIn("ОТЧЁТ 4Ч", text)
+        self.assertIn("РЕШЕНИЕ: LONG РАЗРЕШЁН", text)
+        self.assertIn("Decision: LONG_ALLOWED", text)
+        self.assertIn("🧭 MTF-КОНТЕКСТ", text)
+        self.assertIn("• D1: ОЖИДАНИЕ | ↓48% ↑52%", text)
 
     def test_entry_readiness_is_symmetric_for_long_and_short(self):
         long_score, long_parts = score_entry_readiness(
