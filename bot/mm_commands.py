@@ -13,6 +13,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from services.mm.report_engine import build_market_view, render_report
+from services.mm.scenario_engine import build_current_scenario, persist_scenario, render_scenario
+from services.mm.zone_store import rebuild_zones
 
 log = logging.getLogger(__name__)
 
@@ -134,8 +136,21 @@ async def cmd_mm_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"Ошибка /mm_report ({tf}): {e}")
 
 
+async def cmd_scenario_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    tf = _normalize_tf(context.args[0] if context.args else None)
+    try:
+        rebuild_zones("BTC-USDT", tf)
+        scenario = build_current_scenario("BTC-USDT", tf)
+        persist_scenario(scenario)
+        await update.message.reply_text(render_scenario(scenario))
+    except Exception as e:
+        log.exception("scenario_now failed tf=%s", tf)
+        await update.message.reply_text(f"Ошибка /scenario_now ({tf}): {e}")
+
+
 def register_mm_commands(app: Application) -> None:
     app.add_handler(CommandHandler("mm_on", cmd_mm_on))
     app.add_handler(CommandHandler("mm_off", cmd_mm_off))
     app.add_handler(CommandHandler("mm_status", cmd_mm_status))
     app.add_handler(CommandHandler("mm_report", cmd_mm_report))
+    app.add_handler(CommandHandler("scenario_now", cmd_scenario_now))

@@ -108,6 +108,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("mm_status", "MM: статус"),
         BotCommand("mm_report", "MM: ручной отчёт"),
         BotCommand("mm_snapshots", "MM: записать live снапшоты в БД"),
+        BotCommand("scenario_now", "Рыночный сценарий: Direction/Setup/Entry"),
 
         # Outcomes / Edge
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
