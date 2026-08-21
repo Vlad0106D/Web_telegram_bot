@@ -1,6 +1,7 @@
 import unittest
+from datetime import datetime, timezone
 
-from services.tradfi.auto import detect_alert
+from services.tradfi.auto import detect_alert, should_persist
 
 
 def state(score=40, decision="WAIT", direction="LONG", impulse=1.0, basis=0.0, stale=0):
@@ -30,6 +31,26 @@ class TradfiAlertTests(unittest.TestCase):
 
     def test_direction_change(self):
         self.assertEqual(detect_alert(state(direction="LONG"), state(direction="SHORT")), "DIRECTION_CHANGE")
+
+    def test_persistence_is_downsampled(self):
+        previous = state(46)
+        previous["trigger_text"] = "подтверждения M1 нет"
+        current = state(46)
+        current.update(now=datetime(2026, 8, 21, 19, 3, tzinfo=timezone.utc),
+                       trigger_text="подтверждения M1 нет")
+        self.assertFalse(should_persist(previous, current, None))
+        current["now"] = datetime(2026, 8, 21, 19, 5, tzinfo=timezone.utc)
+        self.assertTrue(should_persist(previous, current, None))
+
+    def test_meaningful_change_is_always_persisted(self):
+        previous = state(46)
+        previous["trigger_text"] = "нет"
+        current = state(51)
+        current.update(now=datetime(2026, 8, 21, 19, 3, tzinfo=timezone.utc),
+                       trigger_text="нет")
+        self.assertTrue(should_persist(previous, current, None))
+        current["score"] = 46
+        self.assertTrue(should_persist(previous, current, "SETUP_WATCH"))
 
 
 if __name__ == "__main__":
