@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from services.mm.zone_engine import Candle, ZoneConfig, replay_zones
+from services.mm.zone_engine import Candle, ZoneConfig, replay_zone_states, replay_zones
 
 
 def bar(index: int, high: float, low: float, close: float) -> Candle:
@@ -60,6 +60,28 @@ class ZoneReplayTests(unittest.TestCase):
             z for z in zones if z.side == "upper" and z.created_ts == bars[1].ts
         )
         self.assertEqual(zone.status, "accepted")
+
+    def test_point_in_time_states_do_not_expose_future_reclaim(self):
+        bars = [
+            bar(0, 100, 96, 98),
+            bar(1, 105, 97, 100),
+            bar(2, 101, 96, 99),
+            bar(3, 106, 103, 105.5),
+            bar(4, 104, 99, 100),
+        ]
+        states = replay_zone_states(
+            bars,
+            symbol="BTC-USDT",
+            tf="H1",
+            config=ZoneConfig(pivot_window=1, accept_bars=2),
+        )
+        _, sweep_events = states[bars[3].ts]
+        _, reclaim_events = states[bars[4].ts]
+        self.assertEqual([event["event_type"] for event in sweep_events], ["sweep"])
+        self.assertEqual(
+            [event["event_type"] for event in reclaim_events],
+            ["sweep", "reclaim"],
+        )
 
 
 if __name__ == "__main__":

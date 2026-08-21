@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 
 from services.mm.scenario_engine import SCENARIO_VERSION
 
-HORIZON_BARS = (4, 12, 24)
+HORIZON_BARS = (1, 4, 24)
 
 
 def _db_url() -> str:
