@@ -110,6 +110,34 @@ class ScenarioTests(unittest.TestCase):
         )
         self.assertTrue(any("противоречивая" in reason for reason in result.reasons))
 
+    def test_render_shows_historical_and_higher_timeframe_context(self):
+        result = build_scenario(
+            symbol="BTC-USDT", tf="H1", ts=NOW, price=100, zones=[], events=[]
+        )
+        result.historical_zones = [
+            {
+                "tf": "H1",
+                "side": "lower",
+                "center_price": 95.0,
+                "strength": 70,
+                "status": "expired",
+            }
+        ]
+        result.higher_tf_zones = [
+            {
+                "tf": "H4",
+                "side": "lower",
+                "center_price": 90.0,
+                "strength": 80,
+                "status": "active",
+            }
+        ]
+        text = render_scenario(result)
+        self.assertIn("Историческая структура H1 (не торговые цели):", text)
+        self.assertIn("Старшие зоны H4/D1:", text)
+        self.assertIn("95.00 | -5.00% | H1", text)
+        self.assertIn("90.00 | -10.00% | H4", text)
+
 
 if __name__ == "__main__":
     unittest.main()

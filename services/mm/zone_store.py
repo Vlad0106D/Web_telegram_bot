@@ -167,6 +167,31 @@ def load_current_zones(
             return [dict(r) for r in (cur.fetchall() or [])]
 
 
+def load_historical_zones(
+    symbol: str, tf: str, price: float, *, per_side: int = 2
+) -> List[dict]:
+    """Nearest consumed/expired zones for context, never for signal scoring."""
+    sql = """
+    WITH ranked AS (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY side ORDER BY ABS(center_price - %s), strength DESC
+      ) AS rn
+      FROM liquidity_zones
+      WHERE algorithm_version=%s AND symbol=%s AND tf=%s
+        AND status IN ('accepted','expired','reclaimed')
+        AND ((side='upper' AND center_price>%s) OR (side='lower' AND center_price<%s))
+    )
+    SELECT * FROM ranked WHERE rn <= %s ORDER BY side DESC, ABS(center_price-%s);
+    """
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (price, ALGORITHM_VERSION, symbol, tf, price, price, per_side, price),
+            )
+            return [dict(r) for r in (cur.fetchall() or [])]
+
+
 def load_recent_zone_events(symbol: str, tf: str, *, limit: int = 8) -> List[dict]:
     sql = """
     SELECT e.*, z.side, z.center_price, z.strength

@@ -10,7 +10,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from services.mm.zone_engine import ALGORITHM_VERSION as ZONE_VERSION
-from services.mm.zone_store import load_current_zones, load_recent_zone_events
+from services.mm.zone_store import (
+    load_current_zones,
+    load_historical_zones,
+    load_recent_zone_events,
+)
 
 SCENARIO_VERSION = "scenario_v1"
 Bias = Literal["long", "short", "neutral"]
@@ -35,6 +39,8 @@ class MarketScenario:
     alternative_targets: List[float] = field(default_factory=list)
     upper_zones: List[dict] = field(default_factory=list)
     lower_zones: List[dict] = field(default_factory=list)
+    historical_zones: List[dict] = field(default_factory=list)
+    higher_tf_zones: List[dict] = field(default_factory=list)
     invalidation_price: Optional[float] = None
     entry_low: Optional[float] = None
     entry_high: Optional[float] = None
@@ -306,6 +312,18 @@ def _fmt_price(value: Optional[float]) -> str:
     return f"{value:,.2f}".replace(",", " ")
 
 
+def _zone_line(zone: dict, price: float) -> str:
+    center = float(zone["center_price"])
+    distance = (center / price - 1.0) * 100
+    distance_text = f"{distance:+.2f}%"
+    tf = zone.get("tf")
+    tf_text = f"{tf} | " if tf else ""
+    return (
+        f"• {_fmt_price(center)} | {distance_text} | {tf_text}"
+        f"сила {int(zone['strength'])}/100 | {zone.get('status', 'active')}"
+    )
+
+
 def render_scenario(s: MarketScenario) -> str:
     icon = {
         "setup_ready": "🚨",
@@ -345,25 +363,23 @@ def render_scenario(s: MarketScenario) -> str:
     if s.upper_zones:
         lines.append("Сверху:")
         for zone in s.upper_zones:
-            distance = (float(zone["center_price"]) / s.price - 1.0) * 100
-            lines.append(
-                f"• {_fmt_price(float(zone['center_price']))} | "
-                f"+{distance:.2f}% | сила {int(zone['strength'])}/100 | "
-                f"{zone.get('status', 'active')}"
-            )
+            lines.append(_zone_line(zone, s.price))
     else:
         lines.append("Сверху: активных зон нет")
     if s.lower_zones:
         lines.append("Снизу:")
         for zone in s.lower_zones:
-            distance = (float(zone["center_price"]) / s.price - 1.0) * 100
-            lines.append(
-                f"• {_fmt_price(float(zone['center_price']))} | "
-                f"{distance:.2f}% | сила {int(zone['strength'])}/100 | "
-                f"{zone.get('status', 'active')}"
-            )
+            lines.append(_zone_line(zone, s.price))
     else:
         lines.append("Снизу: активных зон нет")
+    if s.historical_zones:
+        lines.append("Историческая структура H1 (не торговые цели):")
+        for zone in s.historical_zones:
+            lines.append(_zone_line(zone, s.price))
+    if s.higher_tf_zones:
+        lines.append("Старшие зоны H4/D1:")
+        for zone in s.higher_tf_zones:
+            lines.append(_zone_line(zone, s.price))
     if s.bias != "neutral":
         lines += ["", f"🎯 Основной сценарий — {s.primary_probability}%"]
         if s.entry_low is not None:
@@ -416,6 +432,22 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         raise RuntimeError(f"No snapshots for {symbol} {tf}")
     price = float(row["close"])
     zones = load_current_zones(symbol, tf, price)
+    historical_zones = load_historical_zones(symbol, tf, price)
+    higher_tf_zones: List[dict] = []
+    if tf == "H1":
+        for higher_tf in ("H4", "D1"):
+            current_higher = load_current_zones(symbol, higher_tf, price, per_side=2)
+            higher_tf_zones.extend(current_higher)
+            present_sides = {zone["side"] for zone in current_higher}
+            if len(present_sides) < 2:
+                historical_higher = load_historical_zones(
+                    symbol, higher_tf, price, per_side=1
+                )
+                higher_tf_zones.extend(
+                    zone
+                    for zone in historical_higher
+                    if zone["side"] not in present_sides
+                )
     events = load_recent_zone_events(symbol, tf) + market_events
     deriv_score: Optional[int] = None
     deriv_note = "данных недостаточно"
@@ -440,7 +472,7 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
                     )
         except Exception:
             deriv_note = "Deriv временно недоступен; сценарий рассчитан без него"
-    return build_scenario(
+    scenario = build_scenario(
         symbol=symbol,
         tf=tf,
         ts=row["ts"],
@@ -450,14 +482,34 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         deriv_note=deriv_note,
         deriv_score=deriv_score,
     )
+    scenario.historical_zones = historical_zones
+    scenario.higher_tf_zones = sorted(
+        higher_tf_zones,
+        key=lambda zone: abs(float(zone["center_price"]) - price),
+    )
+    return scenario
 
 
 def persist_scenario(s: MarketScenario) -> bool:
+    def zone_payload(zone: dict) -> dict:
+        return {
+            "tf": zone.get("tf", s.tf),
+            "side": zone["side"],
+            "center_price": float(zone["center_price"]),
+            "strength": int(zone["strength"]),
+            "status": zone.get("status", "active"),
+        }
+
     payload = {
         "reasons": s.reasons,
         "alternative_targets": s.alternative_targets,
         "deriv_note": s.deriv_note,
         "zone_version": ZONE_VERSION,
+        "active_zones": [
+            zone_payload(zone) for zone in (s.upper_zones + s.lower_zones)
+        ],
+        "historical_zones": [zone_payload(zone) for zone in s.historical_zones],
+        "higher_tf_zones": [zone_payload(zone) for zone in s.higher_tf_zones],
     }
     sql = """
     INSERT INTO market_scenarios (
