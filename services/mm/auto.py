@@ -1,6 +1,7 @@
 # services/mm/auto.py
 from __future__ import annotations
 
+import asyncio
 import os
 import logging
 from datetime import datetime, timezone, timedelta
@@ -33,6 +34,7 @@ from services.mm.scenario_engine import (
 )
 from services.mm.scenario_schema import ensure_scenario_schema
 from services.mm.scenario_outcomes import backfill_scenario_outcomes
+from services.mm.scenario_replay import REPLAY_ENABLED, backfill_scenario_v2
 from services.mm.zone_store import rebuild_zones
 
 log = logging.getLogger(__name__)
@@ -70,6 +72,15 @@ MM_TFS = [
     for t in (os.getenv("MM_TFS", "H1,H4,D1,W1").replace(" ", "").split(","))
     if t.strip()
 ]
+
+
+async def _scenario_replay_tick(app: Application) -> None:
+    del app
+    try:
+        result = await asyncio.to_thread(backfill_scenario_v2)
+        log.info("Scenario v2 historical replay result=%s", result)
+    except Exception:
+        log.exception("Scenario v2 historical replay failed")
 
 
 def _db_url() -> str:
@@ -806,6 +817,21 @@ def schedule_mm_auto(app: Application) -> List[str]:
             },
         )
         created.append(live_name)
+
+    if REPLAY_ENABLED:
+        replay_name = "mm_auto_scenario_v2_replay"
+        jq.run_repeating(
+            callback=lambda ctx: _scenario_replay_tick(ctx.application),
+            interval=6 * 60 * 60,
+            first=120,
+            name=replay_name,
+            job_kwargs={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 300,
+            },
+        )
+        created.append(replay_name)
 
     log.info(
         "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",

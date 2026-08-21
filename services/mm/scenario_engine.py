@@ -16,7 +16,7 @@ from services.mm.zone_store import (
     load_recent_zone_events,
 )
 
-SCENARIO_VERSION = "scenario_v1"
+SCENARIO_VERSION = "scenario_v2"
 Bias = Literal["long", "short", "neutral"]
 State = Literal["no_trade", "context_update", "setup_watch", "setup_ready"]
 
@@ -47,6 +47,7 @@ class MarketScenario:
     deriv_note: str = "данных недостаточно"
     deriv_score: Optional[int] = None
     entry_breakdown: dict = field(default_factory=dict)
+    calibration_note: str = ""
 
 
 EVENT_LABELS = {
@@ -477,6 +478,8 @@ def render_scenario(s: MarketScenario) -> str:
             lines.append(_zone_line(zone, s.price))
     if s.bias != "neutral":
         lines += ["", f"🎯 Основной сценарий — {s.primary_probability}%"]
+        if s.calibration_note:
+            lines.append(s.calibration_note)
         if s.entry_low is not None:
             lines.append(
                 f"Входная область: {_fmt_price(s.entry_low)}–{_fmt_price(s.entry_high)}"
@@ -585,6 +588,41 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         higher_tf_zones,
         key=lambda zone: abs(float(zone["center_price"]) - price),
     )
+    if scenario.bias != "neutral":
+        try:
+            with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT n,directional_winrate,target_rate,invalidation_rate,
+                                  direction_band,setup_band,entry_band
+                           FROM scenario_calibration
+                           WHERE algorithm_version=%s AND bias=%s
+                             AND horizon_bars=4 AND n>=20
+                           ORDER BY
+                             ABS(direction_band-%s) + ABS(setup_band-%s)
+                             + ABS(entry_band-%s), n DESC
+                           LIMIT 1""",
+                        (
+                            SCENARIO_VERSION,
+                            scenario.bias,
+                            (scenario.direction_score // 10) * 10,
+                            (scenario.setup_score // 10) * 10,
+                            (scenario.entry_score // 10) * 10,
+                        ),
+                    )
+                    calibration = cur.fetchone()
+            if calibration and int(calibration["n"]) >= 20:
+                n = int(calibration["n"])
+                winrate = float(calibration["directional_winrate"])
+                shrunk = (n * winrate + 20 * 0.5) / (n + 20)
+                scenario.primary_probability = _clamp(shrunk * 100)
+                scenario.calibration_note = (
+                    f"Калибровка 4ч: n={n}, win={winrate * 100:.1f}% | "
+                    f"bands D/S/E={calibration['direction_band']}/"
+                    f"{calibration['setup_band']}/{calibration['entry_band']}"
+                )
+        except Exception:
+            scenario.calibration_note = "Калибровка временно недоступна"
     return scenario
 
 
@@ -604,6 +642,7 @@ def persist_scenario(s: MarketScenario) -> bool:
         "deriv_note": s.deriv_note,
         "zone_version": ZONE_VERSION,
         "entry_breakdown": s.entry_breakdown,
+        "calibration_note": s.calibration_note,
         "active_zones": [
             zone_payload(zone) for zone in (s.upper_zones + s.lower_zones)
         ],

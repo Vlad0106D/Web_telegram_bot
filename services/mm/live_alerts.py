@@ -12,6 +12,7 @@ from psycopg.types.json import Jsonb
 from telegram.ext import Application
 
 from services.mm.scenario_engine import (
+    SCENARIO_VERSION,
     MarketScenario,
     build_current_scenario,
     score_entry_readiness,
@@ -51,7 +52,10 @@ def _fmt_price(value: float) -> str:
 def _load_state(conn: psycopg.Connection, symbol: str) -> Dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM scenario_live_state WHERE symbol=%s", (symbol,))
-        return dict(cur.fetchone() or {})
+        state = dict(cur.fetchone() or {})
+    if state.get("scenario_version") != SCENARIO_VERSION:
+        return {}
+    return state
 
 
 def _crossed(previous: Optional[float], current: float, level: float) -> bool:
@@ -273,11 +277,12 @@ def _save_state(
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO scenario_live_state (
-                 symbol,last_m5_ts,last_price,last_entry_score,last_bias,
+                 symbol,scenario_version,last_m5_ts,last_price,last_entry_score,last_bias,
                  pending_sweep_type,pending_level,pending_outside_count,
                  last_deriv_score,updated_at
-               ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+               ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
                ON CONFLICT (symbol) DO UPDATE SET
+                 scenario_version=EXCLUDED.scenario_version,
                  last_m5_ts=EXCLUDED.last_m5_ts,last_price=EXCLUDED.last_price,
                  last_entry_score=EXCLUDED.last_entry_score,last_bias=EXCLUDED.last_bias,
                  pending_sweep_type=EXCLUDED.pending_sweep_type,
@@ -286,6 +291,7 @@ def _save_state(
                  last_deriv_score=EXCLUDED.last_deriv_score,updated_at=now()""",
             (
                 symbol,
+                SCENARIO_VERSION,
                 candle_ts,
                 price,
                 entry,

@@ -76,6 +76,7 @@ CREATE INDEX IF NOT EXISTS market_scenarios_latest_idx
 
 CREATE TABLE IF NOT EXISTS scenario_live_state (
     symbol TEXT PRIMARY KEY,
+    scenario_version TEXT,
     last_m5_ts TIMESTAMPTZ,
     last_price DOUBLE PRECISION,
     last_entry_score SMALLINT,
@@ -92,6 +93,9 @@ ALTER TABLE scenario_live_state
 
 ALTER TABLE scenario_live_state
     ADD COLUMN IF NOT EXISTS last_deriv_score SMALLINT;
+
+ALTER TABLE scenario_live_state
+    ADD COLUMN IF NOT EXISTS scenario_version TEXT;
 
 CREATE TABLE IF NOT EXISTS scenario_live_alerts (
     id BIGSERIAL PRIMARY KEY,
@@ -120,6 +124,26 @@ CREATE TABLE IF NOT EXISTS scenario_outcomes (
     invalidated BOOLEAN NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (scenario_id, horizon_bars)
+);
+
+CREATE TABLE IF NOT EXISTS scenario_calibration (
+    algorithm_version TEXT NOT NULL,
+    bias TEXT NOT NULL,
+    direction_band SMALLINT NOT NULL,
+    setup_band SMALLINT NOT NULL,
+    entry_band SMALLINT NOT NULL,
+    horizon_bars INTEGER NOT NULL,
+    n INTEGER NOT NULL,
+    directional_winrate DOUBLE PRECISION NOT NULL,
+    target_rate DOUBLE PRECISION,
+    invalidation_rate DOUBLE PRECISION NOT NULL,
+    avg_return_pct DOUBLE PRECISION NOT NULL,
+    avg_mfe_pct DOUBLE PRECISION NOT NULL,
+    avg_mae_pct DOUBLE PRECISION NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (
+        algorithm_version,bias,direction_band,setup_band,entry_band,horizon_bars
+    )
 );
 
 COMMIT;

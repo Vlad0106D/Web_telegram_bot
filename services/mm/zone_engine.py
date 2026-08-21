@@ -250,6 +250,80 @@ def replay_zones(
     return zones
 
 
+def replay_zone_states(
+    candles: Iterable[Candle],
+    *,
+    symbol: str,
+    tf: str,
+    config: Optional[ZoneConfig] = None,
+    limit_per_side: int = 3,
+    event_limit: int = 8,
+) -> Dict[datetime, Tuple[List[dict], List[dict]]]:
+    """Return point-in-time zone maps without exposing future zone lifecycle."""
+    cfg = config or ZoneConfig()
+    tf_seconds = {"H1": 3600, "H4": 14_400, "D1": 86_400, "W1": 604_800}.get(
+        tf, 3600
+    )
+    bars = sorted(list(candles), key=lambda x: x.ts)
+    zones: List[LiquidityZone] = []
+    outside: Dict[str, int] = {}
+    history: Dict[datetime, Tuple[List[dict], List[dict]]] = {}
+    for current_idx, candle in enumerate(bars):
+        pivot_idx = current_idx - cfg.pivot_window
+        if pivot_idx >= cfg.pivot_window:
+            for side in ("upper", "lower"):
+                if _pivot(bars[: current_idx + 1], pivot_idx, side, cfg.pivot_window):
+                    _merge_or_add(
+                        zones,
+                        _new_zone(symbol, tf, bars[pivot_idx], candle.ts, side, cfg),
+                        cfg,
+                    )
+        previous = bars[current_idx - 1] if current_idx else None
+        for zone in zones:
+            outside[zone.zone_key] = _advance(
+                zone, candle, previous, outside.get(zone.zone_key, 0), cfg
+            )
+            age = max(
+                0, int((candle.ts - zone.confirmed_ts).total_seconds() // tf_seconds)
+            )
+            if zone.status in ("active", "touched") and age >= cfg.max_age_bars:
+                zone.status = "expired"
+                zone.closed_ts = candle.ts
+                zone.last_event_ts = candle.ts
+                zone.events.append(ZoneEvent(candle.ts, "expire", candle.close))
+
+        upper, lower = active_zone_map(zones, candle.close, limit=limit_per_side)
+        zone_rows = [
+            {
+                "tf": tf,
+                "side": zone.side,
+                "lower_price": zone.lower_price,
+                "upper_price": zone.upper_price,
+                "center_price": zone.center_price,
+                "strength": zone.strength,
+                "status": zone.status,
+            }
+            for zone in (upper + lower)
+        ]
+        event_rows = sorted(
+            (
+                {
+                    "event_ts": event.event_ts,
+                    "event_type": event.event_type,
+                    "side": zone.side,
+                    "center_price": zone.center_price,
+                    "strength": zone.strength,
+                }
+                for zone in zones
+                for event in zone.events
+                if event.event_type in ("sweep", "reclaim", "accept")
+            ),
+            key=lambda event: event["event_ts"],
+        )[-event_limit:]
+        history[candle.ts] = (zone_rows, event_rows)
+    return history
+
+
 def active_zone_map(
     zones: Sequence[LiquidityZone], price: float, limit: int = 3
 ) -> Tuple[List[LiquidityZone], List[LiquidityZone]]:
