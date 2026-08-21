@@ -12,10 +12,16 @@ from services.outcomes.deriv_alerts import maybe_send_deriv_alert
 
 log = logging.getLogger(__name__)
 
-DERIV_AUTO_ENABLED_ENV = (os.getenv("DERIV_AUTO_ENABLED", "1").strip() == "1")
+DERIV_AUTO_ENABLED_ENV = os.getenv("DERIV_AUTO_ENABLED", "1").strip() == "1"
+DERIV_ALERT_ENABLED_ENV = os.getenv("DERIV_ALERT_ENABLED", "0").strip() == "1"
+LEGACY_ALERTS_ENABLED_ENV = (
+    os.getenv("LEGACY_OUTCOMES_ALERTS_ENABLED", "0").strip() == "1"
+)
 
 # по умолчанию раз в 6ч
-DERIV_REFRESH_SEC = int((os.getenv("DERIV_REFRESH_SEC", str(6 * 60 * 60)).strip() or str(6 * 60 * 60)))
+DERIV_REFRESH_SEC = int(
+    (os.getenv("DERIV_REFRESH_SEC", str(6 * 60 * 60)).strip() or str(6 * 60 * 60))
+)
 
 # check алертов по умолчанию раз в 60 сек
 DERIV_ALERT_CHECK_SEC = int((os.getenv("DERIV_ALERT_CHECK_SEC", "60").strip() or "60"))
@@ -62,7 +68,11 @@ async def _deriv_auto_refresh_tick(app: Application) -> None:
 
 
 async def _deriv_auto_alert_tick(app: Application) -> None:
-    if not _deriv_is_enabled(app):
+    if (
+        not _deriv_is_enabled(app)
+        or not DERIV_ALERT_ENABLED_ENV
+        or not LEGACY_ALERTS_ENABLED_ENV
+    ):
         return
 
     if DERIV_ALERT_CHAT_ID is None:
@@ -116,20 +126,21 @@ def schedule_deriv_auto(app: Application) -> List[str]:
     )
     created.append(name_refresh)
 
-    name_alert = "deriv_auto_alert"
-    jq.run_repeating(
-        callback=lambda ctx: _deriv_auto_alert_tick(ctx.application),
-        interval=int(DERIV_ALERT_CHECK_SEC),
-        first=50,
-        name=name_alert,
-        job_kwargs={**job_kwargs, "misfire_grace_time": 30},
-    )
-    created.append(name_alert)
+    if DERIV_ALERT_ENABLED_ENV and LEGACY_ALERTS_ENABLED_ENV:
+        name_alert = "deriv_auto_alert"
+        jq.run_repeating(
+            callback=lambda ctx: _deriv_auto_alert_tick(ctx.application),
+            interval=int(DERIV_ALERT_CHECK_SEC),
+            first=50,
+            name=name_alert,
+            job_kwargs={**job_kwargs, "misfire_grace_time": 30},
+        )
+        created.append(name_alert)
 
     log.info(
-        "DERIV auto scheduled: refresh every %ss | alert_check every %ss | chat_id=%s",
+        "DERIV auto scheduled: refresh every %ss | legacy_alerts=%s | chat_id=%s",
         int(DERIV_REFRESH_SEC),
-        int(DERIV_ALERT_CHECK_SEC),
+        DERIV_ALERT_ENABLED_ENV and LEGACY_ALERTS_ENABLED_ENV,
         DERIV_ALERT_CHAT_ID,
     )
     return created

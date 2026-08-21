@@ -164,6 +164,28 @@ def _report_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> boo
     return bool(last_ts and last_ts == ts)
 
 
+def _scenario_already_sent(conn: psycopg.Connection, tf: str, ts: datetime) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT 1 FROM mm_events
+               WHERE symbol='BTC-USDT' AND tf=%s AND ts=%s
+                 AND event_type='scenario_sent' LIMIT 1""",
+            (tf, ts),
+        )
+        return cur.fetchone() is not None
+
+
+def _mark_scenario_sent(
+    conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO mm_events (ts, tf, symbol, event_type, payload_json)
+               VALUES (%s,%s,'BTC-USDT','scenario_sent',%s)""",
+            (ts, tf, Jsonb(payload)),
+        )
+
+
 def _mark_report_sent(
     conn: psycopg.Connection, tf: str, ts: datetime, payload: Dict[str, Any]
 ) -> None:
@@ -664,7 +686,12 @@ async def _mm_auto_tick(app: Application) -> None:
                         log.exception("MM auto: action persistence failed tf=%s", tf)
 
                 # отчёт уже отправляли на этот ts?
-                if _report_already_sent(conn, tf, view.ts):
+                already_sent = (
+                    _scenario_already_sent(conn, tf, view.ts)
+                    if tf == "H1"
+                    else _report_already_sent(conn, tf, view.ts)
+                )
+                if already_sent:
                     # ✅ прошли успешно → фиксируем seen
                     if tf not in ("D1", "W1"):
                         seen[tf] = _iso(view.ts)
@@ -686,7 +713,10 @@ async def _mm_auto_tick(app: Application) -> None:
                     "report_ts": view.ts.isoformat(),
                     "sent_at": datetime.now(timezone.utc).isoformat(),
                 }
-                _mark_report_sent(conn, tf, view.ts, payload)
+                if tf == "H1":
+                    _mark_scenario_sent(conn, tf, view.ts, payload)
+                else:
+                    _mark_report_sent(conn, tf, view.ts, payload)
                 conn.commit()
 
                 log.info("MM report sent tf=%s ts=%s", tf, view.ts)

@@ -59,6 +59,9 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("Setup:", text)
         self.assertIn("Entry:", text)
         self.assertIn("Инвалидация:", text)
+        self.assertIn("Карта ликвидности:", text)
+        self.assertIn("Сверху:", text)
+        self.assertIn("Снизу:", text)
 
     def test_deriv_cannot_create_bias_without_market_structure(self):
         result = build_scenario(
