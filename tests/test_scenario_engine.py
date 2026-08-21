@@ -60,6 +60,53 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("Entry:", text)
         self.assertIn("Инвалидация:", text)
 
+    def test_deriv_cannot_create_bias_without_market_structure(self):
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H1",
+            ts=NOW,
+            price=100,
+            zones=[],
+            events=[],
+            deriv_score=90,
+        )
+        self.assertEqual(result.bias, "neutral")
+        self.assertEqual(result.state, "no_trade")
+
+    def test_missing_invalidation_cannot_be_setup_watch(self):
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H1",
+            ts=NOW,
+            price=100,
+            zones=[{"side": "upper", "center_price": 103.0, "strength": 80}],
+            events=[{"side": None, "event_type": "accept_above", "event_ts": NOW}],
+            deriv_score=84,
+        )
+        self.assertEqual(result.bias, "long")
+        self.assertEqual(result.state, "context_update")
+        self.assertLess(result.setup_score, 50)
+
+    def test_conflicting_chain_reduces_setup(self):
+        zones = [
+            {"side": "upper", "center_price": 103.0, "strength": 80},
+            {"side": "lower", "center_price": 98.0, "strength": 70},
+        ]
+        events = [
+            {"side": None, "event_type": "accept_above", "event_ts": NOW},
+            {"side": None, "event_type": "pressure_down", "event_ts": NOW},
+        ]
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H1",
+            ts=NOW,
+            price=100,
+            zones=zones,
+            events=events,
+            deriv_score=84,
+        )
+        self.assertTrue(any("противоречивая" in reason for reason in result.reasons))
+
 
 if __name__ == "__main__":
     unittest.main()
