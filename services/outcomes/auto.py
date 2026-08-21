@@ -12,10 +12,16 @@ from services.outcomes.alerts import maybe_send_edge_alert
 
 log = logging.getLogger(__name__)
 
-EDGE_AUTO_ENABLED_ENV = (os.getenv("EDGE_AUTO_ENABLED", "1").strip() == "1")
+EDGE_AUTO_ENABLED_ENV = os.getenv("EDGE_AUTO_ENABLED", "1").strip() == "1"
+EDGE_ALERT_ENABLED_ENV = os.getenv("EDGE_ALERT_ENABLED", "0").strip() == "1"
+LEGACY_ALERTS_ENABLED_ENV = (
+    os.getenv("LEGACY_OUTCOMES_ALERTS_ENABLED", "0").strip() == "1"
+)
 
 # Как часто обновлять витрину (сек). По умолчанию 6 часов.
-EDGE_REFRESH_SEC = int((os.getenv("EDGE_REFRESH_SEC", str(6 * 60 * 60)).strip() or str(6 * 60 * 60)))
+EDGE_REFRESH_SEC = int(
+    (os.getenv("EDGE_REFRESH_SEC", str(6 * 60 * 60)).strip() or str(6 * 60 * 60))
+)
 
 # Как часто проверять триггеры алерта (сек). По умолчанию 60 сек.
 EDGE_ALERT_CHECK_SEC = int((os.getenv("EDGE_ALERT_CHECK_SEC", "60").strip() or "60"))
@@ -64,7 +70,11 @@ async def _edge_auto_refresh_tick(app: Application) -> None:
 
 
 async def _edge_auto_alert_tick(app: Application) -> None:
-    if not _edge_is_enabled(app):
+    if (
+        not _edge_is_enabled(app)
+        or not EDGE_ALERT_ENABLED_ENV
+        or not LEGACY_ALERTS_ENABLED_ENV
+    ):
         return
 
     if EDGE_ALERT_CHAT_ID is None:
@@ -119,24 +129,21 @@ def schedule_edge_auto(app: Application) -> List[str]:
     )
     created.append(name_refresh)
 
-    # 2) частый check на триггеры (но отправка только при изменениях/усилении)
-    name_alert = "edge_auto_alert"
-    jq.run_repeating(
-        callback=lambda ctx: _edge_auto_alert_tick(ctx.application),
-        interval=int(EDGE_ALERT_CHECK_SEC),
-        first=45,
-        name=name_alert,
-        job_kwargs={
-            **job_kwargs,
-            "misfire_grace_time": 30,
-        },
-    )
-    created.append(name_alert)
+    if EDGE_ALERT_ENABLED_ENV and LEGACY_ALERTS_ENABLED_ENV:
+        name_alert = "edge_auto_alert"
+        jq.run_repeating(
+            callback=lambda ctx: _edge_auto_alert_tick(ctx.application),
+            interval=int(EDGE_ALERT_CHECK_SEC),
+            first=45,
+            name=name_alert,
+            job_kwargs={**job_kwargs, "misfire_grace_time": 30},
+        )
+        created.append(name_alert)
 
     log.info(
-        "EDGE auto scheduled: refresh every %ss | alert_check every %ss | chat_id=%s",
+        "EDGE auto scheduled: refresh every %ss | legacy_alerts=%s | chat_id=%s",
         int(EDGE_REFRESH_SEC),
-        int(EDGE_ALERT_CHECK_SEC),
+        EDGE_ALERT_ENABLED_ENV and LEGACY_ALERTS_ENABLED_ENV,
         EDGE_ALERT_CHAT_ID,
     )
     return created

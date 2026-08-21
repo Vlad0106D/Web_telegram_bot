@@ -33,6 +33,8 @@ class MarketScenario:
     reasons: List[str] = field(default_factory=list)
     targets: List[float] = field(default_factory=list)
     alternative_targets: List[float] = field(default_factory=list)
+    upper_zones: List[dict] = field(default_factory=list)
+    lower_zones: List[dict] = field(default_factory=list)
     invalidation_price: Optional[float] = None
     entry_low: Optional[float] = None
     entry_high: Optional[float] = None
@@ -250,6 +252,15 @@ def build_scenario(
     targets, alternatives, invalidation, entry_low, entry_high = _derive_levels(
         bias, zones, price
     )
+    upper_zones = sorted(
+        (dict(z) for z in zones if z["side"] == "upper"),
+        key=lambda z: float(z["center_price"]),
+    )
+    lower_zones = sorted(
+        (dict(z) for z in zones if z["side"] == "lower"),
+        key=lambda z: float(z["center_price"]),
+        reverse=True,
+    )
     entry = _entry_score(bias, price, targets[0] if targets else None, invalidation)
     has_trade_plan = bool(targets and invalidation is not None)
     if not has_trade_plan:
@@ -280,6 +291,8 @@ def build_scenario(
         reasons=(event_reasons + zone_reasons + conflict_reasons + deriv_reasons)[:5],
         targets=targets,
         alternative_targets=alternatives,
+        upper_zones=upper_zones,
+        lower_zones=lower_zones,
         invalidation_price=invalidation,
         entry_low=entry_low,
         entry_high=entry_high,
@@ -328,6 +341,29 @@ def render_scenario(s: MarketScenario) -> str:
         lines += ["", "🔗 Цепочка:", " → ".join(s.event_chain)]
     if s.reasons:
         lines += ["", "🔍 Основания:"] + [f"• {x}" for x in s.reasons]
+    lines += ["", "🧲 Карта ликвидности:"]
+    if s.upper_zones:
+        lines.append("Сверху:")
+        for zone in s.upper_zones:
+            distance = (float(zone["center_price"]) / s.price - 1.0) * 100
+            lines.append(
+                f"• {_fmt_price(float(zone['center_price']))} | "
+                f"+{distance:.2f}% | сила {int(zone['strength'])}/100 | "
+                f"{zone.get('status', 'active')}"
+            )
+    else:
+        lines.append("Сверху: активных зон нет")
+    if s.lower_zones:
+        lines.append("Снизу:")
+        for zone in s.lower_zones:
+            distance = (float(zone["center_price"]) / s.price - 1.0) * 100
+            lines.append(
+                f"• {_fmt_price(float(zone['center_price']))} | "
+                f"{distance:.2f}% | сила {int(zone['strength'])}/100 | "
+                f"{zone.get('status', 'active')}"
+            )
+    else:
+        lines.append("Снизу: активных зон нет")
     if s.bias != "neutral":
         lines += ["", f"🎯 Основной сценарий — {s.primary_probability}%"]
         if s.entry_low is not None:
