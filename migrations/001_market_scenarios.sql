@@ -74,6 +74,40 @@ CREATE TABLE IF NOT EXISTS market_scenarios (
 CREATE INDEX IF NOT EXISTS market_scenarios_latest_idx
     ON market_scenarios (symbol, tf, scenario_ts DESC);
 
+CREATE TABLE IF NOT EXISTS scenario_live_state (
+    symbol TEXT PRIMARY KEY,
+    last_m5_ts TIMESTAMPTZ,
+    last_price DOUBLE PRECISION,
+    last_entry_score SMALLINT,
+    last_bias TEXT,
+    pending_sweep_type TEXT,
+    pending_level DOUBLE PRECISION,
+    pending_outside_count INTEGER NOT NULL DEFAULT 0,
+    last_deriv_score SMALLINT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE scenario_live_state
+    ADD COLUMN IF NOT EXISTS pending_outside_count INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE scenario_live_state
+    ADD COLUMN IF NOT EXISTS last_deriv_score SMALLINT;
+
+CREATE TABLE IF NOT EXISTS scenario_live_alerts (
+    id BIGSERIAL PRIMARY KEY,
+    fingerprint TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    m5_ts TIMESTAMPTZ NOT NULL,
+    event_type TEXT NOT NULL,
+    price DOUBLE PRECISION NOT NULL,
+    entry_score SMALLINT NOT NULL,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS scenario_live_alerts_timeline_idx
+    ON scenario_live_alerts (symbol, m5_ts DESC);
+
 CREATE TABLE IF NOT EXISTS scenario_outcomes (
     id BIGSERIAL PRIMARY KEY,
     scenario_id BIGINT NOT NULL REFERENCES market_scenarios(id) ON DELETE CASCADE,

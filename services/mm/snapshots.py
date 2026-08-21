@@ -31,6 +31,7 @@ def _db_url() -> str:
 def _tf_to_okx(tf: str) -> str:
     # ВАЖНО: для D1/W1 используем UTC бары, иначе OKX может отдавать "не то закрытие"
     m = {
+        "M5": "5m",
         "H1": "1H",
         "H4": "4H",
         "D1": "1Dutc",
@@ -42,6 +43,8 @@ def _tf_to_okx(tf: str) -> str:
 
 
 def _tf_seconds(tf: str) -> int:
+    if tf == "M5":
+        return 5 * 60
     if tf == "H1":
         return 3600
     if tf == "H4":
@@ -60,6 +63,10 @@ def _swap_inst_id(spot_symbol: str) -> str:
 
 def _floor_ts(tf: str, ts: datetime) -> datetime:
     ts = ts.astimezone(timezone.utc).replace(microsecond=0)
+
+    if tf == "M5":
+        minute = (ts.minute // 5) * 5
+        return ts.replace(minute=minute, second=0)
 
     if tf == "H1":
         return ts.replace(minute=0, second=0)

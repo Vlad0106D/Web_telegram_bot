@@ -45,6 +45,8 @@ class MarketScenario:
     entry_low: Optional[float] = None
     entry_high: Optional[float] = None
     deriv_note: str = "данных недостаточно"
+    deriv_score: Optional[int] = None
+    entry_breakdown: dict = field(default_factory=dict)
 
 
 EVENT_LABELS = {
@@ -163,30 +165,85 @@ def _derive_levels(
         return [], [], None, None, None
     if invalidation is None:
         return targets, alternatives, None, None, None
-    width = abs(invalidation - price) * 0.35
+    pullback_depth = abs(invalidation - price) * 0.35
     if bias == "long":
-        entry_low, entry_high = price - width, price
+        entry_low, entry_high = invalidation, invalidation + pullback_depth
     else:
-        entry_low, entry_high = price, price + width
+        entry_low, entry_high = invalidation - pullback_depth, invalidation
     return targets, alternatives, invalidation, entry_low, entry_high
 
 
-def _entry_score(
-    bias: Bias, price: float, target: Optional[float], invalidation: Optional[float]
-) -> int:
+def score_entry_readiness(
+    bias: Bias,
+    price: float,
+    target: Optional[float],
+    invalidation: Optional[float],
+    event_chain: Sequence[str],
+    deriv_score: Optional[int],
+) -> Tuple[int, dict]:
     if bias == "neutral" or target is None or invalidation is None:
-        return 15
+        return 10, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
     risk = abs(price - invalidation)
     reward = abs(target - price)
-    if risk <= 0:
-        return 10
+    if risk <= 0 or reward <= 0:
+        return 5, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
+    valid_levels = (bias == "long" and invalidation < price < target) or (
+        bias == "short" and target < price < invalidation
+    )
+    if not valid_levels:
+        return 5, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
+
     rr = reward / risk
-    score = 25 + min(50, rr * 22)
-    if (bias == "long" and invalidation >= price) or (
-        bias == "short" and invalidation <= price
-    ):
-        return 10
-    return _clamp(score)
+    position = _clamp(min(30.0, 30.0 * reward / (reward + risk)))
+    rr_score = _clamp(min(20.0, rr / 2.0 * 20.0))
+
+    chain = set(event_chain)
+    aligned_reclaim = "reclaim up" if bias == "long" else "reclaim down"
+    aligned_accept = "accept above" if bias == "long" else "accept below"
+    aligned_sweep = "sweep low" if bias == "long" else "sweep high"
+    aligned_pressure = "pressure up" if bias == "long" else "pressure down"
+    opposite = (
+        {"reclaim down", "accept below", "pressure down"}
+        if bias == "long"
+        else {"reclaim up", "accept above", "pressure up"}
+    )
+    if aligned_reclaim in chain:
+        structure = 30
+    elif aligned_accept in chain:
+        structure = 25
+    elif aligned_sweep in chain:
+        structure = 14
+    elif aligned_pressure in chain:
+        structure = 9
+    else:
+        structure = 0
+    if opposite.intersection(chain):
+        structure = max(0, structure - 10)
+
+    confirmation = 0
+    if aligned_pressure in chain:
+        confirmation += 8
+    if aligned_reclaim in chain or aligned_accept in chain:
+        confirmation += 6
+    if deriv_score is not None:
+        deriv_aligned = (bias == "long" and deriv_score >= 65) or (
+            bias == "short" and deriv_score <= 35
+        )
+        deriv_opposed = (bias == "long" and deriv_score <= 35) or (
+            bias == "short" and deriv_score >= 65
+        )
+        if deriv_aligned:
+            confirmation += 6
+        elif deriv_opposed:
+            confirmation -= 6
+    confirmation = _clamp(min(20, max(0, confirmation)))
+    breakdown = {
+        "position": position,
+        "structure": structure,
+        "rr": rr_score,
+        "confirmation": confirmation,
+    }
+    return _clamp(sum(breakdown.values())), breakdown
 
 
 def build_scenario(
@@ -267,7 +324,14 @@ def build_scenario(
         key=lambda z: float(z["center_price"]),
         reverse=True,
     )
-    entry = _entry_score(bias, price, targets[0] if targets else None, invalidation)
+    entry, entry_breakdown = score_entry_readiness(
+        bias,
+        price,
+        targets[0] if targets else None,
+        invalidation,
+        chain,
+        deriv_score,
+    )
     has_trade_plan = bool(targets and invalidation is not None)
     if not has_trade_plan:
         setup = min(setup, 49)
@@ -303,6 +367,8 @@ def build_scenario(
         entry_low=entry_low,
         entry_high=entry_high,
         deriv_note=deriv_note,
+        deriv_score=deriv_score,
+        entry_breakdown=entry_breakdown,
     )
 
 
@@ -318,9 +384,30 @@ def _zone_line(zone: dict, price: float) -> str:
     distance_text = f"{distance:+.2f}%"
     tf = zone.get("tf")
     tf_text = f"{tf} | " if tf else ""
+    status = {
+        "active": "активная",
+        "touched": "касание",
+        "swept": "свип",
+        "reclaimed": "реклейм",
+        "accepted": "поглощена",
+        "expired": "историческая",
+    }.get(str(zone.get("status", "active")), str(zone.get("status", "active")))
     return (
         f"• {_fmt_price(center)} | {distance_text} | {tf_text}"
-        f"сила {int(zone['strength'])}/100 | {zone.get('status', 'active')}"
+        f"сила {int(zone['strength'])}/100 | {status}"
+    )
+
+
+def _nearest_per_side(zones: Sequence[dict], price: float, limit: int) -> List[dict]:
+    selected: List[dict] = []
+    for side in ("upper", "lower"):
+        side_zones = sorted(
+            (zone for zone in zones if zone.get("side") == side),
+            key=lambda zone: abs(float(zone["center_price"]) - price),
+        )
+        selected.extend(side_zones[:limit])
+    return sorted(
+        selected, key=lambda zone: abs(float(zone["center_price"]) - price)
     )
 
 
@@ -353,6 +440,12 @@ def render_scenario(s: MarketScenario) -> str:
         f"Direction: {s.direction_score}/100",
         f"Setup: {s.setup_score}/100",
         f"Entry: {s.entry_score}/100",
+        "↳ Позиция/структура: "
+        f"{s.entry_breakdown.get('position', 0)}/30 · "
+        f"{s.entry_breakdown.get('structure', 0)}/30",
+        "↳ RR/подтверждение: "
+        f"{s.entry_breakdown.get('rr', 0)}/20 · "
+        f"{s.entry_breakdown.get('confirmation', 0)}/20",
         f"Решение: {action}",
     ]
     if s.event_chain:
@@ -372,13 +465,15 @@ def render_scenario(s: MarketScenario) -> str:
             lines.append(_zone_line(zone, s.price))
     else:
         lines.append("Снизу: активных зон нет")
-    if s.historical_zones:
+    historical_display = _nearest_per_side(s.historical_zones, s.price, 1)
+    if historical_display:
         lines.append("Историческая структура H1 (не торговые цели):")
-        for zone in s.historical_zones:
+        for zone in historical_display:
             lines.append(_zone_line(zone, s.price))
-    if s.higher_tf_zones:
+    higher_display = _nearest_per_side(s.higher_tf_zones, s.price, 2)
+    if higher_display:
         lines.append("Старшие зоны H4/D1:")
-        for zone in s.higher_tf_zones:
+        for zone in higher_display:
             lines.append(_zone_line(zone, s.price))
     if s.bias != "neutral":
         lines += ["", f"🎯 Основной сценарий — {s.primary_probability}%"]
@@ -386,7 +481,10 @@ def render_scenario(s: MarketScenario) -> str:
             lines.append(
                 f"Входная область: {_fmt_price(s.entry_low)}–{_fmt_price(s.entry_high)}"
             )
-        lines.append(f"Инвалидация: {_fmt_price(s.invalidation_price)}")
+        if s.invalidation_price is None:
+            lines.append("Инвалидация: не определена — активной встречной H1-зоны нет")
+        else:
+            lines.append(f"Инвалидация: {_fmt_price(s.invalidation_price)}")
         if s.targets:
             lines += ["Цели:"] + [
                 f"{i}. {_fmt_price(x)}" for i, x in enumerate(s.targets, 1)
@@ -505,6 +603,7 @@ def persist_scenario(s: MarketScenario) -> bool:
         "alternative_targets": s.alternative_targets,
         "deriv_note": s.deriv_note,
         "zone_version": ZONE_VERSION,
+        "entry_breakdown": s.entry_breakdown,
         "active_zones": [
             zone_payload(zone) for zone in (s.upper_zones + s.lower_zones)
         ],

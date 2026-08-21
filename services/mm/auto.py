@@ -19,6 +19,11 @@ from services.mm.market_events_detector import detect_and_store_market_events
 from services.mm.liquidity_events_detector import (
     detect_and_store_liquidity_events,
 )  # ✅ NEW
+from services.mm.live_alerts import (
+    LIVE_ALERT_INTERVAL_SEC,
+    LIVE_ALERTS_ENABLED,
+    live_event_tick,
+)
 from services.mm.action_engine import compute_action  # ✅ MTF-aware decision
 from services.outcomes.backfill import backfill_outcomes_once  # ✅ auto outcomes
 from services.mm.scenario_engine import (
@@ -786,6 +791,21 @@ def schedule_mm_auto(app: Application) -> List[str]:
         job_kwargs=job_kwargs,
     )
     created.append(name)
+
+    if LIVE_ALERTS_ENABLED:
+        live_name = "mm_auto_live_events"
+        jq.run_repeating(
+            callback=lambda ctx: live_event_tick(ctx.application),
+            interval=max(60, LIVE_ALERT_INTERVAL_SEC),
+            first=75,
+            name=live_name,
+            job_kwargs={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 60,
+            },
+        )
+        created.append(live_name)
 
     log.info(
         "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",
