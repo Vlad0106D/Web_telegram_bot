@@ -148,6 +148,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "MM:\n"
         "• /mm_on /mm_off /mm_status /mm_report\n"
         "• /mm_snapshots — запись снапшотов\n\n"
+        "• /scenario_now — текущий рыночный сценарий\n\n"
         "Outcomes:\n"
         "• /edge_now — Edge (0–100)\n"
         "• /edge_refresh — обновить витрину Edge\n"
@@ -165,6 +166,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/watch_on, /watch_off, /watch_status, "
         "/tt_on, /tt_off, /tt_status, "
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
+        "/scenario_now, "
         "/edge_now, /edge_refresh, "
         "/deriv_now, /deriv_refresh"
     )

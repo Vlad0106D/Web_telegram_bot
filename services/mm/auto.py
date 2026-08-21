@@ -19,6 +19,10 @@ from services.mm.market_events_detector import detect_and_store_market_events
 from services.mm.liquidity_events_detector import detect_and_store_liquidity_events  # ✅ NEW
 from services.mm.action_engine import compute_action  # ✅ MTF-aware decision
 from services.outcomes.backfill import backfill_outcomes_once  # ✅ auto outcomes
+from services.mm.scenario_engine import build_current_scenario, persist_scenario, render_scenario
+from services.mm.scenario_schema import ensure_scenario_schema
+from services.mm.scenario_outcomes import backfill_scenario_outcomes
+from services.mm.zone_store import rebuild_zones
 
 log = logging.getLogger(__name__)
 
@@ -541,6 +545,14 @@ async def _mm_auto_tick(app: Application) -> None:
                     log.exception("MM auto: market events failed for tf=%s", tf)
                     # не критично для отчёта — продолжаем
 
+                # 3.5) Versioned zone lifecycle; chronological and idempotent.
+                try:
+                    zone_result = rebuild_zones("BTC-USDT", tf, until=latest_ts)
+                    log.info("MM zone engine %s: %s", tf, zone_result)
+                except Exception:
+                    log.exception("MM auto: zone engine failed tf=%s", tf)
+                    continue
+
                 # 4) REPORTS + ACTION ENGINE persistence/eval
                 latest_ts = _get_latest_snapshot_ts(conn, tf)
                 if latest_ts is None:
@@ -616,7 +628,13 @@ async def _mm_auto_tick(app: Application) -> None:
                     continue
 
                 # отправляем отчёт
-                text = render_report(view)
+                if tf == "H1":
+                    scenario = build_current_scenario("BTC-USDT", "H1")
+                    persist_scenario(scenario)
+                    backfill_scenario_outcomes()
+                    text = render_scenario(scenario)
+                else:
+                    text = render_report(view)
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
                 payload = {
@@ -647,6 +665,8 @@ def schedule_mm_auto(app: Application) -> List[str]:
     if not MM_AUTO_ENABLED_ENV:
         log.warning("MM_AUTO_ENABLED=0 — mm auto disabled")
         return created
+
+    ensure_scenario_schema()
 
     if "mm_enabled" not in app.bot_data:
         app.bot_data["mm_enabled"] = True
