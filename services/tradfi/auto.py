@@ -71,6 +71,8 @@ def _payload(a: Dict) -> Dict:
         "trigger": a["trigger_text"], "higher_bias": a.get("higher_bias"),
         "setup_type": a.get("setup_type"), "long_score": a.get("long_score"),
         "short_score": a.get("short_score"), "event_chain": a.get("event_chain", []),
+        "upper_zone": a.get("upper_zone"), "lower_zone": a.get("lower_zone"),
+        "active_zone": a.get("active_zone"),
     }
 
 

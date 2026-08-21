@@ -78,100 +78,163 @@ def _context(items: Sequence[Candle]) -> Tuple[str, int]:
     return "диапазон / конфликт", 0
 
 
-def _levels(price: float, sets: Sequence[Sequence[Candle]]) -> Tuple[Optional[float], Optional[float]]:
-    levels = []
-    for items in sets:
-        for i in range(2, len(items) - 2):
-            part = items[i - 2:i] + items[i + 1:i + 3]
-            if all(items[i].h >= x.h for x in part):
-                levels.append(items[i].h)
-            if all(items[i].l <= x.l for x in part):
-                levels.append(items[i].l)
-    above = sorted({x for x in levels[-80:] if x > price})
-    below = sorted({x for x in levels[-80:] if x < price}, reverse=True)
-    return (above[0] if above else None, below[0] if below else None)
+def _swing_centers(items: Sequence[Candle]) -> List[Tuple[float, int]]:
+    result: List[Tuple[float, int]] = []
+    for i in range(2, len(items) - 2):
+        neighbours = items[i - 2:i] + items[i + 1:i + 3]
+        if all(items[i].h >= x.h for x in neighbours):
+            result.append((items[i].h, i))
+        if all(items[i].l <= x.l for x in neighbours):
+            result.append((items[i].l, i))
+    return result
 
 
-def _event_chain(items: Sequence[Candle], side: str, level: Optional[float], atr: float) -> Tuple[List[str], int]:
-    if level is None or len(items) < 8:
+def _build_zones(candles: Dict[str, List[Candle]]) -> List[Dict]:
+    atr_h1, atr_m15 = _atr(candles["H1"]), _atr(candles["M15"])
+    raw: List[Dict] = []
+    for tf, base, fraction, atr in (
+        ("H1", 70, .08, atr_h1),
+        ("M15", 45, .12, atr_m15),
+    ):
+        swings = _swing_centers(candles[tf])[-24:]
+        half_width = max(.08, fraction * atr)
+        total = len(candles[tf])
+        for center, index in swings:
+            age = total - 1 - index
+            recency = max(-15, -age // 12)
+            raw.append({
+                "tf": tf, "sources": [tf], "center": center,
+                "low": center - half_width, "high": center + half_width,
+                "strength": max(20, base + recency),
+            })
+    raw.sort(key=lambda z: z["center"])
+    merge_distance = max(.10, .15 * atr_m15)
+    clusters: List[Dict] = []
+    for zone in raw:
+        if clusters and zone["low"] <= clusters[-1]["high"] + merge_distance:
+            current = clusters[-1]
+            old_weight, new_weight = current["strength"], zone["strength"]
+            current["center"] = (
+                current["center"] * old_weight + zone["center"] * new_weight
+            ) / (old_weight + new_weight)
+            current["low"] = min(current["low"], zone["low"])
+            current["high"] = max(current["high"], zone["high"])
+            current["sources"] = sorted(set(current["sources"] + zone["sources"]))
+            current["tf"] = "+".join(current["sources"])
+            confluence = 20 if len(current["sources"]) > 1 else 0
+            current["strength"] = min(100, max(old_weight, new_weight) + confluence)
+        else:
+            clusters.append(dict(zone))
+    return clusters
+
+
+def _working_zones(price: float, zones: Sequence[Dict], atr_m15: float) -> Tuple[Optional[Dict], Optional[Dict]]:
+    above = [z for z in zones if z["low"] > price]
+    below = [z for z in zones if z["high"] < price]
+    containing = [z for z in zones if z["low"] <= price <= z["high"]]
+    def priority(zone: Dict) -> float:
+        distance = 0.0 if zone["low"] <= price <= zone["high"] else min(
+            abs(price-zone["low"]), abs(price-zone["high"])
+        )
+        return zone["strength"] / (1 + distance / max(atr_m15, .01))
+    upper = max(above, key=priority) if above else None
+    lower = max(below, key=priority) if below else None
+    if containing:
+        active = max(containing, key=priority)
+        # The current zone may act as support for LONG and resistance for SHORT.
+        lower = lower or active
+        upper = upper or active
+    return upper, lower
+
+
+def _event_chain(items: Sequence[Candle], side: str, zone: Optional[Dict], atr: float) -> Tuple[List[str], int]:
+    if zone is None or len(items) < 8:
         return [], 0
     recent = items[-8:]
-    tolerance = max(0.05, atr * 0.12)
+    boundary = zone["low"] if side == "SHORT" else zone["high"]
+    tolerance = max(.05, atr * .12)
     chain: List[str] = []
     acceptance_at = None
     for i in range(1, len(recent)):
-        a, b = recent[i - 1], recent[i]
+        first, second = recent[i-1], recent[i]
         accepted = (
-            a.c < level - tolerance and b.c < level - tolerance
+            first.c < boundary-tolerance and second.c < boundary-tolerance
             if side == "SHORT"
-            else a.c > level + tolerance and b.c > level + tolerance
+            else first.c > boundary+tolerance and second.c > boundary+tolerance
         )
         if accepted and acceptance_at is None:
             acceptance_at = i
     if acceptance_at is not None:
-        chain.append("accept below" if side == "SHORT" else "accept above")
-        after = recent[acceptance_at + 1:]
-        for candle in after:
+        chain.append("accept below" if side=="SHORT" else "accept above")
+        for candle in recent[acceptance_at+1:]:
             retest = (
-                candle.h >= level - tolerance and candle.c < level
-                if side == "SHORT"
-                else candle.l <= level + tolerance and candle.c > level
+                candle.h >= boundary-tolerance and candle.c < boundary
+                if side=="SHORT"
+                else candle.l <= boundary+tolerance and candle.c > boundary
             )
             if retest:
-                chain.append("retest снизу" if side == "SHORT" else "retest сверху")
-                rejection = candle.c < candle.o if side == "SHORT" else candle.c > candle.o
-                if rejection:
-                    chain.append("bearish rejection" if side == "SHORT" else "bullish rejection")
+                chain.append("retest снизу" if side=="SHORT" else "retest сверху")
+                if (side=="SHORT" and candle.c<candle.o) or (side=="LONG" and candle.c>candle.o):
+                    chain.append("bearish rejection" if side=="SHORT" else "bullish rejection")
                 break
-    current = recent[-1]
-    previous = recent[-2]
+    current, previous = recent[-1], recent[-2]
     displacement = (
-        current.c < current.o and current.c <= current.l + .25 * max(current.h-current.l, 1e-9)
-        if side == "SHORT"
-        else current.c > current.o and current.c >= current.h - .25 * max(current.h-current.l, 1e-9)
+        current.c<current.o and current.c<=current.l+.25*max(current.h-current.l,1e-9)
+        if side=="SHORT" else
+        current.c>current.o and current.c>=current.h-.25*max(current.h-current.l,1e-9)
     )
     sweep = (
-        current.h > max(x.h for x in recent[-5:-1]) and current.c < previous.h
-        if side == "SHORT"
-        else current.l < min(x.l for x in recent[-5:-1]) and current.c > previous.l
+        current.h>max(x.h for x in recent[-5:-1]) and current.c<previous.h
+        if side=="SHORT" else
+        current.l<min(x.l for x in recent[-5:-1]) and current.c>previous.l
     )
     if sweep:
-        chain.append("sweep high" if side == "SHORT" else "sweep low")
+        chain.append("sweep high" if side=="SHORT" else "sweep low")
     if displacement:
-        chain.append("bearish displacement" if side == "SHORT" else "bullish displacement")
+        chain.append("bearish displacement" if side=="SHORT" else "bullish displacement")
     chain = list(dict.fromkeys(chain))
     score = min(25, (10 if any("accept" in x for x in chain) else 0)
-                + (8 if any("retest" in x for x in chain) else 0)
-                + (7 if any("rejection" in x for x in chain) else 0)
-                + (9 if any("displacement" in x for x in chain) else 0)
-                + (6 if any("sweep" in x for x in chain) else 0))
+                +(8 if any("retest" in x for x in chain) else 0)
+                +(7 if any("rejection" in x for x in chain) else 0)
+                +(9 if any("displacement" in x for x in chain) else 0)
+                +(6 if any("sweep" in x for x in chain) else 0))
     return chain, score
 
 
-def _side_plan(side: str, price: float, above: Optional[float], below: Optional[float],
+def _side_plan(side: str, price: float, upper_zone: Optional[Dict], lower_zone: Optional[Dict],
                atr1: float, atr5: float, votes: Dict[str, int],
                candles: Dict[str, List[Candle]]) -> Dict:
-    sign = 1 if side == "LONG" else -1
-    higher_raw = 2 * votes["H1"] + 2 * votes["M15"]
-    aligned = higher_raw * sign
-    setup_type = "TREND" if aligned > 0 else "COUNTERTREND" if aligned < 0 else "NEUTRAL"
-    level = below if side == "LONG" else above
-    target = above if side == "LONG" else below
-    chain, event_score = _event_chain(candles["M1"], side, level, atr1)
-    local = sign * (2 * votes["M5"] + votes["M1"])
-    context_score = 15 if aligned >= 3 else 10 if aligned > 0 else 5 if aligned < 0 else 7
-    structure_score = 20 if local >= 3 else 14 if local >= 1 else 5
-    proximity = 0 if level is None else max(0, min(15, round(15 * (1-abs(price-level)/max(1.5*atr5,.01)))))
-    buffer = max(.12, .35*atr1)
-    stop = (level-buffer if side=="LONG" else level+buffer) if level is not None else None
+    sign = 1 if side=="LONG" else -1
+    higher_raw = 2*votes["H1"] + 2*votes["M15"]
+    aligned = higher_raw*sign
+    setup_type = "TREND" if aligned>0 else "COUNTERTREND" if aligned<0 else "NEUTRAL"
+    working_zone = lower_zone if side=="LONG" else upper_zone
+    target_zone = upper_zone if side=="LONG" else lower_zone
+    chain, event_score = _event_chain(candles["M1"], side, working_zone, atr1)
+    local = sign*(2*votes["M5"]+votes["M1"])
+    context_score = 15 if aligned>=3 else 10 if aligned>0 else 5 if aligned<0 else 7
+    structure_score = 20 if local>=3 else 14 if local>=1 else 5
+    if working_zone is None:
+        proximity = 0
+    else:
+        distance = 0 if working_zone["low"]<=price<=working_zone["high"] else min(
+            abs(price-working_zone["low"]), abs(price-working_zone["high"])
+        )
+        proximity = max(0,min(15,round(15*(1-distance/max(1.5*atr5,.01)))))
+        proximity = round(proximity * working_zone["strength"]/100)
+    buffer = max(.12,.35*atr1)
+    stop = None
+    if working_zone is not None:
+        stop = working_zone["low"]-buffer if side=="LONG" else working_zone["high"]+buffer
+    target = target_zone["center"] if target_zone is not None else None
     risk = abs(price-stop) if stop is not None else 0
     reward = abs(target-price) if target is not None else 0
     rr = reward/risk if risk else 0
-    parts = {"context":context_score, "structure":structure_score, "liquidity":proximity,
-             "event":event_score, "rr":min(15,round(7.5*rr)), "market":10}
-    return {"side":side, "type":setup_type, "score":min(100,sum(parts.values())),
-            "parts":parts, "chain":chain, "level":level, "stop":stop,
-            "target":target, "rr":rr}
+    parts={"context":context_score,"structure":structure_score,"liquidity":proximity,
+           "event":event_score,"rr":min(15,round(7.5*rr)),"market":10}
+    return {"side":side,"type":setup_type,"score":min(100,sum(parts.values())),
+            "parts":parts,"chain":chain,"zone":working_zone,"stop":stop,
+            "target":target,"rr":rr}
 
 def _n(value) -> Optional[float]:
     try:
@@ -199,11 +262,15 @@ async def assess_gold_now() -> Dict:
         contexts[tf], votes[tf] = _context(candles[tf])
     higher_raw = 2 * votes["H1"] + 2 * votes["M15"]
     higher_bias = "LONG" if higher_raw >= 2 else "SHORT" if higher_raw <= -2 else "NEUTRAL"
-    above, below = _levels(price, [candles["M1"], candles["M5"], candles["M15"], candles["H1"]])
     atr1, atr5 = _atr(candles["M1"]), _atr(candles["M5"])
+    atr15 = _atr(candles["M15"])
+    zones = _build_zones(candles)
+    upper_zone, lower_zone = _working_zones(price, zones, atr15)
+    above = upper_zone["center"] if upper_zone else None
+    below = lower_zone["center"] if lower_zone else None
     impulse = (candles["M1"][-1].h-candles["M1"][-1].l)/atr1
-    long_plan = _side_plan("LONG", price, above, below, atr1, atr5, votes, candles)
-    short_plan = _side_plan("SHORT", price, above, below, atr1, atr5, votes, candles)
+    long_plan = _side_plan("LONG", price, upper_zone, lower_zone, atr1, atr5, votes, candles)
+    short_plan = _side_plan("SHORT", price, upper_zone, lower_zone, atr1, atr5, votes, candles)
     selected = long_plan if long_plan["score"] >= short_plan["score"] else short_plan
     if abs(long_plan["score"]-short_plan["score"]) < 6:
         tactical_side = "NEUTRAL"
@@ -231,12 +298,23 @@ async def assess_gold_now() -> Dict:
                 setup_type=selected["type"], decision=decision, score=selected["score"],
                 long_score=long_plan["score"], short_score=short_plan["score"],
                 parts=selected["parts"], event_chain=selected["chain"], above=above,
-                below=below, stop=selected["stop"], target=selected["target"], atr5=atr5,
+                below=below, upper_zone=upper_zone, lower_zone=lower_zone,
+                active_zone=selected["zone"], stop=selected["stop"],
+                target=selected["target"], atr5=atr5,
                 impulse=impulse, stale=stale, trigger_text=trigger_text)
 
 
 def _p(x) -> str:
     return "—" if x is None else f"{x:,.2f}".replace(",", " ")
+
+
+def _zone_text(zone: Optional[Dict]) -> str:
+    if not zone:
+        return "—"
+    return (
+        f"{_p(zone['low'])}–{_p(zone['high'])} | "
+        f"{zone['tf']} | сила {zone['strength']}/100"
+    )
 
 
 def render_gold(a: Dict) -> str:
@@ -256,7 +334,8 @@ def render_gold(a: Dict) -> str:
               f"Контекст {p['context']}/15 │ структура {p['structure']}/20 │ ликвидность {p['liquidity']}/15",
               f"События {p['event']}/25 │ RR {p['rr']}/15 │ рынок {p['market']}/10",
               f"Триггер: {a['trigger_text']}", "", "🧲 ЛИКВИДНОСТЬ",
-              f"Сверху: {_p(a['above'])}", f"Снизу: {_p(a['below'])}"]
+              f"Сверху: {_zone_text(a.get('upper_zone'))}",
+              f"Снизу: {_zone_text(a.get('lower_zone'))}"]
     if a["stop"] is not None:
         risk = abs(a["price"]-a["stop"]) + .12
         lines += ["", "🎯 ПЛАН ПРИ ПОДТВЕРЖДЕНИИ" if a["decision"] in ("WAIT", "SETUP WATCH") else "🎯 АКТИВНЫЙ ПЛАН", f"Stop: {_p(a['stop'])}", f"Цель: {_p(a['target'])}",
