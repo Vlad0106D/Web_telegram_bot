@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from services.tradfi.gold_engine import Candle, _atr, _context, _levels, _event_chain, render_gold
+from services.tradfi.gold_engine import Candle, _atr, _build_zones, _context, _event_chain, _working_zones, render_gold
 
 
 def candles(start=100.0, step=0.2, count=80):
@@ -24,16 +24,28 @@ class GoldEngineTests(unittest.TestCase):
     def test_atr_is_positive(self):
         self.assertGreater(_atr(candles()), 0)
 
-    def test_levels_are_on_correct_sides(self):
-        data = candles(count=80)
-        data[30] = Candle(data[30].ts, 104, 120, 103, 105, 10)
-        data[50] = Candle(data[50].ts, 110, 111, 90, 109, 10)
-        above, below = _levels(108, [data])
-        self.assertGreater(above, 108)
-        self.assertLess(below, 108)
+    def test_zones_use_only_h1_and_m15_and_merge_confluence(self):
+        h1 = candles(start=100, step=0.0, count=80)
+        m15 = candles(start=100, step=0.0, count=80)
+        h1[60] = Candle(h1[60].ts, 100, 105.0, 99.8, 100, 10)
+        m15[60] = Candle(m15[60].ts, 100, 104.95, 99.8, 100, 10)
+        zones = _build_zones({"H1": h1, "M15": m15})
+        confluence = [z for z in zones if "H1" in z["sources"] and "M15" in z["sources"]]
+        self.assertTrue(confluence)
+        self.assertGreaterEqual(confluence[-1]["strength"], 80)
+
+    def test_working_zone_uses_strength_and_distance(self):
+        zones = [
+            {"low": 101.0, "high": 101.2, "center": 101.1, "strength": 30},
+            {"low": 101.3, "high": 101.5, "center": 101.4, "strength": 90},
+            {"low": 98.8, "high": 99.0, "center": 98.9, "strength": 70},
+        ]
+        upper, lower = _working_zones(100.0, zones, 2.0)
+        self.assertEqual(upper["strength"], 90)
+        self.assertEqual(lower["strength"], 70)
 
     def test_accept_retest_rejection_builds_short_chain(self):
-        level = 100.0
+        zone = {"low": 99.9, "high": 100.1, "center": 100.0, "strength": 70}
         base = candles(start=101.0, step=0.0, count=72)
         ts = base[-1].ts
         sequence = [
@@ -42,7 +54,7 @@ class GoldEngineTests(unittest.TestCase):
             Candle(ts + timedelta(minutes=3), 99.5, 100.05, 99.3, 99.4, 10),
             Candle(ts + timedelta(minutes=4), 99.4, 99.5, 98.8, 98.9, 10),
         ]
-        chain, score = _event_chain(base[-4:] + sequence, "SHORT", level, 0.5)
+        chain, score = _event_chain(base[-4:] + sequence, "SHORT", zone, 0.5)
         self.assertIn("accept below", chain)
         self.assertIn("retest снизу", chain)
         self.assertIn("bearish rejection", chain)
@@ -57,6 +69,8 @@ class GoldEngineTests(unittest.TestCase):
             "parts": {"context": 0, "structure": 2, "liquidity": 0, "event": 0, "rr": 0, "market": 10},
             "contexts": {tf: "диапазон" for tf in ("H1", "M15", "M5", "M1")},
             "trigger_text": "нет направления", "above": 102.0, "below": 98.0,
+            "upper_zone": {"low": 101.8, "high": 102.2, "center": 102.0, "tf": "H1", "strength": 70},
+            "lower_zone": {"low": 97.8, "high": 98.2, "center": 98.0, "tf": "M15", "strength": 45},
             "stop": None, "target": None, "impulse": 1.0, "stale": 0, "atr5": 1.2,
         }
         text = render_gold(assessment)
