@@ -106,6 +106,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("mm_report", "MM: ручной отчёт"),
         BotCommand("mm_snapshots", "MM: записать live снапшоты в БД"),
         BotCommand("scenario_now", "Рыночный сценарий: Direction/Setup/Entry"),
+        BotCommand("tradfi", "TradFi Gold: оценка XAUUSD+ сейчас"),
         # Outcomes / Edge
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
         BotCommand("edge_refresh", "Edge Engine: обновить витрину (REFRESH MV)"),
