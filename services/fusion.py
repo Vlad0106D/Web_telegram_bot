@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional, List, Dict
 
 from services.analyze import analyze_symbol
@@ -207,7 +207,7 @@ async def analyze_fusion(symbol: str, tf: str) -> Optional[FusionEvent]:
         tf=str(tf),
         side=side,
         confidence=int(base_conf),
-        score=int(base_conf),  # важно для TrueTrading/ATTENTION
+        score=int(base_conf),
         price=float(price),
         exchange=str(ex),
         components=components,
@@ -236,21 +236,3 @@ def format_fusion_message(ev: FusionEvent) -> str:
             parts.append(f"• {r}")
     return "\n".join(parts)
 
-
-def fusion_to_tt_dict(ev: FusionEvent) -> Dict[str, object]:
-    """
-    Возвращает словарь, который ожидает TrueTrading.update_fusion().
-    """
-    d = asdict(ev)
-    d["score"] = int(ev.score)
-    return {
-        "symbol": ev.symbol,
-        "tf": ev.tf,
-        "side": ev.side,
-        "score": int(d.get("score", 0) or 0),
-        "trend1d": ev.trend_1d,  # ключ для ATTENTION-агрегатора
-        "zone_center": ev.zone_center,
-        "zone_halfwidth": ev.zone_halfwidth,
-        "price": ev.price,
-        "components": ev.components,
-    }

@@ -99,9 +99,6 @@ async def _post_init(app: Application) -> None:
         BotCommand("watch_on", "Включить вотчер (уведомления)"),
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
-        BotCommand("tt_on", "True Trading: включить"),
-        BotCommand("tt_off", "True Trading: выключить"),
-        BotCommand("tt_status", "True Trading: статус"),
         # MM
         BotCommand("mm_on", "MM: включить авто"),
         BotCommand("mm_off", "MM: выключить авто"),

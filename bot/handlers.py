@@ -28,8 +28,6 @@ from services.market_data import search_symbols
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
 
-# === True Trading ===
-from services.true_trading import get_tt
 
 # === MM (snapshots + commands) ===
 from services.mm.snapshots import run_snapshots_once
@@ -78,8 +76,6 @@ def _kbd_main() -> ReplyKeyboardMarkup:
         [KeyboardButton("/check")],
         [KeyboardButton("/watch_on"), KeyboardButton("/watch_off")],
         [KeyboardButton("/watch_status")],
-        [KeyboardButton("/tt_on"), KeyboardButton("/tt_off")],
-        [KeyboardButton("/tt_status")],
         [KeyboardButton(BTN_BACK)],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -144,7 +140,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /find ‹строка› — поиск пары\n"
         "• /check — анализ избранного\n"
         "• /watch_on /watch_off /watch_status — вотчер\n"
-        "• /tt_on /tt_off /tt_status — True Trading\n\n"
+        ""
         "MM:\n"
         "• /mm_on /mm_off /mm_status /mm_report\n"
         "• /mm_snapshots — запись снапшотов\n\n"
@@ -164,7 +160,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Команды: /start, /help, /menu, /list, /find, /check, "
         "/watch_on, /watch_off, /watch_status, "
-        "/tt_on, /tt_off, /tt_status, "
+        
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
         "/scenario_now, "
         "/edge_now, /edge_refresh, "
@@ -273,32 +269,6 @@ async def cmd_watch_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("\n".join(lines))
 
 
-# ------------ True Trading ------------
-async def cmd_tt_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tt = get_tt(context.application)
-    tt.enable()
-    st = tt.status()
-    await update.message.reply_text(
-        "✅ True Trading включён.\n"
-        f"Риск/сделку: {st.risk_pct*100:.2f}% | Лимит позиций: {st.max_open_pos}"
-    )
-
-
-async def cmd_tt_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tt = get_tt(context.application)
-    tt.disable()
-    await update.message.reply_text("⛔ True Trading выключен.")
-
-
-async def cmd_tt_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tt = get_tt(context.application)
-    st = tt.status()
-    await update.message.reply_text(
-        f"📟 True Trading\n"
-        f"Состояние: {'ВКЛ' if st.enabled else 'ВЫКЛ'}\n"
-        f"Риск: {st.risk_pct*100:.2f}% | RR min: {st.min_rr_tp1:.2f}"
-    )
-
 
 # ------------ Menu buttons handler ------------
 async def _on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -402,9 +372,6 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("watch_off", cmd_watch_off))
     app.add_handler(CommandHandler("watch_status", cmd_watch_status))
 
-    app.add_handler(CommandHandler("tt_on", cmd_tt_on))
-    app.add_handler(CommandHandler("tt_off", cmd_tt_off))
-    app.add_handler(CommandHandler("tt_status", cmd_tt_status))
 
     # MM команды (/mm_on, /mm_off, /mm_status, /mm_report)
     register_mm_commands(app)

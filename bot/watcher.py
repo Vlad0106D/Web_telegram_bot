@@ -56,8 +56,6 @@ from services.signal_text import build_signal_message
 # Fibo watcher
 from strategy.fibo_watcher import analyze_fibo, format_fibo_message
 
-# ATTENTION агрегатор (и кэш Fusion/Fibo внутри TrueTrading)
-from services.true_trading import get_tt
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +117,6 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_reversal = 0
         sent_fusion = 0
         sent_fibo = 0
-        sent_attention = 0
 
         for sym in favs:
             sym_u = str(sym).upper()
@@ -204,21 +201,6 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 )
                             fusion_last[key_f] = now
                             sent_fusion += 1
-
-                        # кэш для ATTENTION
-                        try:
-                            get_tt(app).update_fusion(
-                                sym_u, tf,
-                                {
-                                    "symbol": fev.symbol,
-                                    "tf": fev.tf,
-                                    "side": getattr(fev, "side", None),
-                                    "score": int(getattr(fev, "score", getattr(fev, "confidence", 0) or 0)),
-                                    "trend1d": getattr(fev, "trend_1d", None),
-                                },
-                            )
-                        except Exception:
-                            log.exception("Failed to cache fusion for ATTENTION %s %s", sym_u, tf)
             except Exception:
                 log.exception("Fusion analysis failed for %s %s", sym_u, tf)
 
@@ -238,44 +220,12 @@ async def _watch_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 )
                             fibo_last[key_fi] = now
                             sent_fibo += 1
-
-                        # кэш для ATTENTION
-                        try:
-                            get_tt(app).update_fibo(
-                                sym_u, tf,
-                                {
-                                    "symbol": ev.symbol,
-                                    "tf": ev.tf,
-                                    "side": getattr(ev, "side", "").lower(),
-                                    "level_kind": getattr(ev, "level_kind", None),
-                                    "level_pct": float(getattr(ev, "level_pct", 0.0)),
-                                    "trend_1d": getattr(ev, "trend_1d", None),
-                                    "entry": float(getattr(ev, "entry", getattr(ev, "touch_price", 0.0))),
-                                    "sl": float(getattr(ev, "sl", 0.0)),
-                                    "tp1": float(getattr(ev, "tp1", 0.0)),
-                                    "tp2": float(getattr(ev, "tp2", 0.0)),
-                                    "tp3": float(getattr(ev, "tp3", 0.0)),
-                                    "rr_tp1": float(getattr(ev, "rr_tp1", 0.0)),
-                                    "rr_tp2": float(getattr(ev, "rr_tp2", 0.0)),
-                                    "rr_tp3": float(getattr(ev, "rr_tp3", 0.0)),
-                                },
-                            )
-                        except Exception:
-                            log.exception("Failed to cache fibo for ATTENTION %s %s", sym_u, tf)
             except Exception:
                 log.exception("Fibo watcher failed for %s %s", sym_u, tf)
 
-            # ---------- 6) ATTENTION ----------
-            try:
-                attn_ev = await get_tt(app).maybe_send_attention(context, chat_id, sym_u, tf)
-                if attn_ev:
-                    sent_attention += 1
-            except Exception:
-                log.exception("ATTENTION aggregator failed for %s %s", sym_u, tf)
-
         log.info(
-            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d, fibo=%d, attention=%d",
-            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion, sent_fibo, sent_attention
+            "Watcher tick: tf=%s, favorites=%d, alerts: breaker=%d, strategy=%d, reversal=%d, fusion=%d, fibo=%d",
+            tf, len(favs), sent_breaker, sent_signal, sent_reversal, sent_fusion, sent_fibo
         )
 
     except Exception:
