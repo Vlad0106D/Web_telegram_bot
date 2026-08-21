@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 from telegram.ext import Application
 
 from services.mm.snapshots import run_snapshots_once
-from services.mm.report_engine import build_market_view, render_report
+from services.mm.report_engine import build_market_view
 from services.mm.liquidity import update_liquidity_memory
 from services.mm.market_events_detector import detect_and_store_market_events
 from services.mm.liquidity_events_detector import (
@@ -702,11 +702,7 @@ async def _mm_auto_tick(app: Application) -> None:
                         log.exception("MM auto: action persistence failed tf=%s", tf)
 
                 # отчёт уже отправляли на этот ts?
-                already_sent = (
-                    _scenario_already_sent(conn, tf, view.ts)
-                    if tf == "H1"
-                    else _report_already_sent(conn, tf, view.ts)
-                )
+                already_sent = _scenario_already_sent(conn, tf, view.ts)
                 if already_sent:
                     # ✅ прошли успешно → фиксируем seen
                     if tf not in ("D1", "W1"):
@@ -714,13 +710,11 @@ async def _mm_auto_tick(app: Application) -> None:
                     continue
 
                 # отправляем отчёт
+                scenario = build_current_scenario("BTC-USDT", tf)
+                persist_scenario(scenario)
                 if tf == "H1":
-                    scenario = build_current_scenario("BTC-USDT", "H1")
-                    persist_scenario(scenario)
                     backfill_scenario_outcomes()
-                    text = render_scenario(scenario)
-                else:
-                    text = render_report(view)
+                text = render_scenario(scenario)
                 await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
 
                 payload = {
@@ -729,10 +723,7 @@ async def _mm_auto_tick(app: Application) -> None:
                     "report_ts": view.ts.isoformat(),
                     "sent_at": datetime.now(timezone.utc).isoformat(),
                 }
-                if tf == "H1":
-                    _mark_scenario_sent(conn, tf, view.ts, payload)
-                else:
-                    _mark_report_sent(conn, tf, view.ts, payload)
+                _mark_scenario_sent(conn, tf, view.ts, payload)
                 conn.commit()
 
                 log.info("MM report sent tf=%s ts=%s", tf, view.ts)

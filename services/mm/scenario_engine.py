@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional, Sequence, Tuple
 
 import psycopg
@@ -48,6 +48,11 @@ class MarketScenario:
     deriv_score: Optional[int] = None
     entry_breakdown: dict = field(default_factory=dict)
     calibration_note: str = ""
+    action_decision: str = "NONE"
+    action_confidence: int = 0
+    action_event: Optional[str] = None
+    action_reason: str = ""
+    mtf_context: List[dict] = field(default_factory=list)
 
 
 EVENT_LABELS = {
@@ -412,95 +417,131 @@ def _nearest_per_side(zones: Sequence[dict], price: float, limit: int) -> List[d
     )
 
 
+def _bar_close_ts(ts: datetime, tf: str) -> datetime:
+    delta = {
+        "H1": timedelta(hours=1),
+        "H4": timedelta(hours=4),
+        "D1": timedelta(days=1),
+        "W1": timedelta(days=7),
+    }.get(tf, timedelta(0))
+    return ts.astimezone(timezone.utc) + delta
+
+
+def _decision_view(s: MarketScenario) -> Tuple[str, str, str]:
+    if s.action_decision == "LONG_ALLOWED":
+        return "🟢", "LONG РАЗРЕШЁН", "подтверждён"
+    if s.action_decision == "SHORT_ALLOWED":
+        return "🔴", "SHORT РАЗРЕШЁН", "подтверждён"
+    if s.state == "setup_ready":
+        return "🟡", "ЖДАТЬ ПОДТВЕРЖДЕНИЕ", "почти готов"
+    if s.bias == "neutral":
+        return "⚪", "ВНЕ РЫНКА", "не сформирован"
+    return "🟡", "ЖДАТЬ", "не подтверждён"
+
+
+def _entry_requirements(s: MarketScenario) -> List[str]:
+    parts = s.entry_breakdown
+    missing: List[str] = []
+    if parts.get("position", 0) < 18:
+        missing.append("подход цены к рабочей входной области")
+    if parts.get("structure", 0) < 18:
+        missing.append("свип/реклейм или закрепление в сторону сценария")
+    if parts.get("rr", 0) < 12:
+        missing.append("приемлемое соотношение цели к риску")
+    if parts.get("confirmation", 0) < 12:
+        missing.append("подтверждение реакции цены")
+    return missing[:3]
+
+
+def _context_line(item: dict) -> str:
+    title = str(item.get("title") or "нет данных")
+    up = item.get("prob_up")
+    down = item.get("prob_down")
+    if up is None or down is None:
+        return f"• {item['tf']}: {title}"
+    return f"• {item['tf']}: {title} | ↓{down}% ↑{up}%"
+
+
 def render_scenario(s: MarketScenario) -> str:
-    icon = {
-        "setup_ready": "🚨",
-        "setup_watch": "👀",
-        "context_update": "📣",
-        "no_trade": "⚪",
-    }[s.state]
-    title = {
-        "setup_ready": "SETUP READY",
-        "setup_watch": "SETUP WATCH",
-        "context_update": "MARKET SCENARIO",
-        "no_trade": "NO TRADE",
-    }[s.state]
-    bias = {"long": "LONG BIAS", "short": "SHORT BIAS", "neutral": "NEUTRAL"}[s.bias]
-    action = {
-        "setup_ready": "сетап готов — проверить реакцию во входной зоне",
-        "setup_watch": "ждать подтверждение и выгодный ретест",
-        "context_update": "наблюдать, вход пока не подтверждён",
-        "no_trade": "ждать подхода к границе диапазона",
-    }[s.state]
+    decision_icon, decision, entry_status = _decision_view(s)
+    bias = {"long": "LONG", "short": "SHORT", "neutral": "НЕЙТРАЛЬНЫЙ"}[s.bias]
+    title = {"H1": "ЧАСОВОЙ ОТЧЁТ", "H4": "ОТЧЁТ 4Ч", "D1": "ДНЕВНОЙ ОТЧЁТ", "W1": "НЕДЕЛЬНЫЙ ОТЧЁТ"}.get(s.tf, f"ОТЧЁТ {s.tf}")
     lines = [
-        f"{icon} {s.symbol} — {title}",
-        f"🕒 {s.tf}: {s.ts.astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')}",
-        f"💵 Цена: {_fmt_price(s.price)}",
+        f"📊 {s.symbol.replace('-USDT', '')} — {title}",
+        f"🕒 Закрытие {s.tf}: {_bar_close_ts(s.ts, s.tf).strftime('%d.%m.%Y %H:%M UTC')}",
+        f"💵 Цена закрытия: {_fmt_price(s.price)}",
         "",
-        f"🧭 {bias}",
-        f"Direction: {s.direction_score}/100",
-        f"Setup: {s.setup_score}/100",
-        f"Entry: {s.entry_score}/100",
-        "↳ Позиция/структура: "
-        f"{s.entry_breakdown.get('position', 0)}/30 · "
-        f"{s.entry_breakdown.get('structure', 0)}/30",
-        "↳ RR/подтверждение: "
-        f"{s.entry_breakdown.get('rr', 0)}/20 · "
-        f"{s.entry_breakdown.get('confirmation', 0)}/20",
-        f"Решение: {action}",
+        f"{decision_icon} РЕШЕНИЕ: {decision}",
+        f"Уклон: {bias}",
+        f"Вход: {entry_status.upper()}",
+        "",
+        f"Direction {s.direction_score}/100 │ Setup {s.setup_score}/100 │ Entry {s.entry_score}/100",
     ]
+
+    if s.action_decision == "NONE":
+        requirements = _entry_requirements(s)
+        if requirements:
+            lines += ["", "Почему нет входа:"] + [f"• {x}" for x in requirements]
+        for reason in s.reasons[:2]:
+            lines.append(f"• {reason}")
+
+    lines += [
+        "",
+        "⚙️ ACTION ENGINE (v1)",
+        f"Decision: {s.action_decision}",
+        f"Confidence: {s.action_confidence}%",
+        f"Event: {s.action_event or '—'}",
+        f"Reason: {s.action_reason or 'решение сценарного слоя'}",
+    ]
+
     if s.event_chain:
-        lines += ["", "🔗 Цепочка:", " → ".join(s.event_chain)]
-    if s.reasons:
-        lines += ["", "🔍 Основания:"] + [f"• {x}" for x in s.reasons]
-    lines += ["", "🧲 Карта ликвидности:"]
-    if s.upper_zones:
-        lines.append("Сверху:")
-        for zone in s.upper_zones:
-            lines.append(_zone_line(zone, s.price))
-    else:
-        lines.append("Сверху: активных зон нет")
-    if s.lower_zones:
-        lines.append("Снизу:")
-        for zone in s.lower_zones:
-            lines.append(_zone_line(zone, s.price))
-    else:
-        lines.append("Снизу: активных зон нет")
-    historical_display = _nearest_per_side(s.historical_zones, s.price, 1)
-    if historical_display:
-        lines.append("Историческая структура H1 (не торговые цели):")
-        for zone in historical_display:
-            lines.append(_zone_line(zone, s.price))
-    higher_display = _nearest_per_side(s.higher_tf_zones, s.price, 2)
-    if higher_display:
-        lines.append("Старшие зоны H4/D1:")
-        for zone in higher_display:
-            lines.append(_zone_line(zone, s.price))
+        lines += ["", f"🔗 СОБЫТИЯ {s.tf}", " → ".join(s.event_chain)]
+
+    lines += ["", "🧲 ЛИКВИДНОСТЬ"]
+    active = _nearest_per_side(s.upper_zones + s.lower_zones, s.price, 1)
+    for side, label in (("upper", "Ближайшая сверху"), ("lower", "Ближайшая снизу")):
+        zone = next((z for z in active if z.get("side") == side), None)
+        if zone is None:
+            zone = next((z for z in _nearest_per_side(s.historical_zones, s.price, 1) if z.get("side") == side), None)
+            suffix = " │ историческая структура" if zone else ""
+        else:
+            suffix = ""
+        lines.append(f"{label}:")
+        lines.append((_zone_line(zone, s.price) + suffix) if zone else "• значимых зон нет")
+
+    higher = _nearest_per_side(s.higher_tf_zones, s.price, 1)
+    if higher:
+        lines.append("Старшие уровни:")
+        lines.extend(_zone_line(zone, s.price) for zone in higher)
+
     if s.bias != "neutral":
-        lines += ["", f"🎯 Основной сценарий — {s.primary_probability}%"]
+        lines += ["", "🎯 СЦЕНАРИИ", f"Основной — {bias}, {s.primary_probability}%"]
+        if s.entry_low is not None:
+            lines.append(f"Входная область: {_fmt_price(s.entry_low)}–{_fmt_price(s.entry_high)}")
+        else:
+            lines.append("Входная область: пока не сформирована")
+        lines.append(
+            f"Инвалидация: {_fmt_price(s.invalidation_price)}"
+            if s.invalidation_price is not None
+            else "Инвалидация: не определена активной встречной зоной"
+        )
+        if s.targets:
+            lines.append("Цели: " + " → ".join(_fmt_price(x) for x in s.targets))
+        if s.alternative_targets:
+            lines += [
+                f"Альтернатива — {100 - s.primary_probability}%",
+                "При сломе инвалидации: "
+                + " → ".join(_fmt_price(x) for x in s.alternative_targets),
+            ]
         if s.calibration_note:
             lines.append(s.calibration_note)
-        if s.entry_low is not None:
-            lines.append(
-                f"Входная область: {_fmt_price(s.entry_low)}–{_fmt_price(s.entry_high)}"
-            )
-        if s.invalidation_price is None:
-            lines.append("Инвалидация: не определена — активной встречной H1-зоны нет")
-        else:
-            lines.append(f"Инвалидация: {_fmt_price(s.invalidation_price)}")
-        if s.targets:
-            lines += ["Цели:"] + [
-                f"{i}. {_fmt_price(x)}" for i, x in enumerate(s.targets, 1)
-            ]
-        if s.alternative_targets:
-            lines += ["", f"🔄 Альтернатива — {100 - s.primary_probability}%"]
-            lines.append(
-                "При сломе инвалидации цели: "
-                + ", ".join(_fmt_price(x) for x in s.alternative_targets)
-            )
-    lines += ["", "📊 Деривативы:", s.deriv_note]
-    return "\n".join(lines)
 
+    if s.mtf_context:
+        lines += ["", "🧭 MTF-КОНТЕКСТ"]
+        lines.extend(_context_line(item) for item in s.mtf_context)
+
+    lines += ["", "📉 ДЕРИВАТИВЫ", s.deriv_note]
+    return "\n".join(lines)
 
 def _db_url() -> str:
     value = (os.getenv("DATABASE_URL") or "").strip()
@@ -535,8 +576,13 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
     zones = load_current_zones(symbol, tf, price)
     historical_zones = load_historical_zones(symbol, tf, price)
     higher_tf_zones: List[dict] = []
-    if tf == "H1":
-        for higher_tf in ("H4", "D1"):
+    higher_stack = {
+        "H1": ("H4", "D1"),
+        "H4": ("D1", "W1"),
+        "D1": ("W1",),
+        "W1": (),
+    }.get(tf, ())
+    for higher_tf in higher_stack:
             current_higher = load_current_zones(symbol, higher_tf, price, per_side=2)
             higher_tf_zones.extend(current_higher)
             present_sides = {zone["side"] for zone in current_higher}
@@ -552,7 +598,7 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
     events = load_recent_zone_events(symbol, tf) + market_events
     deriv_score: Optional[int] = None
     deriv_note = "данных недостаточно"
-    if symbol == "BTC-USDT" and tf == "H1":
+    if symbol == "BTC-USDT":
         try:
             from services.outcomes.deriv_engine import get_deriv_now
 
@@ -588,7 +634,35 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         higher_tf_zones,
         key=lambda zone: abs(float(zone["center_price"]) - price),
     )
-    if scenario.bias != "neutral":
+    try:
+        from services.mm.action_engine import compute_action
+
+        action = compute_action(tf=tf)
+        scenario.action_decision = action.action
+        scenario.action_confidence = int(action.confidence)
+        scenario.action_event = action.event_type
+        scenario.action_reason = action.reason
+    except Exception:
+        scenario.action_reason = "Action Engine временно недоступен"
+
+    try:
+        from services.mm.state_store import load_last_state
+
+        context_stack = [tf] + list(higher_stack)
+        scenario.mtf_context = []
+        for context_tf in context_stack:
+            state = load_last_state(tf=context_tf) or {}
+            scenario.mtf_context.append(
+                {
+                    "tf": context_tf,
+                    "title": state.get("state_title") or "нет сохранённого состояния",
+                    "prob_up": state.get("prob_up"),
+                    "prob_down": state.get("prob_down"),
+                }
+            )
+    except Exception:
+        scenario.mtf_context = [{"tf": tf, "title": "контекст временно недоступен"}]
+    if scenario.bias != "neutral" and tf == "H1":
         try:
             with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
                 with conn.cursor() as cur:
