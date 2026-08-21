@@ -27,6 +27,7 @@ from services.state import get_favorites, add_favorite, remove_favorite
 from services.market_data import search_symbols
 from services.analyze import analyze_symbol
 from services.signal_text import build_signal_message
+from services.tradfi.gold_engine import GoldDataError, assess_gold_now, render_gold
 
 
 # === MM (snapshots + commands) ===
@@ -50,6 +51,7 @@ MENU_OUT = "outcomes"
 BTN_MAIN = "⚙️ Основное"
 BTN_MM = "🧠 MM"
 BTN_OUT = "📊 Outcomes"
+BTN_TRADFI = "🥇 TradFi Gold"
 BTN_BACK = "⬅️ Назад"
 
 
@@ -64,7 +66,7 @@ def _get_menu_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
 def _kbd_root() -> ReplyKeyboardMarkup:
     rows: List[List[KeyboardButton]] = [
         [KeyboardButton(BTN_MAIN), KeyboardButton(BTN_MM)],
-        [KeyboardButton(BTN_OUT)],
+        [KeyboardButton(BTN_OUT), KeyboardButton(BTN_TRADFI)],
         [KeyboardButton("/menu")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -150,6 +152,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /edge_refresh — обновить витрину Edge\n"
         "• /deriv_now — Deriv (funding+OI)\n"
         "• /deriv_refresh — обновить витрину Deriv\n\n"
+        "TradFi:\n• /tradfi — оценка золота XAUUSD+ сейчас\n\n"
         "• /menu — показать меню-кнопки\n"
     )
     _set_menu_mode(context, MENU_ROOT)
@@ -164,7 +167,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/mm_on, /mm_off, /mm_status, /mm_report, /mm_snapshots, "
         "/scenario_now, "
         "/edge_now, /edge_refresh, "
-        "/deriv_now, /deriv_refresh"
+        "/deriv_now, /deriv_refresh, /tradfi"
     )
 
 
@@ -210,6 +213,22 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.exception("check %s failed", s)
             await update.message.reply_text(f"{s}: ошибка анализа — {e}")
+
+
+
+async def cmd_tradfi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    status = await update.message.reply_text("🥇 Анализирую XAUUSD+ по M1/M5/M15/H1…")
+    try:
+        assessment = await assess_gold_now()
+        await status.edit_text(render_gold(assessment))
+    except GoldDataError as exc:
+        log.warning("tradfi gold data unavailable: %s", exc)
+        await status.edit_text(f"⛔ XAUUSD+: данные временно недоступны\n{exc}")
+    except Exception:
+        log.exception("tradfi gold analysis failed")
+        await status.edit_text("❌ XAUUSD+: ошибка расчёта. Подробности записаны в лог.")
 
 
 # ------------ MM snapshots (manual) ------------
@@ -284,6 +303,10 @@ async def _on_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if txt == BTN_MM:
         _set_menu_mode(context, MENU_MM)
         await update.message.reply_text("🧠 MM:", reply_markup=_kbd_mm())
+        return
+
+    if txt == BTN_TRADFI:
+        await cmd_tradfi(update, context)
         return
 
     if txt == BTN_OUT:
@@ -365,6 +388,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("tradfi", cmd_tradfi))
 
     app.add_handler(CommandHandler("mm_snapshots", cmd_mm_snapshots))
 
