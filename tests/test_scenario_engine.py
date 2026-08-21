@@ -1,7 +1,12 @@
 import unittest
 from datetime import datetime, timezone
 
-from services.mm.scenario_engine import build_scenario, render_scenario
+from services.mm.live_alerts import detect_live_event
+from services.mm.scenario_engine import (
+    build_scenario,
+    render_scenario,
+    score_entry_readiness,
+)
 
 NOW = datetime(2026, 8, 21, 18, tzinfo=timezone.utc)
 
@@ -137,6 +142,53 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("Старшие зоны H4/D1:", text)
         self.assertIn("95.00 | -5.00% | H1", text)
         self.assertIn("90.00 | -10.00% | H4", text)
+
+    def test_entry_readiness_is_symmetric_for_long_and_short(self):
+        long_score, long_parts = score_entry_readiness(
+            "long", 100, 110, 95, ["reclaim up", "pressure up"], 75
+        )
+        short_score, short_parts = score_entry_readiness(
+            "short", 100, 90, 105, ["reclaim down", "pressure down"], 25
+        )
+        self.assertEqual(long_score, short_score)
+        self.assertEqual(long_parts, short_parts)
+        self.assertGreaterEqual(long_score, 65)
+
+    def test_entry_readiness_requires_target_and_invalidation(self):
+        score, parts = score_entry_readiness(
+            "long", 100, 110, None, ["reclaim up"], 80
+        )
+        self.assertEqual(score, 10)
+        self.assertEqual(sum(parts.values()), 0)
+
+    def test_live_sweep_and_two_close_acceptance(self):
+        zone = {"side": "lower", "center_price": 100.0}
+        sweep = detect_live_event(
+            candle={"low": 99.0, "high": 102.0, "close": 100.5},
+            previous_price=101.0,
+            zones=[zone],
+            pending_sweep_type=None,
+            pending_level=None,
+        )
+        self.assertEqual(sweep["type"], "sweep_low")
+        candidate = detect_live_event(
+            candle={"low": 98.0, "high": 100.0, "close": 99.0},
+            previous_price=100.5,
+            zones=[zone],
+            pending_sweep_type="sweep_low",
+            pending_level=100.0,
+            pending_outside_count=0,
+        )
+        self.assertEqual(candidate["type"], "accept_candidate_below")
+        accepted = detect_live_event(
+            candle={"low": 97.0, "high": 99.5, "close": 98.5},
+            previous_price=99.0,
+            zones=[zone],
+            pending_sweep_type="sweep_low",
+            pending_level=100.0,
+            pending_outside_count=1,
+        )
+        self.assertEqual(accepted["type"], "accept_below")
 
 
 if __name__ == "__main__":
