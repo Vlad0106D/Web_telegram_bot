@@ -27,11 +27,15 @@ class RedactTelegramTokenFilter(logging.Filter):
     Маскируем токен бота в логах (например, когда httpx логирует URL вида
     https://api.telegram.org/bot<TOKEN>/getUpdates).
     """
+
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
             if "api.telegram.org/bot" in msg and TOKEN in msg:
-                record.msg = record.msg.replace(TOKEN, "***REDACTED***")
+                # httpx keeps the rendered URL in record.args, so replacing only
+                # record.msg doesn't redact it. Freeze the already-rendered safe text.
+                record.msg = msg.replace(TOKEN, "***REDACTED***")
+                record.args = ()
         except Exception:
             pass
         return True
@@ -89,19 +93,15 @@ async def _post_init(app: Application) -> None:
         BotCommand("start", "Запуск и краткая справка"),
         BotCommand("help", "Помощь и список команд"),
         BotCommand("menu", "Меню-кнопки (категории)"),
-
         BotCommand("list", "Избранные пары"),
         BotCommand("find", "Поиск по тикеру или инструменту"),
         BotCommand("check", "Проверить/проанализировать избранное"),
-
         BotCommand("watch_on", "Включить вотчер (уведомления)"),
         BotCommand("watch_off", "Выключить вотчер"),
         BotCommand("watch_status", "Статус вотчера"),
-
         BotCommand("tt_on", "True Trading: включить"),
         BotCommand("tt_off", "True Trading: выключить"),
         BotCommand("tt_status", "True Trading: статус"),
-
         # MM
         BotCommand("mm_on", "MM: включить авто"),
         BotCommand("mm_off", "MM: выключить авто"),
@@ -109,18 +109,18 @@ async def _post_init(app: Application) -> None:
         BotCommand("mm_report", "MM: ручной отчёт"),
         BotCommand("mm_snapshots", "MM: записать live снапшоты в БД"),
         BotCommand("scenario_now", "Рыночный сценарий: Direction/Setup/Entry"),
-
         # Outcomes / Edge
         BotCommand("edge_now", "Edge Engine: текущая оценка BTC (0–100)"),
         BotCommand("edge_refresh", "Edge Engine: обновить витрину (REFRESH MV)"),
-
         # Outcomes / Derivatives (funding+OI)
         BotCommand("deriv_now", "Deriv Edge: текущая оценка (funding+OI)"),
         BotCommand("deriv_refresh", "Deriv Edge: обновить витрину (REFRESH MV)"),
     ]
 
     await app.bot.set_my_commands(commands)
-    log.info("Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands))
+    log.info(
+        "Bot commands set globally: %s", ", ".join(f"/{c.command}" for c in commands)
+    )
 
 
 async def _on_error(update, context) -> None:
@@ -179,26 +179,36 @@ def main() -> None:
         except Exception:
             log.exception("Failed to schedule watcher jobs")
     else:
-        log.warning("Watcher is disabled (WATCHER_ENABLED=False) — auto signals will NOT run")
+        log.warning(
+            "Watcher is disabled (WATCHER_ENABLED=False) — auto signals will NOT run"
+        )
 
     # === MM AUTO ===
     try:
         mm_jobs = schedule_mm_auto(app)
-        log.info("MM auto scheduled | jobs: %s", ", ".join(mm_jobs) if mm_jobs else "[]")
+        log.info(
+            "MM auto scheduled | jobs: %s", ", ".join(mm_jobs) if mm_jobs else "[]"
+        )
     except Exception:
         log.exception("Failed to schedule MM auto jobs")
 
     # === OUTCOMES / EDGE AUTO ===
     try:
         edge_jobs = schedule_edge_auto(app)
-        log.info("Edge auto scheduled | jobs: %s", ", ".join(edge_jobs) if edge_jobs else "[]")
+        log.info(
+            "Edge auto scheduled | jobs: %s",
+            ", ".join(edge_jobs) if edge_jobs else "[]",
+        )
     except Exception:
         log.exception("Failed to schedule Edge auto jobs")
 
     # === OUTCOMES / DERIV AUTO ===
     try:
         deriv_jobs = schedule_deriv_auto(app)
-        log.info("Deriv auto scheduled | jobs: %s", ", ".join(deriv_jobs) if deriv_jobs else "[]")
+        log.info(
+            "Deriv auto scheduled | jobs: %s",
+            ", ".join(deriv_jobs) if deriv_jobs else "[]",
+        )
     except Exception:
         log.exception("Failed to schedule Deriv auto jobs")
 
