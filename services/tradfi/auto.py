@@ -220,6 +220,12 @@ def should_persist(previous: Optional[Dict], current: Dict, alert_kind: Optional
     """Keep five-minute baselines and every meaningful state change."""
     if previous is None or alert_kind is not None:
         return True
+    if not current.get("market_ready", True):
+        # Keep the transition plus one hourly diagnostic heartbeat, not a flat
+        # five-minute weekend/maintenance history.
+        if previous.get("market_ready", True):
+            return True
+        return current["now"].minute == 0
     if current["now"].minute % 5 == 0:
         return True
     if abs(int(current["score"]) - int(previous["score"])) >= 5:
