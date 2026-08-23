@@ -95,6 +95,11 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(result.bias, "long")
         self.assertEqual(result.state, "context_update")
         self.assertLess(result.setup_score, 50)
+        self.assertGreater(result.entry_breakdown["structure"], 0)
+        self.assertGreater(result.entry_breakdown["confirmation"], 0)
+        self.assertEqual(
+            result.entry_breakdown["blocked_reason"], "нет валидной инвалидации"
+        )
 
     def test_conflicting_chain_reduces_setup(self):
         zones = [
@@ -187,8 +192,53 @@ class ScenarioTests(unittest.TestCase):
         score, parts = score_entry_readiness(
             "long", 100, 110, None, ["reclaim up"], 80
         )
-        self.assertEqual(score, 10)
-        self.assertEqual(sum(parts.values()), 0)
+        self.assertEqual(score, 42)
+        self.assertEqual(parts["position"], 0)
+        self.assertEqual(parts["rr"], 0)
+        self.assertEqual(parts["structure"], 30)
+        self.assertEqual(parts["confirmation"], 12)
+        self.assertFalse(parts["plan_complete"])
+        self.assertEqual(parts["blocked_reason"], "нет валидной инвалидации")
+
+    def test_reclaimed_h1_zone_can_be_structural_invalidation_only(self):
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H1",
+            ts=NOW,
+            price=100,
+            zones=[{"side": "upper", "center_price": 110.0, "strength": 80}],
+            invalidation_zones=[
+                {
+                    "side": "lower", "center_price": 96.0,
+                    "strength": 75, "status": "reclaimed",
+                }
+            ],
+            events=[{"side": None, "event_type": "accept_above", "event_ts": NOW}],
+            deriv_score=80,
+        )
+        self.assertEqual(result.bias, "long")
+        self.assertEqual(result.targets, [110.0])
+        self.assertEqual(result.invalidation_price, 96.0)
+        self.assertEqual(result.invalidation_source, "historical_h1_structure")
+        self.assertTrue(result.entry_breakdown["plan_complete"])
+
+    def test_expired_zone_cannot_be_used_as_invalidation(self):
+        result = build_scenario(
+            symbol="BTC-USDT",
+            tf="H1",
+            ts=NOW,
+            price=100,
+            zones=[{"side": "upper", "center_price": 110.0, "strength": 80}],
+            invalidation_zones=[
+                {
+                    "side": "lower", "center_price": 96.0,
+                    "strength": 75, "status": "expired",
+                }
+            ],
+            events=[{"side": None, "event_type": "accept_above", "event_ts": NOW}],
+        )
+        self.assertIsNone(result.invalidation_price)
+        self.assertFalse(result.entry_breakdown["plan_complete"])
 
     def test_live_sweep_and_two_close_acceptance(self):
         zone = {"side": "lower", "center_price": 100.0}
