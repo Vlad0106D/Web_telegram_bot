@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Dict, Optional, Sequence
 
 import psycopg
@@ -30,6 +31,29 @@ def _float(value: Any) -> Optional[float]:
         return None if value is None else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a recursively JSON-serializable copy of a feature payload.
+
+    psycopg returns PostgreSQL timestamps as ``datetime`` objects.  Zone and
+    event dictionaries are deliberately preserved inside ``features_json``,
+    so their nested timestamps must be converted before wrapping the payload
+    in ``Jsonb``.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _bar_close_ts(ts: datetime, tf: str) -> datetime:
@@ -185,7 +209,7 @@ def build_feature_payload(
     if lower is None:
         missing.append("nearest_lower_zone")
 
-    features_json = {
+    features_json = _json_safe({
         "contract_hash": config_hash,
         "source": {
             "origin": origin,
@@ -210,7 +234,7 @@ def build_feature_payload(
             "higher_tf": list(scenario.higher_tf_zones),
         },
         "computed_at": available_ts.isoformat(),
-    }
+    })
     return {
         **bar,
         "funding_rate": funding_rate,
