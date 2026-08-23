@@ -38,6 +38,7 @@ from services.mm.scenario_outcomes import backfill_scenario_outcomes
 from services.mm.scenario_replay import REPLAY_ENABLED, backfill_scenario_v2
 from services.mm.zone_store import rebuild_zones
 from services.mm.feature_store import persist_feature_snapshot
+from services.mm.setup_lifecycle import persist_setup_lifecycle
 
 log = logging.getLogger(__name__)
 
@@ -801,6 +802,7 @@ async def _mm_auto_tick(app: Application) -> None:
                 # idempotent by scenario and feature keys.
                 scenario = build_current_scenario("BTC-USDT", tf)
                 persist_scenario(scenario)
+                feature_id: Optional[int] = None
                 try:
                     feature_id = persist_feature_snapshot(scenario, origin="live")
                     log.info(
@@ -815,6 +817,29 @@ async def _mm_auto_tick(app: Application) -> None:
                         tf,
                         scenario.ts,
                     )
+
+                # A setup is advanced exactly once per immutable closed-bar
+                # feature. Lifecycle persistence is independent of delivery.
+                if feature_id is not None:
+                    try:
+                        lifecycle = persist_setup_lifecycle(scenario, feature_id)
+                        log.info(
+                            "MM setup lifecycle tf=%s ts=%s result=%s "
+                            "episode=%s state=%s direction=%s",
+                            tf,
+                            scenario.ts,
+                            lifecycle.get("result"),
+                            lifecycle.get("episode_id"),
+                            lifecycle.get("signal_state"),
+                            lifecycle.get("direction"),
+                        )
+                    except Exception:
+                        log.exception(
+                            "MM setup lifecycle failed tf=%s ts=%s feature_id=%s",
+                            tf,
+                            scenario.ts,
+                            feature_id,
+                        )
 
                 # отчёт уже отправляли на этот ts?
                 already_sent = _scenario_already_sent(conn, tf, view.ts)

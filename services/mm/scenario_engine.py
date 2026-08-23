@@ -57,6 +57,7 @@ class MarketScenario:
     action_short_score: int = 0
     action_lifecycle: str = "none"
     action_mode: str = "context"
+    action_setup_fingerprint: str = ""
     action_components: dict = field(default_factory=dict)
     mtf_context: List[dict] = field(default_factory=list)
 
@@ -708,6 +709,7 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         scenario.action_short_score = int(action.short_score)
         scenario.action_lifecycle = action.lifecycle
         scenario.action_mode = action.mode
+        scenario.action_setup_fingerprint = action.setup_fingerprint
         scenario.action_components = action.components
     except Exception:
         scenario.action_reason = "Action Engine временно недоступен"
