@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -40,6 +41,15 @@ from services.mm.zone_store import rebuild_zones
 from services.mm.feature_store import persist_feature_snapshot
 from services.mm.setup_lifecycle import persist_setup_lifecycle
 from services.mm.setup_outcomes import persist_setup_outcomes
+from services.mm.pipeline_runtime import (
+    PipelineCandidate,
+    PipelineRunAlreadyActive,
+    begin_pipeline_run,
+    complete_pipeline_run,
+    fail_pipeline_run,
+    load_completed_event_ts,
+    plan_candidate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -139,25 +149,6 @@ def _get_latest_snapshot_close(conn: psycopg.Connection, tf: str) -> Optional[fl
         return float(row["close"])
     except Exception:
         return None
-
-
-def _iso(ts: datetime) -> str:
-    return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _get_seen_map(app: Application) -> Dict[str, str]:
-    m = app.bot_data.get("mm_last_seen_snapshot_ts")
-    if not isinstance(m, dict):
-        m = {}
-        app.bot_data["mm_last_seen_snapshot_ts"] = m
-
-    out: Dict[str, str] = {}
-    for k, v in m.items():
-        if isinstance(k, str) and isinstance(v, str):
-            out[k] = v
-
-    app.bot_data["mm_last_seen_snapshot_ts"] = out
-    return out
 
 
 # =============================================================================
@@ -604,7 +595,7 @@ def _evaluate_pending(
     return updated
 
 
-def _run_outcomes_auto_if_needed(candidates: List[Tuple[str, datetime]]) -> None:
+def _run_outcomes_auto_if_needed(candidates: List[PipelineCandidate]) -> None:
     """
     Автоматически досчитывает mm_outcomes после появления новой H1 свечи.
 
@@ -616,7 +607,7 @@ def _run_outcomes_auto_if_needed(candidates: List[Tuple[str, datetime]]) -> None
     if not OUTCOMES_AUTO_ENABLED_ENV:
         return
 
-    has_h1 = any(tf == "H1" for tf, _ in candidates)
+    has_h1 = any(item.tf == "H1" and item.needs_analysis for item in candidates)
     if not has_h1:
         return
 
@@ -625,6 +616,63 @@ def _run_outcomes_auto_if_needed(candidates: List[Tuple[str, datetime]]) -> None
         log.info("MM auto: outcomes backfill result=%s", res)
     except Exception:
         log.exception("MM auto: outcomes backfill failed")
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))
+
+
+def _run_action_cycle(
+    *, tf: str, action_ts: datetime, action_close: float
+) -> Tuple[bool, int]:
+    """Run the legacy action persistence in a worker-thread connection."""
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC';")
+        inserted = _insert_action_decision(
+            conn,
+            tf=tf,
+            action_ts=action_ts,
+            action_close=action_close,
+        )
+        evaluated = _evaluate_pending(
+            conn,
+            tf=tf,
+            latest_ts=action_ts,
+            latest_close=action_close,
+        )
+        if inserted or evaluated:
+            conn.commit()
+        return inserted, evaluated
+
+
+def _pipeline_candidates(
+    conn: psycopg.Connection, *, now: datetime
+) -> List[PipelineCandidate]:
+    candidates: List[PipelineCandidate] = []
+    for tf in MM_TFS:
+        latest_ts = _get_latest_snapshot_ts(conn, tf)
+        if latest_ts is None:
+            continue
+        completed_ts = load_completed_event_ts(
+            conn,
+            symbol="BTC-USDT",
+            tf=tf,
+            origin="live",
+        )
+        report_due = not (
+            tf in ("D1", "W1")
+            and not _should_send_close_report(tf, latest_ts, now)
+        )
+        candidate = plan_candidate(
+            tf=tf,
+            event_ts=latest_ts,
+            completed_event_ts=completed_ts,
+            report_due=report_due,
+            report_sent=_scenario_already_sent(conn, tf, latest_ts),
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
 
 
 async def _mm_auto_tick(app: Application) -> None:
@@ -644,265 +692,259 @@ async def _mm_auto_tick(app: Application) -> None:
         log.exception("MM auto: snapshots failed")
         return
 
-    seen = _get_seen_map(app)
-
-    # ⚠️ ВАЖНО: НЕ обновляем seen заранее.
-    # Обновим seen только ПОСЛЕ успешного полного прохода по tf.
-
+    # Candidate selection uses a durable DB cursor.  No connection is held
+    # across slow calculations or Telegram network calls.
     with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
         conn.execute("SET TIME ZONE 'UTC';")
+        candidates = _pipeline_candidates(conn, now=now)
 
-        # Сначала соберём кандидатов
-        candidates: List[Tuple[str, datetime]] = []
-        for tf in MM_TFS:
-            latest_ts = _get_latest_snapshot_ts(conn, tf)
-            if latest_ts is None:
-                continue
+    if not candidates:
+        return
 
-            # D1/W1 не зависят от seen-map (иначе может “залипнуть”)
-            if tf not in ("D1", "W1"):
-                if seen.get(tf) == _iso(latest_ts):
-                    continue
+    # Existing raw outcomes are advanced only for a genuinely new H1 candle.
+    await asyncio.to_thread(_run_outcomes_auto_if_needed, candidates)
 
-            candidates.append((tf, latest_ts))
-
-        if not candidates:
-            return
-
-        # 1.5) OUTCOMES AUTO
-        # После появления новой H1 свечи досчитываем outcomes для уже созревших горизонтов.
-        _run_outcomes_auto_if_needed(candidates)
-
-        # Обрабатываем каждый TF отдельно, и только после успеха отмечаем seen
-        for tf, initial_ts in candidates:
-            try:
-                # перечитаем актуальный ts на случай, если что-то успело обновиться
-                latest_ts = _get_latest_snapshot_ts(conn, tf)
-                if latest_ts is None:
-                    continue
+    for candidate in candidates:
+        tf = candidate.tf
+        latest_ts = candidate.event_ts
+        run_id: Optional[int] = None
+        run_started = time.perf_counter()
+        stage_durations: Dict[str, int] = {}
+        stage_warnings: Dict[str, str] = {}
+        scenario = None
+        feature_id: Optional[int] = None
+        try:
+            if candidate.needs_analysis:
+                run_id = await asyncio.to_thread(
+                    begin_pipeline_run,
+                    symbol="BTC-USDT",
+                    tf=tf,
+                    event_ts=latest_ts,
+                    origin="live",
+                )
 
                 # 2) LIQUIDITY MEMORY (обязательно ДО liquidity-events)
+                stage_started = time.perf_counter()
                 try:
                     await update_liquidity_memory([tf])
                 except Exception:
-                    # если здесь упало — НЕ ставим seen и дадим перезапуститься на следующем тике
-                    log.exception("MM auto: liquidity memory failed tf=%s", tf)
-                    continue
+                    raise RuntimeError(f"liquidity memory failed tf={tf}")
+                stage_durations["liquidity_memory"] = _elapsed_ms(stage_started)
 
                 # 2.5) LIQUIDITY EVENTS (сигнальный слой, зависит от liq_levels)
+                stage_started = time.perf_counter()
                 try:
-                    evs = detect_and_store_liquidity_events(tf)
+                    evs = await asyncio.to_thread(
+                        detect_and_store_liquidity_events, tf
+                    )
                     if evs:
                         log.info("MM liquidity events %s: %s", tf, "; ".join(evs))
-                except Exception:
+                except Exception as exc:
+                    stage_warnings["liquidity_events"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )[:500]
                     log.exception("MM auto: liquidity events failed for tf=%s", tf)
-                    # не критично для отчёта — продолжаем
+                stage_durations["liquidity_events"] = _elapsed_ms(stage_started)
 
                 # 3) MARKET EVENTS (state-layer)
+                stage_started = time.perf_counter()
                 try:
-                    events = detect_and_store_market_events(tf)
+                    events = await asyncio.to_thread(
+                        detect_and_store_market_events, tf
+                    )
                     if events:
                         log.info("MM market events %s: %s", tf, "; ".join(events))
-                except Exception:
+                except Exception as exc:
+                    stage_warnings["market_events"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )[:500]
                     log.exception("MM auto: market events failed for tf=%s", tf)
-                    # не критично для отчёта — продолжаем
+                stage_durations["market_events"] = _elapsed_ms(stage_started)
 
                 # 3.5) Versioned zone lifecycle; chronological and idempotent.
+                stage_started = time.perf_counter()
                 try:
-                    zone_result = rebuild_zones("BTC-USDT", tf, until=latest_ts)
-                    log.info("MM zone engine %s: %s", tf, zone_result)
-                except Exception:
-                    log.exception("MM auto: zone engine failed tf=%s", tf)
-                    continue
-
-                # 4) REPORTS + ACTION ENGINE persistence/eval
-                latest_ts = _get_latest_snapshot_ts(conn, tf)
-                if latest_ts is None:
-                    continue
-
-                # D1/W1 — только “правильный close ts” (без бэкфилла)
-                if tf in ("D1", "W1") and not _should_send_close_report(
-                    tf, latest_ts, now
-                ):
-                    exp = _expected_close_ts(tf, now)
-                    log.info(
-                        "MM report skipped(tf=%s): latest_ts=%s is not close_ts=%s",
-                        tf,
-                        latest_ts,
-                        exp,
+                    zone_result = await asyncio.to_thread(
+                        rebuild_zones, "BTC-USDT", tf, until=latest_ts
                     )
+                    log.info("MM zone engine %s: %s", tf, zone_result)
+                except Exception as exc:
+                    raise RuntimeError(f"zone engine failed tf={tf}") from exc
+                stage_durations["zone_engine"] = _elapsed_ms(stage_started)
 
-                    # action считаем/пишем даже если close-report skip
+                # 4) State view and legacy Action persistence.  Both are moved
+                # off the asyncio loop so M5/TradFi jobs remain responsive.
+                stage_started = time.perf_counter()
+                view = await asyncio.to_thread(build_market_view, tf, manual=False)
+                if view.ts != latest_ts:
+                    raise RuntimeError(
+                        f"snapshot advanced during {tf} processing: "
+                        f"candidate={latest_ts} view={view.ts}"
+                    )
+                stage_durations["market_view"] = _elapsed_ms(stage_started)
+
+                with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
                     latest_close = _get_latest_snapshot_close(conn, tf)
-                    if latest_close is not None:
-                        try:
-                            ins = _insert_action_decision(
-                                conn,
-                                tf=tf,
-                                action_ts=latest_ts,
-                                action_close=float(latest_close),
-                            )
-                            evn = _evaluate_pending(
-                                conn,
-                                tf=tf,
-                                latest_ts=latest_ts,
-                                latest_close=float(latest_close),
-                            )
-                            if ins or evn:
-                                conn.commit()
-                            log.info(
-                                "MM action_engine(%s) insert=%s eval=%s (close-report skipped)",
-                                tf,
-                                ins,
-                                evn,
-                            )
-                        except Exception:
-                            conn.rollback()
-                            log.exception(
-                                "MM auto: action persistence failed tf=%s (close-report skipped)",
-                                tf,
-                            )
-
-                    # ✅ только здесь фиксируем seen (потому что цикл tf прошёл нормально)
-                    if tf not in ("D1", "W1"):
-                        seen[tf] = _iso(latest_ts)
-                    continue
-
-                # строим view (внутри сохранится mm_state)
-                view = build_market_view(tf, manual=False)
-
-                # ACTION persistence/eval (по закрытой свече)
-                latest_close = _get_latest_snapshot_close(conn, tf)
                 if latest_close is not None:
+                    stage_started = time.perf_counter()
                     try:
-                        inserted = _insert_action_decision(
-                            conn,
+                        inserted, evaluated = await asyncio.to_thread(
+                            _run_action_cycle,
                             tf=tf,
                             action_ts=view.ts,
                             action_close=float(latest_close),
                         )
-                        evaluated = _evaluate_pending(
-                            conn,
-                            tf=tf,
-                            latest_ts=view.ts,
-                            latest_close=float(latest_close),
-                        )
-                        conn.commit()
                         log.info(
                             "MM action_engine(%s) inserted=%s evaluated=%s",
                             tf,
                             inserted,
                             evaluated,
                         )
-                    except Exception:
-                        conn.rollback()
+                    except Exception as exc:
+                        stage_warnings["action_engine"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )[:500]
                         log.exception("MM auto: action persistence failed tf=%s", tf)
+                    stage_durations["action_engine"] = _elapsed_ms(stage_started)
 
                 # Scenario persistence and ML-ready feature dual-write happen
                 # independently of Telegram delivery. Repeated ticks are
                 # idempotent by scenario and feature keys.
-                scenario = build_current_scenario("BTC-USDT", tf)
-                persist_scenario(scenario)
-                feature_id: Optional[int] = None
-                try:
-                    feature_id = persist_feature_snapshot(scenario, origin="live")
-                    log.info(
-                        "MM feature snapshot stored tf=%s ts=%s id=%s",
-                        tf,
-                        scenario.ts,
-                        feature_id,
+                stage_started = time.perf_counter()
+                scenario = await asyncio.to_thread(
+                    build_current_scenario, "BTC-USDT", tf
+                )
+                if scenario.ts != latest_ts:
+                    raise RuntimeError(
+                        f"scenario timestamp mismatch tf={tf}: "
+                        f"candidate={latest_ts} scenario={scenario.ts}"
                     )
-                except Exception:
-                    log.exception(
-                        "MM feature snapshot failed tf=%s ts=%s",
-                        tf,
-                        scenario.ts,
-                    )
+                await asyncio.to_thread(persist_scenario, scenario)
+                feature_id = await asyncio.to_thread(
+                    persist_feature_snapshot, scenario, origin="live"
+                )
+                log.info(
+                    "MM feature snapshot stored tf=%s ts=%s id=%s",
+                    tf,
+                    scenario.ts,
+                    feature_id,
+                )
+                stage_durations["scenario_feature"] = _elapsed_ms(stage_started)
 
                 # A setup is advanced exactly once per immutable closed-bar
                 # feature. Lifecycle persistence is independent of delivery.
-                if feature_id is not None:
-                    try:
-                        lifecycle = persist_setup_lifecycle(scenario, feature_id)
-                        log.info(
-                            "MM setup lifecycle tf=%s ts=%s result=%s "
-                            "episode=%s state=%s direction=%s",
-                            tf,
-                            scenario.ts,
-                            lifecycle.get("result"),
-                            lifecycle.get("episode_id"),
-                            lifecycle.get("signal_state"),
-                            lifecycle.get("direction"),
-                        )
-                    except Exception:
-                        log.exception(
-                            "MM setup lifecycle failed tf=%s ts=%s feature_id=%s",
-                            tf,
-                            scenario.ts,
-                            feature_id,
-                        )
+                stage_started = time.perf_counter()
+                lifecycle = await asyncio.to_thread(
+                    persist_setup_lifecycle, scenario, feature_id
+                )
+                log.info(
+                    "MM setup lifecycle tf=%s ts=%s result=%s "
+                    "episode=%s state=%s direction=%s",
+                    tf,
+                    scenario.ts,
+                    lifecycle.get("result"),
+                    lifecycle.get("episode_id"),
+                    lifecycle.get("signal_state"),
+                    lifecycle.get("direction"),
+                )
+                outcome_result = await asyncio.to_thread(
+                    persist_setup_outcomes, feature_id
+                )
+                log.info(
+                    "MM setup outcomes tf=%s ts=%s seeded=%s "
+                    "evaluated=%s resolved=%s",
+                    tf,
+                    scenario.ts,
+                    outcome_result.get("seeded"),
+                    outcome_result.get("evaluated"),
+                    outcome_result.get("resolved"),
+                )
+                stage_durations["setup_layers"] = _elapsed_ms(stage_started)
 
-                    # Confirmed setup episodes receive a separate, versioned
-                    # outcome. Evaluation is bounded by this feature timestamp,
-                    # so replay/live paths cannot read future candles.
-                    try:
-                        outcome_result = persist_setup_outcomes(feature_id)
-                        log.info(
-                            "MM setup outcomes tf=%s ts=%s seeded=%s "
-                            "evaluated=%s resolved=%s",
-                            tf,
-                            scenario.ts,
-                            outcome_result.get("seeded"),
-                            outcome_result.get("evaluated"),
-                            outcome_result.get("resolved"),
-                        )
-                    except Exception:
-                        log.exception(
-                            "MM setup outcomes failed tf=%s ts=%s feature_id=%s",
-                            tf,
-                            scenario.ts,
-                            feature_id,
-                        )
+                total_ms = _elapsed_ms(run_started)
+                await asyncio.to_thread(
+                    complete_pipeline_run,
+                    run_id,
+                    symbol="BTC-USDT",
+                    tf=tf,
+                    event_ts=latest_ts,
+                    feature_id=feature_id,
+                    duration_ms=total_ms,
+                    stage_durations=stage_durations,
+                    warnings=stage_warnings,
+                    origin="live",
+                )
+                run_id = None
+                log.info(
+                    "MM pipeline completed tf=%s ts=%s duration_ms=%s stages=%s",
+                    tf,
+                    latest_ts,
+                    total_ms,
+                    stage_durations,
+                )
 
-                # отчёт уже отправляли на этот ts?
-                already_sent = _scenario_already_sent(conn, tf, view.ts)
-                if already_sent:
-                    # ✅ прошли успешно → фиксируем seen
-                    if tf not in ("D1", "W1"):
-                        seen[tf] = _iso(view.ts)
-                    continue
+            if not candidate.needs_delivery:
+                if tf in ("D1", "W1"):
+                    log.info(
+                        "MM delivery not due tf=%s ts=%s expected=%s",
+                        tf,
+                        latest_ts,
+                        _expected_close_ts(tf, now),
+                    )
+                continue
 
-                # отправляем отчёт
-                if tf == "H1":
-                    backfill_scenario_outcomes()
-                text = render_scenario(scenario)
-                await app.bot.send_message(chat_id=MM_ALERT_CHAT_ID, text=text)
+            # Delivery retry intentionally does not rebuild zones, events,
+            # features, lifecycle, or outcomes for the already completed bar.
+            if scenario is None:
+                log.info("MM delivery retry without reanalysis tf=%s ts=%s", tf, latest_ts)
+                scenario = await asyncio.to_thread(
+                    build_current_scenario, "BTC-USDT", tf
+                )
+            if scenario.ts != latest_ts:
+                raise RuntimeError(
+                    f"delivery scenario mismatch tf={tf}: "
+                    f"candidate={latest_ts} scenario={scenario.ts}"
+                )
 
-                payload = {
-                    "kind": "auto",
-                    "tf": tf,
-                    "report_ts": view.ts.isoformat(),
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                }
-                _mark_scenario_sent(conn, tf, view.ts, payload)
+            if tf == "H1":
+                await asyncio.to_thread(backfill_scenario_outcomes)
+            text_message = render_scenario(scenario)
+            await app.bot.send_message(
+                chat_id=MM_ALERT_CHAT_ID,
+                text=text_message,
+            )
+
+            payload = {
+                "kind": "auto",
+                "tf": tf,
+                "report_ts": latest_ts.isoformat(),
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+                conn.execute("SET TIME ZONE 'UTC';")
+                if not _scenario_already_sent(conn, tf, latest_ts):
+                    _mark_scenario_sent(conn, tf, latest_ts, payload)
                 conn.commit()
 
-                log.info("MM report sent tf=%s ts=%s", tf, view.ts)
+            log.info("MM report sent tf=%s ts=%s", tf, latest_ts)
 
-                # ✅ только ПОСЛЕ полного успеха отмечаем seen (чтобы не залипало)
-                if tf not in ("D1", "W1"):
-                    seen[tf] = _iso(view.ts)
-
-            except Exception:
+        except PipelineRunAlreadyActive:
+            log.info("MM pipeline already active tf=%s ts=%s", tf, latest_ts)
+            continue
+        except Exception as exc:
+            if run_id is not None:
                 try:
-                    conn.rollback()
-                except Exception:
-                    log.warning(
-                        "MM auto: DB connection was already lost during rollback"
+                    await asyncio.to_thread(
+                        fail_pipeline_run,
+                        run_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                        duration_ms=_elapsed_ms(run_started),
+                        stage_durations=stage_durations,
                     )
-                log.exception("MM auto: tick failed tf=%s", tf)
-                # ⚠️ НЕ отмечаем seen — пусть повторит на следующем тике
-                continue
+                except Exception:
+                    log.exception("MM pipeline failure persistence failed tf=%s", tf)
+            log.exception("MM auto: tick failed tf=%s", tf)
+            continue
 
 
 def schedule_mm_auto(app: Application) -> List[str]:
@@ -916,9 +958,6 @@ def schedule_mm_auto(app: Application) -> List[str]:
 
     if "mm_enabled" not in app.bot_data:
         app.bot_data["mm_enabled"] = True
-
-    if "mm_last_seen_snapshot_ts" not in app.bot_data:
-        app.bot_data["mm_last_seen_snapshot_ts"] = {}
 
     jq = app.job_queue
     if jq is None:
