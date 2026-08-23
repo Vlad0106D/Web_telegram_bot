@@ -25,7 +25,8 @@ from services.mm.live_alerts import (
     LIVE_ALERTS_ENABLED,
     live_event_tick,
 )
-from services.mm.action_engine import compute_action  # ✅ MTF-aware decision
+from services.mm.action_engine import ACTION_ENGINE_VERSION, compute_action
+from services.mm.action_outcomes import evaluate_action_path
 from services.outcomes.backfill import backfill_outcomes_once  # ✅ auto outcomes
 from services.mm.scenario_engine import (
     build_current_scenario,
@@ -263,21 +264,19 @@ def _should_send_close_report(tf: str, latest_ts: datetime, now: datetime) -> bo
 # =============================================================================
 
 
-def _thresholds(tf: str) -> Tuple[float, float, int]:
-    confirm = float((os.getenv("MM_ACTION_CONFIRM_PCT") or "0.15").strip())
-    fail = float((os.getenv("MM_ACTION_FAIL_PCT") or "0.15").strip())
+def _evaluation_config(tf: str) -> Tuple[float, float, int]:
+    """ATR stop, ATR target and evaluation horizon.
 
-    key = f"MM_ACTION_MAX_BARS_{tf}"
-    if tf == "H1":
-        d = "6"
-    elif tf == "H4":
-        d = "3"
-    elif tf == "D1":
-        d = "2"
-    else:
-        d = "1"
-    max_bars = int((os.getenv(key) or d).strip())
-    return confirm, fail, max_bars
+    The old ±0.15% first-touch evaluator was too sensitive for BTC H1 and
+    frequently marked a valid idea failed before its expected horizon.
+    """
+    stop_atr = float((os.getenv("MM_ACTION_STOP_ATR") or "1.0").strip())
+    target_atr = float((os.getenv("MM_ACTION_TARGET_ATR") or "1.5").strip())
+    defaults = {"H1": "24", "H4": "12", "D1": "10", "W1": "6"}
+    horizon = int(
+        (os.getenv(f"MM_ACTION_HORIZON_BARS_{tf}") or defaults.get(tf, "12")).strip()
+    )
+    return max(0.25, stop_atr), max(0.5, target_atr), max(1, horizon)
 
 
 def _calc_delta_pct(curr_close: float, action_close: float) -> float:
@@ -300,6 +299,54 @@ def _action_row_exists(
         return cur.fetchone() is not None
 
 
+def _setup_fingerprint_exists(
+    conn: psycopg.Connection, *, tf: str, fingerprint: str
+) -> bool:
+    if not fingerprint:
+        return False
+    sql = """
+    SELECT 1
+    FROM mm_action_engine
+    WHERE symbol='BTC-USDT'
+      AND tf=%s
+      AND payload_json->>'setup_fingerprint'=%s
+    LIMIT 1;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (tf, fingerprint))
+        return cur.fetchone() is not None
+
+
+def _atr_at(
+    conn: psycopg.Connection, *, tf: str, action_ts: datetime, fallback_price: float
+) -> float:
+    sql = """
+    SELECT high, low, close
+    FROM mm_snapshots
+    WHERE symbol='BTC-USDT' AND tf=%s AND ts <= %s
+    ORDER BY ts DESC
+    LIMIT 15;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (tf, action_ts))
+        rows = list(reversed(cur.fetchall() or []))
+    true_ranges: List[float] = []
+    previous_close: Optional[float] = None
+    for row in rows:
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+        tr = high - low
+        if previous_close is not None:
+            tr = max(tr, abs(high - previous_close), abs(low - previous_close))
+        true_ranges.append(max(0.0, tr))
+        previous_close = close
+    values = true_ranges[-14:]
+    if values and sum(values) > 0:
+        return sum(values) / len(values)
+    return max(float(fallback_price) * 0.003, 1e-9)
+
+
 def _insert_action_decision(
     conn: psycopg.Connection, *, tf: str, action_ts: datetime, action_close: float
 ) -> bool:
@@ -309,18 +356,42 @@ def _insert_action_decision(
 
     if _action_row_exists(conn, tf=tf, action_ts=action_ts):
         return False
+    if _setup_fingerprint_exists(
+        conn, tf=tf, fingerprint=dec.setup_fingerprint
+    ):
+        return False
 
     direction = "up" if dec.action == "LONG_ALLOWED" else "down"
+    stop_atr, target_atr, horizon_bars = _evaluation_config(tf)
+    atr = _atr_at(
+        conn, tf=tf, action_ts=action_ts, fallback_price=float(action_close)
+    )
+    direction_sign = 1.0 if direction == "up" else -1.0
+    stop_price = float(action_close) - direction_sign * stop_atr * atr
+    target_price = float(action_close) + direction_sign * target_atr * atr
 
     payload = {
         "status": "pending",
+        "engine": ACTION_ENGINE_VERSION,
         "action": dec.action,
         "event_type": dec.event_type,
         "reason": dec.reason,
+        "lifecycle": dec.lifecycle,
+        "mode": dec.mode,
+        "long_score": dec.long_score,
+        "short_score": dec.short_score,
+        "components": dec.components,
+        "setup_fingerprint": dec.setup_fingerprint,
+        "atr": atr,
+        "stop_atr": stop_atr,
+        "target_atr": target_atr,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "horizon_bars": horizon_bars,
         "created_at": _now_utc().isoformat(),
     }
 
-    meta = {"engine": "v1", "tf": tf}
+    meta = {"engine": ACTION_ENGINE_VERSION, "tf": tf, "mode": dec.mode}
 
     sql = """
     INSERT INTO mm_action_engine (
@@ -390,6 +461,20 @@ def _count_bars_between(
     return int(row["n"]) if row and row.get("n") is not None else 0
 
 
+def _action_path(
+    conn: psycopg.Connection, *, tf: str, from_ts: datetime, to_ts: datetime
+) -> List[Dict[str, Any]]:
+    sql = """
+    SELECT ts, high, low, close
+    FROM mm_snapshots
+    WHERE symbol='BTC-USDT' AND tf=%s AND ts > %s AND ts <= %s
+    ORDER BY ts ASC;
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (tf, from_ts, to_ts))
+        return cur.fetchall() or []
+
+
 def _update_action_eval(
     conn: psycopg.Connection,
     *,
@@ -430,7 +515,6 @@ def _update_action_eval(
 def _evaluate_pending(
     conn: psycopg.Connection, *, tf: str, latest_ts: datetime, latest_close: float
 ) -> int:
-    confirm_pct, fail_pct, max_bars = _thresholds(tf)
     pend = _fetch_pending_actions(conn, tf=tf)
     if not pend:
         return 0
@@ -455,40 +539,50 @@ def _evaluate_pending(
         if action_close_f == 0:
             continue
 
-        bars_passed = _count_bars_between(
-            conn, tf=tf, from_ts=action_ts, to_ts=latest_ts
-        )
+        path = _action_path(conn, tf=tf, from_ts=action_ts, to_ts=latest_ts)
+        bars_passed = len(path)
         delta_pct = _calc_delta_pct(float(latest_close), action_close_f)
-
-        status = "pending"
-
-        if direction == "up":
-            if delta_pct >= confirm_pct:
-                status = "confirmed"
-            elif delta_pct <= -fail_pct:
-                status = "failed"
-            elif bars_passed >= max_bars:
-                status = "failed" if delta_pct < 0 else "pending"
-
-        elif direction == "down":
-            if delta_pct <= -confirm_pct:
-                status = "confirmed"
-            elif delta_pct >= fail_pct:
-                status = "failed"
-            elif bars_passed >= max_bars:
-                status = "failed" if delta_pct > 0 else "pending"
-        else:
+        if direction not in ("up", "down"):
             continue
+        payload = r.get("payload_json") if isinstance(r.get("payload_json"), dict) else {}
+        atr = float(payload.get("atr") or _atr_at(
+            conn, tf=tf, action_ts=action_ts, fallback_price=action_close_f
+        ))
+        stop_atr, target_atr, default_horizon = _evaluation_config(tf)
+        stop_price = float(payload.get("stop_price") or (
+            action_close_f - atr * stop_atr if direction == "up"
+            else action_close_f + atr * stop_atr
+        ))
+        target_price = float(payload.get("target_price") or (
+            action_close_f + atr * target_atr if direction == "up"
+            else action_close_f - atr * target_atr
+        ))
+        horizon_bars = int(payload.get("horizon_bars") or default_horizon)
+        outcome = evaluate_action_path(
+            direction=direction,
+            action_close=action_close_f,
+            stop_price=stop_price,
+            target_price=target_price,
+            horizon_bars=horizon_bars,
+            bars=path,
+        )
+        status = str(outcome["status"])
+        eval_bar = outcome.get("eval_bar") or (path[-1] if path else None)
+        eval_ts = eval_bar["ts"] if eval_bar else latest_ts
+        eval_close = float(eval_bar["close"]) if eval_bar else float(latest_close)
+        eval_delta_pct = _calc_delta_pct(eval_close, action_close_f)
 
         patch = {
             "status": status,
-            "eval_ts": latest_ts.isoformat(),
-            "eval_close": float(latest_close),
-            "eval_delta_pct": float(delta_pct),
+            "eval_ts": eval_ts.isoformat(),
+            "eval_close": eval_close,
+            "eval_delta_pct": eval_delta_pct,
             "bars_passed": int(bars_passed),
-            "confirm_pct": float(confirm_pct),
-            "fail_pct": float(fail_pct),
-            "max_bars": int(max_bars),
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "horizon_bars": horizon_bars,
+            "mfe_pct": float(outcome["mfe_pct"]),
+            "mae_pct": float(outcome["mae_pct"]),
             "evaluated_at": _now_utc().isoformat(),
         }
 
@@ -496,9 +590,9 @@ def _evaluate_pending(
             conn,
             row_id=row_id,
             eval_status=status,
-            eval_ts=latest_ts,
-            eval_close=float(latest_close),
-            eval_delta_pct=float(delta_pct),
+            eval_ts=eval_ts,
+            eval_close=eval_close,
+            eval_delta_pct=eval_delta_pct,
             bars_passed=int(bars_passed),
             payload_patch=patch,
         )
