@@ -64,6 +64,19 @@ point-in-time feature snapshot containing:
 This is a dual-write foundation only. Telegram decisions continue to use the
 existing scenario and Action Engine paths.
 
+## Persistent setup lifecycle
+
+`setup_lifecycle_v1` groups consecutive closed-candle Action Engine readings
+into durable episodes instead of treating every candle as a new trade idea.
+The additive tables `setup_episodes`, `setup_evaluations`,
+`setup_observations`, and `setup_transitions` preserve candidate, watch, ready,
+confirmed, cancelled, and expired states. Short-lived score weakness is kept
+as an observation, direction changes close the old path, and an Action Engine
+fingerprint prevents a confirmed setup from being reopened on every candle.
+
+The lifecycle is an observational data layer. It does not alter Telegram
+alerts, Action Engine scores, or execution decisions.
+
 ## Required environment
 
 - `TELEGRAM_BOT_TOKEN` (or `TELEGRAM_TOKEN`)
