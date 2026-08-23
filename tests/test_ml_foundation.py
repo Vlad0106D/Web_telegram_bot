@@ -146,6 +146,8 @@ class MlFoundationTests(unittest.TestCase):
         self.assertGreater(payload["upper_distance_atr"], 0.0)
         self.assertGreater(payload["lower_distance_atr"], 0.0)
         self.assertFalse(payload["quality_json"]["future_data_used"])
+        self.assertTrue(payload["quality_json"]["complete"])
+        self.assertEqual(payload["quality_json"]["context_absent"], [])
         self.assertEqual(
             payload["features_json"]["action_components"]["long"]["liquidity"],
             28,
@@ -155,6 +157,24 @@ class MlFoundationTests(unittest.TestCase):
             "2026-08-21T20:00:00+00:00",
         )
         json.dumps(payload["features_json"])
+
+        scenario.lower_zones = []
+        without_lower_zone = build_feature_payload(
+            scenario=scenario,
+            snapshot=snapshot,
+            bars=rows,
+            previous_meta={"open_interest": {"open_interest": 1000.0}},
+            range_state="HOLDING",
+            origin="live",
+            available_ts=NOW + timedelta(hours=1, minutes=1),
+            config_hash="abc",
+        )
+        self.assertTrue(without_lower_zone["quality_json"]["complete"])
+        self.assertEqual(without_lower_zone["quality_json"]["missing"], [])
+        self.assertEqual(
+            without_lower_zone["quality_json"]["context_absent"],
+            ["nearest_lower_zone"],
+        )
 
 
 if __name__ == "__main__":

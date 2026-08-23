@@ -204,10 +204,11 @@ def build_feature_payload(
         missing.append("funding_rate")
     if oi is None:
         missing.append("open_interest")
+    context_absent = []
     if upper is None:
-        missing.append("nearest_upper_zone")
+        context_absent.append("nearest_upper_zone")
     if lower is None:
-        missing.append("nearest_lower_zone")
+        context_absent.append("nearest_lower_zone")
 
     features_json = _json_safe({
         "contract_hash": config_hash,
@@ -250,6 +251,7 @@ def build_feature_payload(
         "quality_json": {
             "complete": not missing,
             "missing": missing,
+            "context_absent": context_absent,
             "future_data_used": False,
         },
         "market_event": (
@@ -361,9 +363,10 @@ def persist_feature_snapshot(
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE market_scenarios
-                   SET available_ts=%s,origin=%s,algorithm_config_id=%s
+                   SET available_ts=COALESCE(available_ts,%s),
+                       algorithm_config_id=COALESCE(algorithm_config_id,%s)
                    WHERE id=%s""",
-                (known_at, origin, config_id, scenario_id),
+                (known_at, config_id, scenario_id),
             )
             cur.execute(
                 """INSERT INTO mm_features (
@@ -387,10 +390,7 @@ def persist_feature_snapshot(
                    )
                    ON CONFLICT (feature_key) WHERE feature_key IS NOT NULL
                    DO UPDATE SET
-                     available_ts=EXCLUDED.available_ts,
-                     scenario_id=EXCLUDED.scenario_id,
-                     features_json=EXCLUDED.features_json,
-                     quality_json=EXCLUDED.quality_json
+                     feature_key=EXCLUDED.feature_key
                    RETURNING id""",
                 (
                     feature_key,
