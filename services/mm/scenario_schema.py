@@ -13,10 +13,13 @@ def ensure_scenario_schema() -> None:
     url = (os.getenv("DATABASE_URL") or "").strip()
     if not url:
         raise RuntimeError("DATABASE_URL is empty")
-    migration = (
-        Path(__file__).resolve().parents[2] / "migrations" / "001_market_scenarios.sql"
-    )
+    migrations_dir = Path(__file__).resolve().parents[2] / "migrations"
+    migrations = sorted(migrations_dir.glob("*.sql"))
+    if not migrations:
+        raise RuntimeError(f"No migrations found in {migrations_dir}")
     with psycopg.connect(url) as conn:
-        conn.execute(migration.read_text(encoding="utf-8"))
-        conn.commit()
-    log.info("Scenario schema is ready")
+        for migration in migrations:
+            conn.execute(migration.read_text(encoding="utf-8"))
+            conn.commit()
+            log.info("Applied idempotent migration %s", migration.name)
+    log.info("Scenario and ML foundation schemas are ready")
