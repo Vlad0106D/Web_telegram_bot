@@ -39,6 +39,7 @@ from services.mm.scenario_replay import REPLAY_ENABLED, backfill_scenario_v2
 from services.mm.zone_store import rebuild_zones
 from services.mm.feature_store import persist_feature_snapshot
 from services.mm.setup_lifecycle import persist_setup_lifecycle
+from services.mm.setup_outcomes import persist_setup_outcomes
 
 log = logging.getLogger(__name__)
 
@@ -836,6 +837,28 @@ async def _mm_auto_tick(app: Application) -> None:
                     except Exception:
                         log.exception(
                             "MM setup lifecycle failed tf=%s ts=%s feature_id=%s",
+                            tf,
+                            scenario.ts,
+                            feature_id,
+                        )
+
+                    # Confirmed setup episodes receive a separate, versioned
+                    # outcome. Evaluation is bounded by this feature timestamp,
+                    # so replay/live paths cannot read future candles.
+                    try:
+                        outcome_result = persist_setup_outcomes(feature_id)
+                        log.info(
+                            "MM setup outcomes tf=%s ts=%s seeded=%s "
+                            "evaluated=%s resolved=%s",
+                            tf,
+                            scenario.ts,
+                            outcome_result.get("seeded"),
+                            outcome_result.get("evaluated"),
+                            outcome_result.get("resolved"),
+                        )
+                    except Exception:
+                        log.exception(
+                            "MM setup outcomes failed tf=%s ts=%s feature_id=%s",
                             tf,
                             scenario.ts,
                             feature_id,

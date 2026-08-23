@@ -77,6 +77,19 @@ fingerprint prevents a confirmed setup from being reopened on every candle.
 The lifecycle is an observational data layer. It does not alter Telegram
 alerts, Action Engine scores, or execution decisions.
 
+## Setup episode outcomes
+
+`setup_outcome_v1` creates a separate label only after an episode reaches
+`confirmed`. Entry is the confirmation close, with a 1 ATR stop, 1.5 ATR
+target, and timeframe-specific horizon. Evaluation reads only candles that
+were available after confirmation and never changes the source episode or
+feature rows.
+
+Resolved labels distinguish `target_hit`, `stop_hit`, `timeout`, and
+`ambiguous`. When both levels fall inside one OHLC candle, the result stays
+ambiguous instead of inventing an intrabar order. Pending and ambiguous rows
+are explicitly unsuitable for directional model training.
+
 ## Required environment
 
 - `TELEGRAM_BOT_TOKEN` (or `TELEGRAM_TOKEN`)
