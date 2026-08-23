@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import unittest
 
-from services.mm.action_engine import score_action_context
+from services.mm.action_engine import classify_lifecycle, score_action_context
 from services.mm.action_outcomes import evaluate_action_path
 
 
@@ -13,6 +13,32 @@ def event(event_type, side=None):
 
 
 class ActionEngineV2Tests(unittest.TestCase):
+    def test_lifecycle_confirms_at_70(self):
+        self.assertEqual(
+            classify_lifecycle(best_score=49, spread=20, has_setup_source=True),
+            "none",
+        )
+        self.assertEqual(
+            classify_lifecycle(best_score=50, spread=8, has_setup_source=True),
+            "watch",
+        )
+        self.assertEqual(
+            classify_lifecycle(best_score=64, spread=8, has_setup_source=True),
+            "ready",
+        )
+        self.assertEqual(
+            classify_lifecycle(best_score=69, spread=8, has_setup_source=True),
+            "ready",
+        )
+        self.assertEqual(
+            classify_lifecycle(best_score=70, spread=8, has_setup_source=True),
+            "confirmed",
+        )
+        self.assertEqual(
+            classify_lifecycle(best_score=90, spread=7, has_setup_source=True),
+            "none",
+        )
+
     def test_soft_mtf_conflict_reduces_score_without_blanket_veto(self):
         decision = score_action_context(
             tf="H1",
