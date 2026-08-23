@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 import unittest
 
 from services.mm.action_engine import action_engine_config
@@ -119,7 +120,9 @@ class MlFoundationTests(unittest.TestCase):
             action_lifecycle="confirmed",
             action_mode="reversal",
             action_event="liq_reclaim_up",
-            action_components={"long": {"liquidity": 28}},
+            action_components={
+                "long": {"liquidity": 28, "observed_at": NOW},
+            },
         )
         snapshot = dict(rows[-1])
         snapshot["meta_json"] = {
@@ -147,6 +150,11 @@ class MlFoundationTests(unittest.TestCase):
             payload["features_json"]["action_components"]["long"]["liquidity"],
             28,
         )
+        self.assertEqual(
+            payload["features_json"]["action_components"]["long"]["observed_at"],
+            "2026-08-21T20:00:00+00:00",
+        )
+        json.dumps(payload["features_json"])
 
 
 if __name__ == "__main__":
