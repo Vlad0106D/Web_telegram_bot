@@ -17,7 +17,7 @@ OKX_CANDLES = "https://www.okx.com/api/v5/market/candles"
 OKX_FUNDING = "https://www.okx.com/api/v5/public/funding-rate"
 OKX_OI = "https://www.okx.com/api/v5/public/open-interest"
 
-# ✅ по умолчанию берём гарантированно закрытый бар (data[1])
+# Compatibility flag retained for deployments that previously enabled it.
 MM_OKX_SMART_CANDLE_PICK = (os.getenv("MM_OKX_SMART_CANDLE_PICK", "0").strip() == "1")
 
 
@@ -85,7 +85,7 @@ def _floor_ts(tf: str, ts: datetime) -> datetime:
     raise ValueError(tf)
 
 
-def _parse_okx_candle(row: List[str]) -> Dict[str, float]:
+def _parse_okx_candle(row: List[str]) -> Dict:
     return {
         "ts_ms": int(row[0]),
         "open": float(row[1]),
@@ -93,7 +93,24 @@ def _parse_okx_candle(row: List[str]) -> Dict[str, float]:
         "low": float(row[3]),
         "close": float(row[4]),
         "volume": float(row[5]),
+        # OKX: 0 = forming candle, 1 = completed candle.
+        "confirmed": str(row[8]) == "1" if len(row) > 8 else None,
     }
+
+
+def _select_last_closed_candle(data: List[List[str]]) -> Dict:
+    """Select the newest candle explicitly confirmed by OKX.
+
+    Older mocked/provider rows may not contain the confirm field. For those
+    rows only, preserve the old safe policy and use the second returned bar.
+    """
+    parsed = [_parse_okx_candle(row) for row in data]
+    confirmed = [candle for candle in parsed if candle["confirmed"] is True]
+    if confirmed:
+        return max(confirmed, key=lambda candle: candle["ts_ms"])
+    if len(parsed) >= 2 and all(candle["confirmed"] is None for candle in parsed):
+        return parsed[1]
+    raise RuntimeError("OKX returned no confirmed candle")
 
 
 def _safe_float(x) -> Optional[float]:
@@ -126,13 +143,12 @@ async def fetch_last_closed_candle(
     tf: str,
 ) -> Tuple[datetime, Dict]:
     """
-    OKX отдаёт 2 последних бара.
+    OKX отдаёт последние бары с confirm=0/1.
     Надёжная политика:
-      - по умолчанию берём data[1] как гарантированно закрытый бар
-      - если включён MM_OKX_SMART_CANDLE_PICK=1, то пытаемся взять data[0],
-        но только если он точно закрыт по времени
+      - берём самый новый бар, для которого OKX явно вернул confirm=1
+      - для старых тестовых строк без confirm сохраняем fallback на data[1]
     """
-    params = {"instId": symbol, "bar": _tf_to_okx(tf), "limit": "2"}
+    params = {"instId": symbol, "bar": _tf_to_okx(tf), "limit": "3"}
     r = await client.get(OKX_CANDLES, params=params)
     r.raise_for_status()
     data = (r.json().get("data") or [])
@@ -140,16 +156,16 @@ async def fetch_last_closed_candle(
         raise RuntimeError(f"Not enough candles for {symbol} {tf}")
 
     c0 = _parse_okx_candle(data[0])
-    c1 = _parse_okx_candle(data[1])
-
-    # ✅ default: safest closed candle
-    cndl = c1
-    ts = datetime.fromtimestamp(c1["ts_ms"] / 1000, tz=timezone.utc)
+    cndl = _select_last_closed_candle(data)
+    ts = datetime.fromtimestamp(cndl["ts_ms"] / 1000, tz=timezone.utc)
 
     if MM_OKX_SMART_CANDLE_PICK:
         now = datetime.now(timezone.utc)
         ts0 = datetime.fromtimestamp(c0["ts_ms"] / 1000, tz=timezone.utc)
-        if now >= ts0 + timedelta(seconds=_tf_seconds(tf)):
+        if (
+            c0["confirmed"] is True
+            and now >= ts0 + timedelta(seconds=_tf_seconds(tf))
+        ):
             cndl = c0
             ts = ts0
 
@@ -288,6 +304,7 @@ async def run_snapshots_once(
                         "src": "okx",
                         "bar": _tf_to_okx(tf),
                         "ts_ms": cndl["ts_ms"],
+                        "candle_confirmed": cndl.get("confirmed"),
                         "funding": funding_map.get(symbol, {}),
                         "open_interest": oi_map.get(symbol, {}),
                         "metrics_fetched_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),

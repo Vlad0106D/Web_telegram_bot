@@ -37,6 +37,7 @@ from services.mm.scenario_schema import ensure_scenario_schema
 from services.mm.scenario_outcomes import backfill_scenario_outcomes
 from services.mm.scenario_replay import REPLAY_ENABLED, backfill_scenario_v2
 from services.mm.zone_store import rebuild_zones
+from services.mm.feature_store import persist_feature_snapshot
 
 log = logging.getLogger(__name__)
 
@@ -795,6 +796,26 @@ async def _mm_auto_tick(app: Application) -> None:
                         conn.rollback()
                         log.exception("MM auto: action persistence failed tf=%s", tf)
 
+                # Scenario persistence and ML-ready feature dual-write happen
+                # independently of Telegram delivery. Repeated ticks are
+                # idempotent by scenario and feature keys.
+                scenario = build_current_scenario("BTC-USDT", tf)
+                persist_scenario(scenario)
+                try:
+                    feature_id = persist_feature_snapshot(scenario, origin="live")
+                    log.info(
+                        "MM feature snapshot stored tf=%s ts=%s id=%s",
+                        tf,
+                        scenario.ts,
+                        feature_id,
+                    )
+                except Exception:
+                    log.exception(
+                        "MM feature snapshot failed tf=%s ts=%s",
+                        tf,
+                        scenario.ts,
+                    )
+
                 # отчёт уже отправляли на этот ts?
                 already_sent = _scenario_already_sent(conn, tf, view.ts)
                 if already_sent:
@@ -804,8 +825,6 @@ async def _mm_auto_tick(app: Application) -> None:
                     continue
 
                 # отправляем отчёт
-                scenario = build_current_scenario("BTC-USDT", tf)
-                persist_scenario(scenario)
                 if tf == "H1":
                     backfill_scenario_outcomes()
                 text = render_scenario(scenario)

@@ -30,6 +30,9 @@ chronological replay is used in live processing and backfill, preventing later
 candles from influencing an earlier state.
 
 On startup, `migrations/001_market_scenarios.sql` is applied idempotently.
+All SQL files in `migrations/` are applied in lexical order. Migration
+`002_ml_foundation.sql` extends the existing schema without replacing raw
+snapshots or historical tables.
 Normal MM processing reconstructs BTC zones automatically for each configured
 timeframe. To rebuild everything explicitly:
 
@@ -42,6 +45,24 @@ Or one series:
 ```bash
 python -m services.mm.zone_backfill --symbol BTC-USDT --tf H1
 ```
+
+## ML-ready data contract
+
+`mm_snapshots` remains the canonical closed-candle OHLCV source. Production
+selects the newest OKX candle explicitly marked `confirm=1` and keeps the
+unique `(symbol, tf, ts)` row.
+
+For every persisted live scenario, `mm_features` receives one idempotent
+point-in-time feature snapshot containing:
+
+- bar-close and actual availability timestamps;
+- immutable algorithm/configuration hash;
+- price, ATR, returns, funding and open-interest context;
+- scenario, Action Engine, MTF, range and liquidity context;
+- data-quality metadata and explicit `live`/`replay` origin.
+
+This is a dual-write foundation only. Telegram decisions continue to use the
+existing scenario and Action Engine paths.
 
 ## Required environment
 
