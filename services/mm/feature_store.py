@@ -293,6 +293,7 @@ def persist_feature_snapshot(
     *,
     origin: str = "live",
     available_ts: Optional[datetime] = None,
+    feature_key_namespace: Optional[str] = None,
 ) -> int:
     """Persist an idempotent point-in-time feature row for a scenario."""
     if origin not in {"live", "replay", "backfill"}:
@@ -356,8 +357,11 @@ def persist_feature_snapshot(
             config_hash=config_hash,
         )
         upper, lower = payload["upper"], payload["lower"]
+        namespace = (
+            f"{feature_key_namespace}:" if feature_key_namespace else ""
+        )
         feature_key = (
-            f"{origin}:{FEATURE_SET_VERSION}:{config_hash}:"
+            f"{namespace}{origin}:{FEATURE_SET_VERSION}:{config_hash}:"
             f"{int(snapshot['id'])}"
         )
         with conn.cursor() as cur:

@@ -769,7 +769,14 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
     return scenario
 
 
-def persist_scenario(s: MarketScenario) -> bool:
+def persist_scenario(
+    s: MarketScenario,
+    *,
+    origin: str = "live",
+    available_ts: Optional[datetime] = None,
+) -> bool:
+    if origin not in {"live", "replay", "backfill"}:
+        raise ValueError(f"Unsupported scenario origin: {origin}")
     def zone_payload(zone: dict) -> dict:
         return {
             "tf": zone.get("tf", s.tf),
@@ -796,6 +803,7 @@ def persist_scenario(s: MarketScenario) -> bool:
             "mode": s.action_mode,
             "event": s.action_event,
             "reason": s.action_reason,
+            "setup_fingerprint": s.action_setup_fingerprint,
             "components": s.action_components,
         },
         "active_zones": [
@@ -808,8 +816,9 @@ def persist_scenario(s: MarketScenario) -> bool:
     INSERT INTO market_scenarios (
       algorithm_version, symbol, tf, scenario_ts, price, bias, direction_score,
       setup_score, entry_score, primary_probability, state, invalidation_price,
-      entry_low, entry_high, targets_json, event_chain_json, payload_json
-    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+      entry_low, entry_high, targets_json, event_chain_json, payload_json,
+      origin, available_ts
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     ON CONFLICT (algorithm_version, symbol, tf, scenario_ts) DO UPDATE SET
       price=EXCLUDED.price, bias=EXCLUDED.bias,
       direction_score=EXCLUDED.direction_score,
@@ -842,6 +851,8 @@ def persist_scenario(s: MarketScenario) -> bool:
                     Jsonb(s.targets),
                     Jsonb(s.event_chain),
                     Jsonb(payload),
+                    origin,
+                    available_ts,
                 ),
             )
             inserted = bool(cur.fetchone()["inserted"])

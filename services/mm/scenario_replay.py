@@ -212,6 +212,96 @@ def _scenario_values(scenario: MarketScenario, deriv_bucket: Tuple[str, str]) ->
     )
 
 
+def build_historical_scenario_batch(
+    *,
+    after_ts: Optional[datetime] = None,
+    until_ts: Optional[datetime] = None,
+    limit: int = 50,
+) -> List[MarketScenario]:
+    """Build strict point-in-time H1 scenarios without writing to the DB.
+
+    The full history is walked on every call so derivative observations and
+    zone state are identical after a resume.  Only the requested cursor slice
+    is returned to the caller.
+    """
+    if limit <= 0:
+        return []
+    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC'")
+        rows = _extract_rows(conn)
+        events_by_ts = _market_events(conn)
+    if not rows:
+        return []
+
+    candles = [
+        Candle(
+            row["ts"],
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+        )
+        for row in rows
+    ]
+    zone_history = replay_zone_states(candles, symbol="BTC-USDT", tf="H1")
+    buckets = _deriv_features(rows)
+    observations: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
+    recent_market_events: List[dict] = []
+    result: List[MarketScenario] = []
+
+    for index, row in enumerate(rows):
+        if index >= 4:
+            base = index - 4
+            base_price = float(rows[base]["close"])
+            path = rows[base + 1 : index + 1]
+            if not any(value.endswith("_na") for value in buckets[base]):
+                observations[buckets[base]].append(
+                    {
+                        "ret": float(row["close"]) / base_price - 1.0,
+                        "mfe": max(float(item["high"]) for item in path)
+                        / base_price
+                        - 1.0,
+                        "mae": min(float(item["low"]) for item in path)
+                        / base_price
+                        - 1.0,
+                    }
+                )
+        recent_market_events.extend(events_by_ts.get(row["ts"], []))
+        recent_market_events = recent_market_events[-6:]
+
+        event_ts = row["ts"]
+        if after_ts is not None and event_ts <= after_ts:
+            continue
+        if until_ts is not None and event_ts > until_ts:
+            break
+        if len(result) >= limit:
+            break
+
+        deriv_score = _score_from_stats(buckets[index], observations)
+        funding_bucket, oi_bucket = buckets[index]
+        deriv_note = (
+            f"Replay Deriv {deriv_score}/100 | "
+            f"funding={funding_bucket} | OIΔ={oi_bucket}"
+            if deriv_score is not None
+            else "Replay Deriv: history insufficient | "
+            f"funding={funding_bucket} | OIΔ={oi_bucket}"
+        )
+        zones, zone_events = zone_history[event_ts]
+        result.append(
+            build_scenario(
+                symbol="BTC-USDT",
+                tf="H1",
+                ts=event_ts,
+                price=float(row["close"]),
+                zones=zones,
+                events=zone_events + recent_market_events,
+                deriv_note=deriv_note,
+                deriv_score=deriv_score,
+            )
+        )
+    return result
+
+
 def refresh_scenario_calibration() -> int:
     sql = """
     WITH grouped AS (
