@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, Literal, Any, Dict, List, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, Literal, Optional
 
-import psycopg
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
-from services.mm.market_events_store import get_market_event_for_ts  # ✅ TS-aligned event (supports layer)
-from services.mm.state_store import load_last_state
-
-
+ACTION_ENGINE_VERSION = "v2"
 ActionType = Literal["NONE", "LONG_ALLOWED", "SHORT_ALLOWED"]
-EvalStatus = Literal["pending", "confirmed", "failed", "need_more_time"]
+Lifecycle = Literal["none", "watch", "ready", "confirmed"]
 
 
 @dataclass
@@ -24,848 +16,327 @@ class ActionDecision:
     confidence: int
     reason: str
     event_type: Optional[str]
+    long_score: int = 0
+    short_score: int = 0
+    lifecycle: Lifecycle = "none"
+    mode: str = "context"
+    blocked_reason: str = ""
+    setup_fingerprint: str = ""
+    components: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
 
-# ---------------- DB helpers ----------------
-def _db_url() -> str:
-    url = (os.getenv("DATABASE_URL") or "").strip()
-    if not url:
-        raise RuntimeError("DATABASE_URL is empty")
-    return url
+def _clamp(value: float) -> int:
+    return int(round(max(0.0, min(100.0, value))))
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def _get_table_columns(conn: psycopg.Connection, table: str) -> List[str]:
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema='public' AND table_name=%s
-    ORDER BY ordinal_position;
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (table,))
-        rows = cur.fetchall() or []
-    return [r["column_name"] for r in rows]
-
-
-def _fetch_latest_btc_snapshot(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
-    sql = """
-    SELECT ts, close, meta_json
-    FROM mm_snapshots
-    WHERE symbol='BTC-USDT' AND tf=%s
-    ORDER BY ts DESC
-    LIMIT 1;
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (tf,))
-        return cur.fetchone()
-
-
-def _fetch_pending_actions(conn: psycopg.Connection, tf: str) -> List[Dict[str, Any]]:
-    cols = set(_get_table_columns(conn, "mm_action_engine"))
-    if "status" in cols:
-        sql = """
-        SELECT *
-        FROM mm_action_engine
-        WHERE symbol='BTC-USDT' AND tf=%s AND status='pending'
-        ORDER BY action_ts ASC, id ASC;
-        """
-        params = (tf,)
-    else:
-        sql = """
-        SELECT *
-        FROM mm_action_engine
-        WHERE symbol='BTC-USDT'
-          AND tf=%s
-          AND COALESCE(payload_json->>'status','')='pending'
-        ORDER BY (payload_json->>'action_ts') ASC, id ASC;
-        """
-        params = (tf,)
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, params)
-        return cur.fetchall() or []
-
-
-def _get_latest_action_row(conn: psycopg.Connection, tf: str) -> Optional[Dict[str, Any]]:
-    sql = """
-    SELECT *
-    FROM mm_action_engine
-    WHERE symbol='BTC-USDT' AND tf=%s
-    ORDER BY id DESC
-    LIMIT 1;
-    """
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(sql, (tf,))
-        return cur.fetchone()
-
-
-def _safe_float(x) -> Optional[float]:
+def _safe_int(value: Any, default: int = 0) -> int:
     try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-# ---------------- MTF helpers ----------------
-def _mtf_stack(tf: str) -> List[str]:
-    """
-    Какие ТФ должны подтверждать текущий.
-    По договорённости:
-      H1 смотрит H4 + D1
-      H4 смотрит D1
-      D1 (позже) будет смотреть W1, но пока нет
-    """
+def _range_state(state: Dict[str, Any]) -> str:
+    value = ((state or {}).get("range") or {}).get("state")
+    return str(value or "").strip()
+
+
+def _event_type(event: Optional[Dict[str, Any]]) -> Optional[str]:
+    value = (event or {}).get("event_type")
+    return str(value).strip() if value else None
+
+
+def _event_points(event_type: Optional[str], direction: str) -> int:
+    aligned = {
+        "long": {
+            "reclaim_up": 28,
+            "accept_above": 27,
+            "pressure_up": 13,
+            "sweep_low": 12,
+            "decision_zone_down": 14,
+        },
+        "short": {
+            "reclaim_down": 28,
+            "accept_below": 27,
+            "pressure_down": 13,
+            "sweep_high": 12,
+            "decision_zone_up": 14,
+        },
+    }
+    opposed = {
+        "long": {"reclaim_down", "accept_below", "pressure_down"},
+        "short": {"reclaim_up", "accept_above", "pressure_up"},
+    }
+    if event_type in aligned[direction]:
+        return aligned[direction][event_type]
+    if event_type in opposed[direction]:
+        return -18 if str(event_type).startswith(("reclaim", "accept")) else -9
+    return 0
+
+
+def _mtf_stack(tf: str) -> tuple[tuple[str, int], ...]:
     if tf == "H1":
-        return ["H4", "D1"]
+        return (("H4", 9), ("D1", 11))
     if tf == "H4":
-        return ["D1"]
-    return []  # D1, W1
+        return (("D1", 11),)
+    if tf == "D1":
+        return (("W1", 9),)
+    return ()
 
 
-def _state_allows_long(st: Dict[str, Any]) -> bool:
-    if not st:
-        return True
-    if st.get("state_icon") == "🔴":
-        return False
-    if int(st.get("prob_down", 0)) >= 60:
-        return False
-    return True
+def score_action_context(
+    *,
+    tf: str,
+    state: Dict[str, Any],
+    market_event: Optional[Dict[str, Any]],
+    liquidity_event: Optional[Dict[str, Any]],
+    higher_states: Optional[Dict[str, Dict[str, Any]]] = None,
+    deriv_score: Optional[int] = None,
+) -> ActionDecision:
+    """Pure Action Engine v2 scorer.
 
-
-def _state_allows_short(st: Dict[str, Any]) -> bool:
-    if not st:
-        return True
-    if st.get("state_icon") == "🟢":
-        return False
-    if int(st.get("prob_up", 0)) >= 60:
-        return False
-    return True
-
-
-def _mtf_filter(*, tf: str, desired_action: ActionType) -> Tuple[bool, str]:
-    stack = _mtf_stack(tf)
-    if not stack or desired_action == "NONE":
-        return True, "no_mtf_required"
-
-    for htf in stack:
-        st = load_last_state(tf=htf)
-        if desired_action == "LONG_ALLOWED" and not _state_allows_long(st or {}):
-            return False, f"MTF conflict: {htf} против LONG"
-        if desired_action == "SHORT_ALLOWED" and not _state_allows_short(st or {}):
-            return False, f"MTF conflict: {htf} против SHORT"
-
-    return True, "mtf_confirmed"
-
-
-# ---------------- Range gating (mode) ----------------
-def _range_state(st: Dict[str, Any]) -> str:
+    MTF is a weighted context, not a blanket veto. Only an extreme opposite
+    acceptance/reclaim or an accepted opposite range can hard-block a side.
+    Derivatives can adjust an existing setup but can never create one.
     """
-    ✅ FIX: range state лежит в payload['range']['state'], а не в st['range_state'].
-    """
-    r = (st or {}).get("range") or {}
-    rs = r.get("state")
-    return str(rs).strip() if rs is not None else ""
+    higher_states = higher_states or {}
+    market_type = _event_type(market_event)
+    market_side = str((market_event or {}).get("side") or "").strip()
+    if market_type == "decision_zone" and market_side:
+        market_type = f"decision_zone_{market_side}"
+
+    raw_liq_type = _event_type(liquidity_event)
+    liq_type = raw_liq_type.removeprefix("liq_") if raw_liq_type else None
+    has_setup_source = bool(
+        market_type
+        and market_type != "wait"
+        or liq_type in {"sweep_low", "sweep_high", "reclaim_up", "reclaim_down"}
+    )
+
+    scores: Dict[str, float] = {"long": 20.0, "short": 20.0}
+    components: Dict[str, Dict[str, int]] = {"long": {}, "short": {}}
+    blocks: Dict[str, str] = {"long": "", "short": ""}
+    mtf_net: Dict[str, int] = {"long": 0, "short": 0}
+
+    for direction in ("long", "short"):
+        market_points = _event_points(market_type, direction)
+        liquidity_points = _event_points(liq_type, direction)
+        probability = _safe_int(
+            state.get("prob_up" if direction == "long" else "prob_down"), 50
+        )
+        probability_points = max(-8, min(10, round((probability - 50) * 0.45)))
+        scores[direction] += market_points + liquidity_points + probability_points
+        components[direction].update(
+            market=market_points,
+            liquidity=liquidity_points,
+            probability=probability_points,
+        )
+
+    for higher_tf, weight in _mtf_stack(tf):
+        context = higher_states.get(higher_tf) or {}
+        event = str(context.get("event_type") or "")
+        for direction in ("long", "short"):
+            own_prob = _safe_int(
+                context.get("prob_up" if direction == "long" else "prob_down")
+            )
+            opposite_prob = _safe_int(
+                context.get("prob_down" if direction == "long" else "prob_up")
+            )
+            own_icon = "🟢" if direction == "long" else "🔴"
+            opposite_icon = "🔴" if direction == "long" else "🟢"
+            aligned = context.get("state_icon") == own_icon or own_prob >= 60
+            opposed = context.get("state_icon") == opposite_icon or opposite_prob >= 60
+            points = weight if aligned and not opposed else -weight if opposed and not aligned else 0
+            scores[direction] += points
+            mtf_net[direction] += points
+            components[direction][higher_tf.lower()] = points
+
+            extreme = (
+                direction == "long" and event in {"reclaim_down", "accept_below"}
+            ) or (
+                direction == "short" and event in {"reclaim_up", "accept_above"}
+            )
+            if extreme and opposite_prob >= 66:
+                blocks[direction] = f"{higher_tf}: сильное противоположное {event}"
+
+    range_state = _range_state(state)
+    if range_state in {"PENDING_ACCEPT_DOWN", "ACCEPT_DOWN"}:
+        scores["long"] -= 12
+        components["long"]["range"] = -12
+        if range_state == "ACCEPT_DOWN":
+            blocks["long"] = "диапазон принят вниз"
+    elif range_state in {"PENDING_ACCEPT_UP", "ACCEPT_UP"}:
+        scores["short"] -= 12
+        components["short"]["range"] = -12
+        if range_state == "ACCEPT_UP":
+            blocks["short"] = "диапазон принят вверх"
+    else:
+        for direction in ("long", "short"):
+            scores[direction] += 3
+            components[direction]["range"] = 3
+
+    long_confluence = market_type in {
+        "reclaim_up", "accept_above", "pressure_up"
+    } and liq_type in {"reclaim_up", "sweep_low"}
+    short_confluence = market_type in {
+        "reclaim_down", "accept_below", "pressure_down"
+    } and liq_type in {"reclaim_down", "sweep_high"}
+    if long_confluence:
+        scores["long"] += 8
+        components["long"]["confluence"] = 8
+    if short_confluence:
+        scores["short"] += 8
+        components["short"]["confluence"] = 8
+
+    if deriv_score is not None and tf == "H1" and has_setup_source:
+        adjustment = max(-6, min(6, round((_safe_int(deriv_score, 50) - 50) * 0.12)))
+        scores["long"] += adjustment
+        scores["short"] -= adjustment
+        components["long"]["deriv"] = adjustment
+        components["short"]["deriv"] = -adjustment
+
+    for direction in ("long", "short"):
+        scores[direction] = _clamp(scores[direction])
+        if blocks[direction]:
+            scores[direction] = min(scores[direction], 49)
+
+    best = "long" if scores["long"] >= scores["short"] else "short"
+    best_score = int(scores[best])
+    spread = abs(int(scores["long"]) - int(scores["short"]))
+
+    if not has_setup_source or best_score < 50 or spread < 8:
+        lifecycle: Lifecycle = "none"
+    elif best_score < 64:
+        lifecycle = "watch"
+    elif best_score < 74:
+        lifecycle = "ready"
+    else:
+        lifecycle = "confirmed"
+
+    if liq_type in {"reclaim_up", "reclaim_down", "sweep_low", "sweep_high"}:
+        mode = "reversal"
+    elif market_type in {"accept_above", "accept_below"}:
+        mode = "breakout_acceptance"
+    elif market_type in {"pressure_up", "pressure_down"}:
+        mode = "trend_continuation"
+    else:
+        mode = "context"
+    if mtf_net[best] < 0:
+        mode = "countertrend"
+
+    action: ActionType = "NONE"
+    if lifecycle == "confirmed" and not blocks[best]:
+        action = "LONG_ALLOWED" if best == "long" else "SHORT_ALLOWED"
+
+    primary_event = market_type or raw_liq_type
+    event_ts = (market_event or liquidity_event or {}).get("ts")
+    event_key = event_ts.isoformat() if isinstance(event_ts, datetime) else str(event_ts or "")
+    fingerprint = f"{tf}:{best}:{mode}:{primary_event or 'none'}:{event_key}"
+    lifecycle_ru = {
+        "none": "нет сетапа",
+        "watch": "сетап формируется",
+        "ready": "сетап готов, нужен триггер",
+        "confirmed": "условия подтверждены",
+    }[lifecycle]
+    reason = (
+        f"{lifecycle_ru}; Long {int(scores['long'])}/100 | "
+        f"Short {int(scores['short'])}/100"
+    )
+    if blocks[best]:
+        reason += f"; блок: {blocks[best]}"
+
+    return ActionDecision(
+        tf=tf,
+        action=action,
+        confidence=best_score,
+        reason=reason,
+        event_type=primary_event,
+        long_score=int(scores["long"]),
+        short_score=int(scores["short"]),
+        lifecycle=lifecycle,
+        mode=mode,
+        blocked_reason=blocks[best],
+        setup_fingerprint=fingerprint,
+        components=components,
+    )
 
 
-def _range_blocks_long(st: Dict[str, Any]) -> bool:
-    rs = _range_state(st)
-    return rs in ("PENDING_ACCEPT_DOWN", "ACCEPT_DOWN")
-
-
-def _range_blocks_short(st: Dict[str, Any]) -> bool:
-    rs = _range_state(st)
-    return rs in ("PENDING_ACCEPT_UP", "ACCEPT_UP")
-
-
-def _range_filter(*, st: Dict[str, Any], desired_action: ActionType) -> Tuple[bool, str]:
-    if desired_action == "LONG_ALLOWED" and _range_blocks_long(st):
-        return False, f"RANGE blocks LONG ({_range_state(st)})"
-    if desired_action == "SHORT_ALLOWED" and _range_blocks_short(st):
-        return False, f"RANGE blocks SHORT ({_range_state(st)})"
-    return True, "range_ok"
-
-
-# ---------------- LIQ events (local sweeps/reclaims) ----------------
-def _liq_bias_from_event(liq_ev: Optional[Dict[str, Any]]) -> Tuple[int, int, Optional[str]]:
-    """
-    Возвращает (bias_up, bias_down, liq_event_type)
-    bias_* — небольшая корректировка prob, НЕ смена режима.
-    """
-    if not liq_ev:
-        return 0, 0, None
-
-    et = str(liq_ev.get("event_type") or "").strip()
-
-    # weaker
-    if et == "liq_sweep_low":
-        return +6, -6, et
-    if et == "liq_sweep_high":
-        return -6, +6, et
-
-    # stronger (local reclaim)
-    if et == "liq_reclaim_up":
-        return +10, -10, et
-    if et == "liq_reclaim_down":
-        return -10, +10, et
-
-    return 0, 0, et
-
-
-# ---------------- Core logic ----------------
 def compute_action(tf: str) -> ActionDecision:
-    """
-    Action Mode v1.2 (MTF-aware + RANGE gate + LIQ local sweeps + LOCAL RECLAIM)
-    НЕ открывает сделки.
-    Возвращает разрешение направления или NONE.
+    from services.mm.market_events_store import get_market_event_for_ts
+    from services.mm.state_store import load_last_state
 
-    ✅ TS-aligned:
-      market event берётся по ts сохранённого mm_state (st['_state_ts'])
-      чтобы action совпадал с отчётом на этой свече.
-
-    ✅ Layer-safe:
-      market_ev берём layer='state' (исключаем liq_* и local_reclaim*)
-      liq_ev   берём layer='liq'
-    """
-    st = load_last_state(tf=tf)
-    if not st:
-        return ActionDecision(tf=tf, action="NONE", confidence=0, reason="Нет сохранённого mm_state", event_type=None)
-
-    prob_up = int(st.get("prob_up", 0))
-    prob_down = int(st.get("prob_down", 0))
-    state_title = str(st.get("state_title", "") or "")
-
-    state_ts = st.get("_state_ts")
+    state = load_last_state(tf=tf) or {}
+    if not state:
+        return ActionDecision(
+            tf=tf,
+            action="NONE",
+            confidence=0,
+            reason="Нет сохранённого состояния рынка",
+            event_type=None,
+        )
+    state_ts = state.get("_state_ts")
     if state_ts is None:
         return ActionDecision(
             tf=tf,
             action="NONE",
-            confidence=max(prob_up, prob_down),
-            reason="Нет _state_ts в mm_state (не могу TS-align)",
-            event_type=st.get("event_type"),
+            confidence=max(_safe_int(state.get("prob_up")), _safe_int(state.get("prob_down"))),
+            reason="Нет времени состояния для TS-aligned расчёта",
+            event_type=state.get("event_type"),
         )
 
-    # ✅ TS-aligned, layer-safe selection
-    market_ev = None
-    liq_ev = None
-
     try:
-        market_ev = get_market_event_for_ts(
-            tf=tf,
-            ts=state_ts,
-            symbol="BTC-USDT",
-            max_age_bars=2,
-            layer="state",
+        market_event = get_market_event_for_ts(
+            tf=tf, ts=state_ts, symbol="BTC-USDT", max_age_bars=2, layer="state"
         )
     except Exception:
-        market_ev = None
-
+        market_event = None
     try:
-        liq_ev = get_market_event_for_ts(
+        # Liquidity setup remains relevant longer than a single reporting bar.
+        memory_bars = {"H1": 8, "H4": 6, "D1": 4, "W1": 2}.get(tf, 2)
+        liquidity_event = get_market_event_for_ts(
             tf=tf,
             ts=state_ts,
             symbol="BTC-USDT",
-            max_age_bars=2,
+            max_age_bars=memory_bars,
             layer="liq",
         )
     except Exception:
-        liq_ev = None
+        liquidity_event = None
 
-    ev_type = (market_ev.get("event_type") if market_ev else None)
-    side = (market_ev.get("side") if market_ev else None)
-
-    bias_up, bias_down, liq_type = _liq_bias_from_event(liq_ev)
-    prob_up_eff = max(0, min(100, prob_up + bias_up))
-    prob_down_eff = max(0, min(100, prob_down + bias_down))
-
-    ok_r_long, why_r_long = _range_filter(st=st, desired_action="LONG_ALLOWED")
-    ok_r_short, why_r_short = _range_filter(st=st, desired_action="SHORT_ALLOWED")
-
-    # ✅ FIX: decision_zone не кладём в общий список, потому что он направленный по side.
-    long_events = ("reclaim_up", "accept_above")
-    short_events = ("reclaim_down", "accept_below")
-
-    # -----------------------------
-    # 0) WAIT: allow local reclaim / sweep as "signal-layer"
-    # -----------------------------
-    if state_title == "ОЖИДАНИЕ":
-        # local reclaim stronger than sweep
-        if liq_type == "liq_reclaim_up":
-            if ok_r_long:
-                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-                if ok_mtf:
-                    conf = max(58, min(80, prob_up_eff))
-                    return ActionDecision(
-                        tf=tf,
-                        action="LONG_ALLOWED",
-                        confidence=conf,
-                        reason=f"WAIT + {liq_type} (local reclaim) | {why_r_long} | {why_mtf}",
-                        event_type=liq_type,
-                    )
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=max(prob_up_eff, prob_down_eff),
-                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
-                    event_type=liq_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"WAIT + {liq_type} blocked | {why_r_long}",
-                event_type=liq_type,
-            )
-
-        if liq_type == "liq_reclaim_down":
-            if ok_r_short:
-                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-                if ok_mtf:
-                    conf = max(58, min(80, prob_down_eff))
-                    return ActionDecision(
-                        tf=tf,
-                        action="SHORT_ALLOWED",
-                        confidence=conf,
-                        reason=f"WAIT + {liq_type} (local reclaim) | {why_r_short} | {why_mtf}",
-                        event_type=liq_type,
-                    )
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=max(prob_up_eff, prob_down_eff),
-                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
-                    event_type=liq_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"WAIT + {liq_type} blocked | {why_r_short}",
-                event_type=liq_type,
-            )
-
-        # sweeps
-        if liq_type == "liq_sweep_low":
-            if ok_r_long:
-                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-                if ok_mtf:
-                    conf = max(55, min(75, prob_up_eff))
-                    return ActionDecision(
-                        tf=tf,
-                        action="LONG_ALLOWED",
-                        confidence=conf,
-                        reason=f"WAIT + {liq_type} (local) | {why_r_long} | {why_mtf}",
-                        event_type=liq_type,
-                    )
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=max(prob_up_eff, prob_down_eff),
-                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
-                    event_type=liq_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"WAIT + {liq_type} blocked | {why_r_long}",
-                event_type=liq_type,
-            )
-
-        if liq_type == "liq_sweep_high":
-            if ok_r_short:
-                ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-                if ok_mtf:
-                    conf = max(55, min(75, prob_down_eff))
-                    return ActionDecision(
-                        tf=tf,
-                        action="SHORT_ALLOWED",
-                        confidence=conf,
-                        reason=f"WAIT + {liq_type} (local) | {why_r_short} | {why_mtf}",
-                        event_type=liq_type,
-                    )
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=max(prob_up_eff, prob_down_eff),
-                    reason=f"WAIT + {liq_type} blocked | {why_mtf}",
-                    event_type=liq_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"WAIT + {liq_type} blocked | {why_r_short}",
-                event_type=liq_type,
-            )
-
-        return ActionDecision(tf=tf, action="NONE", confidence=0, reason="Состояние WAIT", event_type=ev_type)
-
-    # -----------------------------
-    # 0.5) decision_zone (state-layer) — направленный по side
-    # -----------------------------
-    if ev_type == "decision_zone":
-        # side="down" -> RANGE LOW -> ждём reclaim_up -> LONG bias
-        if side == "down":
-            if not ok_r_long:
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=prob_up_eff,
-                    reason=why_r_long,
-                    event_type=ev_type,
-                )
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-            if ok_mtf and prob_up_eff >= 55:
-                extra = f" | liq={liq_type}" if liq_type else ""
-                return ActionDecision(
-                    tf=tf,
-                    action="LONG_ALLOWED",
-                    confidence=min(85, prob_up_eff),
-                    reason=f"decision_zone(side=down) + prob_up={prob_up_eff}{extra} | {why_r_long} | {why_mtf}",
-                    event_type=ev_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"decision_zone(side=down) blocked | {why_mtf}",
-                event_type=ev_type,
-            )
-
-        # side="up" -> RANGE HIGH -> ждём reclaim_down -> SHORT bias
-        if side == "up":
-            if not ok_r_short:
-                return ActionDecision(
-                    tf=tf,
-                    action="NONE",
-                    confidence=prob_down_eff,
-                    reason=why_r_short,
-                    event_type=ev_type,
-                )
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-            if ok_mtf and prob_down_eff >= 55:
-                extra = f" | liq={liq_type}" if liq_type else ""
-                return ActionDecision(
-                    tf=tf,
-                    action="SHORT_ALLOWED",
-                    confidence=min(85, prob_down_eff),
-                    reason=f"decision_zone(side=up) + prob_down={prob_down_eff}{extra} | {why_r_short} | {why_mtf}",
-                    event_type=ev_type,
-                )
-            return ActionDecision(
-                tf=tf,
-                action="NONE",
-                confidence=max(prob_up_eff, prob_down_eff),
-                reason=f"decision_zone(side=up) blocked | {why_mtf}",
-                event_type=ev_type,
-            )
-
-        # если side неизвестен — безопасно ничего не разрешаем
-        return ActionDecision(
-            tf=tf,
-            action="NONE",
-            confidence=max(prob_up_eff, prob_down_eff),
-            reason="decision_zone без side — пропуск",
-            event_type=ev_type,
-        )
-
-    # -----------------------------
-    # 1) Market-driven LONG
-    # -----------------------------
-    if prob_up_eff >= 55 and ev_type in long_events and side in ("up", None):
-        if not ok_r_long:
-            return ActionDecision(tf=tf, action="NONE", confidence=prob_up_eff, reason=why_r_long, event_type=ev_type)
-        ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-        if ok_mtf:
-            extra = f" | liq={liq_type}" if liq_type else ""
-            return ActionDecision(
-                tf=tf,
-                action="LONG_ALLOWED",
-                confidence=min(90, prob_up_eff),
-                reason=f"{ev_type} + prob_up={prob_up_eff}{extra} | {why_r_long} | {why_mtf}",
-                event_type=ev_type,
-            )
-        return ActionDecision(tf=tf, action="NONE", confidence=prob_up_eff, reason=why_mtf, event_type=ev_type)
-
-    # -----------------------------
-    # 2) Market-driven SHORT
-    # -----------------------------
-    if prob_down_eff >= 55 and ev_type in short_events and side in ("down", None):
-        if not ok_r_short:
-            return ActionDecision(
-                tf=tf, action="NONE", confidence=prob_down_eff, reason=why_r_short, event_type=ev_type
-            )
-        ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-        if ok_mtf:
-            extra = f" | liq={liq_type}" if liq_type else ""
-            return ActionDecision(
-                tf=tf,
-                action="SHORT_ALLOWED",
-                confidence=min(90, prob_down_eff),
-                reason=f"{ev_type} + prob_down={prob_down_eff}{extra} | {why_r_short} | {why_mtf}",
-                event_type=ev_type,
-            )
-        return ActionDecision(tf=tf, action="NONE", confidence=prob_down_eff, reason=why_mtf, event_type=ev_type)
-
-    # -----------------------------
-    # 3) Local reclaim can generate action if market event didn't
-    # -----------------------------
-    if liq_type == "liq_reclaim_up" and prob_up_eff >= 55:
-        if ok_r_long:
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-            if ok_mtf:
-                conf = max(60, min(80, prob_up_eff))
-                return ActionDecision(
-                    tf=tf,
-                    action="LONG_ALLOWED",
-                    confidence=conf,
-                    reason=f"{liq_type} + prob_up={prob_up_eff} | {why_r_long} | {why_mtf}",
-                    event_type=liq_type,
-                )
-
-    if liq_type == "liq_reclaim_down" and prob_down_eff >= 55:
-        if ok_r_short:
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-            if ok_mtf:
-                conf = max(60, min(80, prob_down_eff))
-                return ActionDecision(
-                    tf=tf,
-                    action="SHORT_ALLOWED",
-                    confidence=conf,
-                    reason=f"{liq_type} + prob_down={prob_down_eff} | {why_r_short} | {why_mtf}",
-                    event_type=liq_type,
-                )
-
-    # -----------------------------
-    # 4) Sweeps remain a softer "early" option when prob is strong
-    # -----------------------------
-    if liq_type == "liq_sweep_low" and prob_up_eff >= 60:
-        if ok_r_long:
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="LONG_ALLOWED")
-            if ok_mtf:
-                return ActionDecision(
-                    tf=tf,
-                    action="LONG_ALLOWED",
-                    confidence=min(85, prob_up_eff),
-                    reason=f"{liq_type} + strong_up={prob_up_eff} | {why_r_long} | {why_mtf}",
-                    event_type=liq_type,
-                )
-
-    if liq_type == "liq_sweep_high" and prob_down_eff >= 60:
-        if ok_r_short:
-            ok_mtf, why_mtf = _mtf_filter(tf=tf, desired_action="SHORT_ALLOWED")
-            if ok_mtf:
-                return ActionDecision(
-                    tf=tf,
-                    action="SHORT_ALLOWED",
-                    confidence=min(85, prob_down_eff),
-                    reason=f"{liq_type} + strong_down={prob_down_eff} | {why_r_short} | {why_mtf}",
-                    event_type=liq_type,
-                )
-
-    best = max(prob_up_eff, prob_down_eff)
-    extra = f" | liq={liq_type}" if liq_type else ""
-    return ActionDecision(
-        tf=tf,
-        action="NONE",
-        confidence=best,
-        reason=f"Условия не выполнены{extra}",
-        event_type=(ev_type or liq_type),
-    )
-
-
-# -------------------------------------------------------------------
-# Ниже оставляю твой persistence/eval код без изменений (как у тебя)
-# -------------------------------------------------------------------
-
-def _thresholds(tf: str) -> Tuple[float, float, int]:
-    confirm = float((os.getenv("MM_ACTION_CONFIRM_PCT") or "0.15").strip())
-    fail = float((os.getenv("MM_ACTION_FAIL_PCT") or "0.15").strip())
-
-    key = f"MM_ACTION_MAX_BARS_{tf}"
+    higher_states = {higher_tf: load_last_state(tf=higher_tf) or {} for higher_tf, _ in _mtf_stack(tf)}
+    deriv_score: Optional[int] = None
     if tf == "H1":
-        d = "6"
-    elif tf == "H4":
-        d = "3"
-    elif tf == "D1":
-        d = "2"
-    else:
-        d = "1"
-    max_bars = int((os.getenv(key) or d).strip())
-    return confirm, fail, max_bars
+        try:
+            from services.outcomes.deriv_engine import get_deriv_now
 
+            deriv = get_deriv_now()
+            deriv_score = int(deriv.deriv_score) if deriv is not None else None
+        except Exception:
+            deriv_score = None
 
-def _calc_delta_pct(curr_close: float, action_close: float) -> float:
-    if action_close == 0:
-        return 0.0
-    return (curr_close / action_close - 1.0) * 100.0
-
-
-def _insert_action_row(
-    conn: psycopg.Connection,
-    *,
-    tf: str,
-    action_ts: datetime,
-    action_close: float,
-    decision: ActionDecision,
-    snapshot_meta: Dict[str, Any],
-) -> bool:
-    cols = set(_get_table_columns(conn, "mm_action_engine"))
-
-    last = _get_latest_action_row(conn, tf)
-    if last:
-        last_ts = (
-            last.get("action_ts")
-            or (
-                datetime.fromisoformat(last.get("payload_json", {}).get("action_ts"))
-                if isinstance(last.get("payload_json"), dict) and last.get("payload_json", {}).get("action_ts")
-                else None
-            )
-        )
-        last_action = last.get("action") or (last.get("payload_json", {}) or {}).get("action")
-        last_status = last.get("status") or (last.get("payload_json", {}) or {}).get("status")
-        if last_ts == action_ts and last_action == decision.action:
-            return False
-        if last_action == decision.action and str(last_status) == "pending":
-            return False
-
-    payload: Dict[str, Any] = {
-        "status": "pending",
-        "action_ts": action_ts.isoformat(),
-        "action_close": float(action_close),
-        "action": decision.action,
-        "confidence": int(decision.confidence),
-        "reason": decision.reason,
-        "event_type": decision.event_type,
-        "snapshot_meta": snapshot_meta or {},
-        "created_at": _now_utc().isoformat(),
-    }
-
-    values: Dict[str, Any] = {}
-    if "ts" in cols:
-        values["ts"] = action_ts
-    if "tf" in cols:
-        values["tf"] = tf
-    if "symbol" in cols:
-        values["symbol"] = "BTC-USDT"
-    if "action_ts" in cols:
-        values["action_ts"] = action_ts
-    if "action_close" in cols:
-        values["action_close"] = float(action_close)
-    if "action" in cols:
-        values["action"] = decision.action
-    if "confidence" in cols:
-        values["confidence"] = int(decision.confidence)
-    if "reason" in cols:
-        values["reason"] = decision.reason
-    if "event_type" in cols:
-        values["event_type"] = decision.event_type
-    if "status" in cols:
-        values["status"] = "pending"
-    if "payload_json" in cols:
-        values["payload_json"] = Jsonb(payload)
-
-    if not values:
-        raise RuntimeError("mm_action_engine: no compatible columns found to insert")
-
-    keys = list(values.keys())
-    placeholders = ", ".join(["%s"] * len(keys))
-    sql = f"INSERT INTO mm_action_engine ({', '.join(keys)}) VALUES ({placeholders});"
-
-    with conn.cursor() as cur:
-        cur.execute(sql, tuple(values[k] for k in keys))
-    return True
-
-
-def _update_action_eval(
-    conn: psycopg.Connection,
-    *,
-    row: Dict[str, Any],
-    eval_status: EvalStatus,
-    eval_ts: datetime,
-    eval_close: float,
-    eval_delta_pct: float,
-    bars_passed: int,
-) -> None:
-    cols = set(_get_table_columns(conn, "mm_action_engine"))
-
-    payload = row.get("payload_json") if isinstance(row.get("payload_json"), dict) else (row.get("payload_json") or {})
-    if not isinstance(payload, dict):
-        payload = {}
-
-    payload.update(
-        {
-            "status": eval_status,
-            "eval_ts": eval_ts.isoformat(),
-            "eval_close": float(eval_close),
-            "eval_delta_pct": float(eval_delta_pct),
-            "bars_passed": int(bars_passed),
-            "evaluated_at": _now_utc().isoformat(),
-        }
+    return score_action_context(
+        tf=tf,
+        state=state,
+        market_event=market_event,
+        liquidity_event=liquidity_event,
+        higher_states=higher_states,
+        deriv_score=deriv_score,
     )
-
-    sets: List[str] = []
-    params: List[Any] = []
-
-    if "status" in cols:
-        sets.append("status=%s")
-        params.append(eval_status)
-
-    if "eval_status" in cols:
-        sets.append("eval_status=%s")
-        params.append(eval_status)
-
-    if "eval_ts" in cols:
-        sets.append("eval_ts=%s")
-        params.append(eval_ts)
-
-    if "eval_close" in cols:
-        sets.append("eval_close=%s")
-        params.append(float(eval_close))
-
-    if "eval_delta_pct" in cols:
-        sets.append("eval_delta_pct=%s")
-        params.append(float(eval_delta_pct))
-
-    if "bars_passed" in cols:
-        sets.append("bars_passed=%s")
-        params.append(int(bars_passed))
-
-    if "payload_json" in cols:
-        sets.append("payload_json=%s")
-        params.append(Jsonb(payload))
-
-    if not sets:
-        return
-
-    sql = f"UPDATE mm_action_engine SET {', '.join(sets)} WHERE id=%s;"
-    params.append(row["id"])
-
-    with conn.cursor() as cur:
-        cur.execute(sql, tuple(params))
 
 
 def update_action_engine_for_tf(tf: str) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"tf": tf, "inserted": False, "evaluated": 0, "latest_ts": None}
-
-    confirm_pct, fail_pct, max_bars = _thresholds(tf)
-
-    with psycopg.connect(_db_url(), row_factory=dict_row) as conn:
-        conn.execute("SET TIME ZONE 'UTC';")
-
-        snap = _fetch_latest_btc_snapshot(conn, tf)
-        if not snap:
-            return {**out, "error": "no_snapshots"}
-
-        ts: datetime = snap["ts"]
-        close = float(snap["close"])
-        meta = snap.get("meta_json") or {}
-
-        out["latest_ts"] = ts.isoformat()
-
-        decision = compute_action(tf)
-        if decision.action != "NONE":
-            inserted = _insert_action_row(
-                conn,
-                tf=tf,
-                action_ts=ts,
-                action_close=close,
-                decision=decision,
-                snapshot_meta=meta,
-            )
-            out["inserted"] = bool(inserted)
-            out["action"] = decision.action
-            out["confidence"] = decision.confidence
-            out["reason"] = decision.reason
-            out["event_type"] = decision.event_type
-        else:
-            out["action"] = "NONE"
-            out["confidence"] = decision.confidence
-            out["reason"] = decision.reason
-            out["event_type"] = decision.event_type
-
-        pend = _fetch_pending_actions(conn, tf)
-        evaluated = 0
-
-        for r in pend:
-            action_ts = r.get("action_ts")
-            if action_ts is None:
-                pj = r.get("payload_json") or {}
-                if isinstance(pj, dict) and pj.get("action_ts"):
-                    try:
-                        action_ts = datetime.fromisoformat(pj["action_ts"])
-                    except Exception:
-                        action_ts = None
-            if action_ts is None:
-                continue
-            if action_ts == ts:
-                continue
-
-            action_close = r.get("action_close")
-            if action_close is None:
-                pj = r.get("payload_json") or {}
-                if isinstance(pj, dict):
-                    action_close = pj.get("action_close")
-            action_close_f = _safe_float(action_close)
-            if action_close_f is None:
-                continue
-
-            act = r.get("action") or (
-                ((r.get("payload_json") or {}) if isinstance(r.get("payload_json"), dict) else {}).get("action")
-            )
-            if act not in ("LONG_ALLOWED", "SHORT_ALLOWED"):
-                continue
-
-            sql_bars = """
-            SELECT COUNT(*) AS n
-            FROM mm_snapshots
-            WHERE symbol='BTC-USDT' AND tf=%s AND ts > %s AND ts <= %s;
-            """
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql_bars, (tf, action_ts, ts))
-                nrow = cur.fetchone()
-            bars_passed = int(nrow["n"]) if nrow and nrow.get("n") is not None else 0
-
-            delta_pct = _calc_delta_pct(close, action_close_f)
-
-            status: EvalStatus = "need_more_time"
-            if act == "LONG_ALLOWED":
-                if delta_pct >= confirm_pct:
-                    status = "confirmed"
-                elif delta_pct <= -fail_pct:
-                    status = "failed"
-                elif bars_passed >= max_bars:
-                    status = "failed" if delta_pct < 0 else "need_more_time"
-
-            if act == "SHORT_ALLOWED":
-                if delta_pct <= -confirm_pct:
-                    status = "confirmed"
-                elif delta_pct >= fail_pct:
-                    status = "failed"
-                elif bars_passed >= max_bars:
-                    status = "failed" if delta_pct > 0 else "need_more_time"
-
-            write_status: EvalStatus = status
-            if status == "need_more_time":
-                write_status = "pending"
-
-            _update_action_eval(
-                conn,
-                row=r,
-                eval_status=write_status,
-                eval_ts=ts,
-                eval_close=close,
-                eval_delta_pct=delta_pct,
-                bars_passed=bars_passed,
-            )
-            evaluated += 1
-
-        conn.commit()
-        out["evaluated"] = evaluated
-        return out
+    """Compatibility wrapper; production persistence is owned by mm.auto."""
+    decision = compute_action(tf)
+    return {
+        "tf": tf,
+        "inserted": False,
+        "evaluated": 0,
+        "action": decision.action,
+        "confidence": decision.confidence,
+        "reason": decision.reason,
+        "event_type": decision.event_type,
+        "lifecycle": decision.lifecycle,
+        "long_score": decision.long_score,
+        "short_score": decision.short_score,
+        "engine": ACTION_ENGINE_VERSION,
+    }
