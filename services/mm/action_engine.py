@@ -5,6 +5,9 @@ from datetime import datetime
 from typing import Any, Dict, Literal, Optional
 
 ACTION_ENGINE_VERSION = "v2"
+ACTION_WATCH_SCORE = 50
+ACTION_READY_SCORE = 64
+ACTION_CONFIRM_SCORE = 70
 ActionType = Literal["NONE", "LONG_ALLOWED", "SHORT_ALLOWED"]
 Lifecycle = Literal["none", "watch", "ready", "confirmed"]
 
@@ -72,6 +75,19 @@ def _event_points(event_type: Optional[str], direction: str) -> int:
     if event_type in opposed[direction]:
         return -18 if str(event_type).startswith(("reclaim", "accept")) else -9
     return 0
+
+
+def classify_lifecycle(
+    *, best_score: int, spread: int, has_setup_source: bool
+) -> Lifecycle:
+    """Map a scored setup to its lifecycle stage."""
+    if not has_setup_source or best_score < ACTION_WATCH_SCORE or spread < 8:
+        return "none"
+    if best_score < ACTION_READY_SCORE:
+        return "watch"
+    if best_score < ACTION_CONFIRM_SCORE:
+        return "ready"
+    return "confirmed"
 
 
 def _mtf_stack(tf: str) -> tuple[tuple[str, int], ...]:
@@ -204,14 +220,11 @@ def score_action_context(
     best_score = int(scores[best])
     spread = abs(int(scores["long"]) - int(scores["short"]))
 
-    if not has_setup_source or best_score < 50 or spread < 8:
-        lifecycle: Lifecycle = "none"
-    elif best_score < 64:
-        lifecycle = "watch"
-    elif best_score < 74:
-        lifecycle = "ready"
-    else:
-        lifecycle = "confirmed"
+    lifecycle = classify_lifecycle(
+        best_score=best_score,
+        spread=spread,
+        has_setup_source=has_setup_source,
+    )
 
     if liq_type in {"reclaim_up", "reclaim_down", "sweep_low", "sweep_high"}:
         mode = "reversal"
