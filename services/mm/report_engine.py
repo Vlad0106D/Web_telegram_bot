@@ -680,6 +680,10 @@ class MarketView:
     action_confidence: int
     action_reason: str
     action_event_type: Optional[str]
+    action_long_score: int
+    action_short_score: int
+    action_lifecycle: str
+    action_mode: str
 
     mtf_context: List[Dict[str, Any]]
 
@@ -914,6 +918,10 @@ def build_market_view(tf: str, *, manual: bool = False) -> MarketView:
             action_confidence=int(act.confidence),
             action_reason=str(act.reason),
             action_event_type=act.event_type,
+            action_long_score=int(act.long_score),
+            action_short_score=int(act.short_score),
+            action_lifecycle=act.lifecycle,
+            action_mode=act.mode,
 
             mtf_context=mtf_context,
         )
@@ -933,8 +941,14 @@ def render_report(view: MarketView) -> str:
     lines.append(f"Вероятность: ↓ {view.prob_down}% | ↑ {view.prob_up}%")
     lines.append("")
 
-    lines.append("ACTION ENGINE (v1):")
-    lines.append(f"• Decision: {view.action} | confidence: {view.action_confidence}%")
+    lines.append("ACTION ENGINE (v2):")
+    lines.append(f"• Decision: {view.action}")
+    lines.append(
+        f"• Long {view.action_long_score}/100 | Short {view.action_short_score}/100"
+    )
+    lines.append(
+        f"• Stage: {view.action_lifecycle.upper()} | Mode: {view.action_mode}"
+    )
     if view.action_event_type:
         lines.append(f"• Event: {view.action_event_type}")
     lines.append(f"• Reason: {view.action_reason}")

@@ -63,7 +63,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("Direction ", text)
         self.assertIn("Setup ", text)
         self.assertIn("Entry ", text)
-        self.assertIn("⚙️ ACTION ENGINE (v1)", text)
+        self.assertIn("⚙️ ACTION ENGINE (v2)", text)
         self.assertIn("Инвалидация:", text)
         self.assertIn("🧲 ЛИКВИДНОСТЬ", text)
         self.assertIn("Ближайшая сверху:", text)

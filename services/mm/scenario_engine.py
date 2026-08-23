@@ -53,6 +53,10 @@ class MarketScenario:
     action_confidence: int = 0
     action_event: Optional[str] = None
     action_reason: str = ""
+    action_long_score: int = 0
+    action_short_score: int = 0
+    action_lifecycle: str = "none"
+    action_mode: str = "context"
     mtf_context: List[dict] = field(default_factory=list)
 
 
@@ -538,9 +542,10 @@ def render_scenario(s: MarketScenario) -> str:
 
     lines += [
         "",
-        "⚙️ ACTION ENGINE (v1)",
+        "⚙️ ACTION ENGINE (v2)",
         f"Decision: {s.action_decision}",
-        f"Confidence: {s.action_confidence}%",
+        f"Long {s.action_long_score}/100 │ Short {s.action_short_score}/100",
+        f"Stage: {s.action_lifecycle.upper()} │ Mode: {s.action_mode}",
         f"Event: {s.action_event or '—'}",
         f"Reason: {s.action_reason or 'решение сценарного слоя'}",
     ]
@@ -698,6 +703,10 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         scenario.action_confidence = int(action.confidence)
         scenario.action_event = action.event_type
         scenario.action_reason = action.reason
+        scenario.action_long_score = int(action.long_score)
+        scenario.action_short_score = int(action.short_score)
+        scenario.action_lifecycle = action.lifecycle
+        scenario.action_mode = action.mode
     except Exception:
         scenario.action_reason = "Action Engine временно недоступен"
 
@@ -774,6 +783,16 @@ def persist_scenario(s: MarketScenario) -> bool:
         "entry_breakdown": s.entry_breakdown,
         "invalidation_source": s.invalidation_source,
         "calibration_note": s.calibration_note,
+        "action_engine": {
+            "version": "v2",
+            "decision": s.action_decision,
+            "long_score": s.action_long_score,
+            "short_score": s.action_short_score,
+            "lifecycle": s.action_lifecycle,
+            "mode": s.action_mode,
+            "event": s.action_event,
+            "reason": s.action_reason,
+        },
         "active_zones": [
             zone_payload(zone) for zone in (s.upper_zones + s.lower_zones)
         ],
