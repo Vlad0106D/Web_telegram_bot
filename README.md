@@ -103,6 +103,20 @@ Real candle-processing attempts and per-stage durations are stored in
 event loop, allowing M5 live events and TradFi jobs to remain responsive while
 a higher-timeframe candle is processed.
 
+## Historical setup replay
+
+`setup_replay_v1` walks the existing BTC H1 snapshot history chronologically
+and sends each candle through the current point-in-time scenario, Action
+Engine v2, setup lifecycle, and confirmed-only outcome chain. H4 and D1 are
+used only after their historical candles had closed, preventing MTF lookahead.
+
+Replay features, episodes, evaluations, and outcomes use `origin='replay'` and
+never participate in live Telegram decisions. `setup_replay_state` freezes the
+initial cutoff, stores the completed cursor, and leases one small batch at a
+time so deploys and overlapping instances resume safely. Defaults are 50 H1
+candles per batch every 10 minutes; `SETUP_REPLAY_BATCH_SIZE`,
+`SETUP_REPLAY_INTERVAL_SEC`, and `SETUP_REPLAY_ENABLED` can tune or disable it.
+
 ## Required environment
 
 - `TELEGRAM_BOT_TOKEN` (or `TELEGRAM_TOKEN`)
