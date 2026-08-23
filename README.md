@@ -90,6 +90,19 @@ Resolved labels distinguish `target_hit`, `stop_hit`, `timeout`, and
 ambiguous instead of inventing an intrabar order. Pending and ambiguous rows
 are explicitly unsuitable for directional model training.
 
+## Durable production pipeline
+
+`mm_pipeline_v1` records one persistent completion cursor per symbol and
+timeframe in `mm_pipeline_checkpoints`. Restarts therefore do not rebuild D1
+and W1 zones every minute or repeat an already completed H1/H4 analysis.
+Telegram delivery is tracked separately, so a network timeout retries only the
+message and never reruns zones, features, setup lifecycle, or outcomes.
+
+Real candle-processing attempts and per-stage durations are stored in
+`mm_pipeline_runs`. Slow synchronous analysis is executed outside the asyncio
+event loop, allowing M5 live events and TradFi jobs to remain responsive while
+a higher-timeframe candle is processed.
+
 ## Required environment
 
 - `TELEGRAM_BOT_TOKEN` (or `TELEGRAM_TOKEN`)
