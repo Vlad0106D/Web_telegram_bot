@@ -8,6 +8,16 @@ ACTION_ENGINE_VERSION = "v2"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
+ACTION_MIN_SCORE_SPREAD = 8
+ACTION_DERIVATIVE_CAP = 6
+ACTION_DERIVATIVE_SLOPE = 0.12
+ACTION_MTF_WEIGHTS = {
+    "H1": (("H4", 9), ("D1", 11)),
+    "H4": (("D1", 11),),
+    "D1": (("W1", 9),),
+    "W1": (),
+}
+ACTION_LIQUIDITY_MEMORY_BARS = {"H1": 8, "H4": 6, "D1": 4, "W1": 2}
 ActionType = Literal["NONE", "LONG_ALLOWED", "SHORT_ALLOWED"]
 Lifecycle = Literal["none", "watch", "ready", "confirmed"]
 
@@ -81,7 +91,11 @@ def classify_lifecycle(
     *, best_score: int, spread: int, has_setup_source: bool
 ) -> Lifecycle:
     """Map a scored setup to its lifecycle stage."""
-    if not has_setup_source or best_score < ACTION_WATCH_SCORE or spread < 8:
+    if (
+        not has_setup_source
+        or best_score < ACTION_WATCH_SCORE
+        or spread < ACTION_MIN_SCORE_SPREAD
+    ):
         return "none"
     if best_score < ACTION_READY_SCORE:
         return "watch"
@@ -91,13 +105,25 @@ def classify_lifecycle(
 
 
 def _mtf_stack(tf: str) -> tuple[tuple[str, int], ...]:
-    if tf == "H1":
-        return (("H4", 9), ("D1", 11))
-    if tf == "H4":
-        return (("D1", 11),)
-    if tf == "D1":
-        return (("W1", 9),)
-    return ()
+    return ACTION_MTF_WEIGHTS.get(tf, ())
+
+
+def action_engine_config() -> Dict[str, Any]:
+    """Serializable scoring contract stored with point-in-time features."""
+    return {
+        "version": ACTION_ENGINE_VERSION,
+        "watch_score": ACTION_WATCH_SCORE,
+        "ready_score": ACTION_READY_SCORE,
+        "confirm_score": ACTION_CONFIRM_SCORE,
+        "min_score_spread": ACTION_MIN_SCORE_SPREAD,
+        "mtf_weights": {
+            tf: [[higher_tf, weight] for higher_tf, weight in stack]
+            for tf, stack in ACTION_MTF_WEIGHTS.items()
+        },
+        "derivative_cap": ACTION_DERIVATIVE_CAP,
+        "derivative_slope": ACTION_DERIVATIVE_SLOPE,
+        "liquidity_memory_bars": ACTION_LIQUIDITY_MEMORY_BARS,
+    }
 
 
 def score_action_context(
@@ -205,7 +231,16 @@ def score_action_context(
         components["short"]["confluence"] = 8
 
     if deriv_score is not None and tf == "H1" and has_setup_source:
-        adjustment = max(-6, min(6, round((_safe_int(deriv_score, 50) - 50) * 0.12)))
+        adjustment = max(
+            -ACTION_DERIVATIVE_CAP,
+            min(
+                ACTION_DERIVATIVE_CAP,
+                round(
+                    (_safe_int(deriv_score, 50) - 50)
+                    * ACTION_DERIVATIVE_SLOPE
+                ),
+            ),
+        )
         scores["long"] += adjustment
         scores["short"] -= adjustment
         components["long"]["deriv"] = adjustment
@@ -305,7 +340,7 @@ def compute_action(tf: str) -> ActionDecision:
         market_event = None
     try:
         # Liquidity setup remains relevant longer than a single reporting bar.
-        memory_bars = {"H1": 8, "H4": 6, "D1": 4, "W1": 2}.get(tf, 2)
+        memory_bars = ACTION_LIQUIDITY_MEMORY_BARS.get(tf, 2)
         liquidity_event = get_market_event_for_ts(
             tf=tf,
             ts=state_ts,
