@@ -124,7 +124,7 @@ def _entry_with_live_event(
     chain = list(scenario.event_chain)
     if event and not event["type"].startswith("accept_candidate"):
         chain.append(str(event["label"]))
-    return score_entry_readiness(
+    entry, breakdown = score_entry_readiness(
         scenario.bias,
         price,
         scenario.targets[0] if scenario.targets else None,
@@ -132,6 +132,8 @@ def _entry_with_live_event(
         chain,
         scenario.deriv_score,
     )
+    breakdown["invalidation_source"] = scenario.invalidation_source
+    return entry, breakdown
 
 
 def _choose_alert(
@@ -254,6 +256,10 @@ def _render_alert(
             f"подтверждение {breakdown['confirmation']}/20"
         ),
     ]
+    if breakdown.get("blocked_reason"):
+        lines.append(f"Блокировка входа: {breakdown['blocked_reason']}")
+    elif breakdown.get("invalidation_source") == "historical_h1_structure":
+        lines.append("Инвалидация: ближайшая историческая H1-структура")
     if alert["type"].startswith("sweep"):
         lines.append("Статус: предварительный — ждём reclaim или acceptance на следующей M5")
     elif alert["type"] == "entry_ready":
