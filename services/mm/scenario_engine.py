@@ -16,7 +16,7 @@ from services.mm.zone_store import (
     load_recent_zone_events,
 )
 
-SCENARIO_VERSION = "scenario_v2"
+SCENARIO_VERSION = "scenario_v3"
 Bias = Literal["long", "short", "neutral"]
 State = Literal["no_trade", "context_update", "setup_watch", "setup_ready"]
 
@@ -42,6 +42,7 @@ class MarketScenario:
     historical_zones: List[dict] = field(default_factory=list)
     higher_tf_zones: List[dict] = field(default_factory=list)
     invalidation_price: Optional[float] = None
+    invalidation_source: str = ""
     entry_low: Optional[float] = None
     entry_high: Optional[float] = None
     deriv_note: str = "данных недостаточно"
@@ -144,8 +145,13 @@ def _zone_bias(zones: Sequence[dict], price: float) -> Tuple[int, List[str]]:
 
 
 def _derive_levels(
-    bias: Bias, zones: Sequence[dict], price: float
-) -> Tuple[List[float], List[float], Optional[float], Optional[float], Optional[float]]:
+    bias: Bias,
+    zones: Sequence[dict],
+    price: float,
+    invalidation_zones: Sequence[dict] = (),
+) -> Tuple[
+    List[float], List[float], Optional[float], Optional[float], Optional[float], str
+]:
     upper = sorted(
         (
             float(z["center_price"])
@@ -164,19 +170,45 @@ def _derive_levels(
     if bias == "long":
         targets, alternatives = upper[:3], lower[:3]
         invalidation = lower[0] if lower else None
+        invalidation_side = "lower"
     elif bias == "short":
         targets, alternatives = lower[:3], upper[:3]
         invalidation = upper[0] if upper else None
+        invalidation_side = "upper"
     else:
-        return [], [], None, None, None
+        return [], [], None, None, None, ""
+    invalidation_source = "active_h1" if invalidation is not None else ""
     if invalidation is None:
-        return targets, alternatives, None, None, None
+        fallback = sorted(
+            (
+                z for z in invalidation_zones
+                if z.get("side") == invalidation_side
+                and str(z.get("status")) in ("accepted", "reclaimed")
+                and (
+                    float(z["center_price"]) < price
+                    if bias == "long"
+                    else float(z["center_price"]) > price
+                )
+            ),
+            key=lambda z: (
+                abs(float(z["center_price"]) - price),
+                -int(z.get("strength") or 0),
+            ),
+        )
+        if fallback:
+            invalidation = float(fallback[0]["center_price"])
+            invalidation_source = "historical_h1_structure"
+    if invalidation is None:
+        return targets, alternatives, None, None, None, ""
     pullback_depth = abs(invalidation - price) * 0.35
     if bias == "long":
         entry_low, entry_high = invalidation, invalidation + pullback_depth
     else:
         entry_low, entry_high = invalidation - pullback_depth, invalidation
-    return targets, alternatives, invalidation, entry_low, entry_high
+    return (
+        targets, alternatives, invalidation, entry_low, entry_high,
+        invalidation_source,
+    )
 
 
 def score_entry_readiness(
@@ -187,22 +219,11 @@ def score_entry_readiness(
     event_chain: Sequence[str],
     deriv_score: Optional[int],
 ) -> Tuple[int, dict]:
-    if bias == "neutral" or target is None or invalidation is None:
-        return 10, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
-    risk = abs(price - invalidation)
-    reward = abs(target - price)
-    if risk <= 0 or reward <= 0:
-        return 5, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
-    valid_levels = (bias == "long" and invalidation < price < target) or (
-        bias == "short" and target < price < invalidation
-    )
-    if not valid_levels:
-        return 5, {"position": 0, "structure": 0, "rr": 0, "confirmation": 0}
-
-    rr = reward / risk
-    position = _clamp(min(30.0, 30.0 * reward / (reward + risk)))
-    rr_score = _clamp(min(20.0, rr / 2.0 * 20.0))
-
+    if bias == "neutral":
+        return 0, {
+            "position": 0, "structure": 0, "rr": 0, "confirmation": 0,
+            "plan_complete": False, "blocked_reason": "направление не определено",
+        }
     chain = set(event_chain)
     aligned_reclaim = "reclaim up" if bias == "long" else "reclaim down"
     aligned_accept = "accept above" if bias == "long" else "accept below"
@@ -243,13 +264,38 @@ def score_entry_readiness(
         elif deriv_opposed:
             confirmation -= 6
     confirmation = _clamp(min(20, max(0, confirmation)))
+
+    blocked_reason = ""
+    if target is None:
+        blocked_reason = "нет валидной цели"
+    elif invalidation is None:
+        blocked_reason = "нет валидной инвалидации"
+    else:
+        risk = abs(price - invalidation)
+        reward = abs(target - price)
+        valid_levels = (bias == "long" and invalidation < price < target) or (
+            bias == "short" and target < price < invalidation
+        )
+        if risk <= 0 or reward <= 0 or not valid_levels:
+            blocked_reason = "цель и инвалидация расположены некорректно"
+
+    if blocked_reason:
+        position = 0
+        rr_score = 0
+    else:
+        rr = reward / risk
+        position = _clamp(min(30.0, 30.0 * reward / (reward + risk)))
+        rr_score = _clamp(min(20.0, rr / 2.0 * 20.0))
     breakdown = {
         "position": position,
         "structure": structure,
         "rr": rr_score,
         "confirmation": confirmation,
+        "plan_complete": not blocked_reason,
+        "blocked_reason": blocked_reason,
     }
-    return _clamp(sum(breakdown.values())), breakdown
+    score = position + structure + rr_score + confirmation
+    return _clamp(min(49, score) if blocked_reason else score), breakdown
 
 
 def build_scenario(
@@ -260,6 +306,7 @@ def build_scenario(
     price: float,
     zones: Sequence[dict],
     events: Sequence[dict],
+    invalidation_zones: Sequence[dict] = (),
     deriv_note: str = "данных недостаточно",
     deriv_score: Optional[int] = None,
 ) -> MarketScenario:
@@ -318,9 +365,10 @@ def build_scenario(
         + confluence
         - (20 if conflicting else 0)
     )
-    targets, alternatives, invalidation, entry_low, entry_high = _derive_levels(
-        bias, zones, price
-    )
+    (
+        targets, alternatives, invalidation, entry_low, entry_high,
+        invalidation_source,
+    ) = _derive_levels(bias, zones, price, invalidation_zones)
     upper_zones = sorted(
         (dict(z) for z in zones if z["side"] == "upper"),
         key=lambda z: float(z["center_price"]),
@@ -370,6 +418,7 @@ def build_scenario(
         upper_zones=upper_zones,
         lower_zones=lower_zones,
         invalidation_price=invalidation,
+        invalidation_source=invalidation_source,
         entry_low=entry_low,
         entry_high=entry_high,
         deriv_note=deriv_note,
@@ -442,6 +491,8 @@ def _decision_view(s: MarketScenario) -> Tuple[str, str, str]:
 def _entry_requirements(s: MarketScenario) -> List[str]:
     parts = s.entry_breakdown
     missing: List[str] = []
+    if parts.get("blocked_reason"):
+        missing.append(str(parts["blocked_reason"]))
     if parts.get("position", 0) < 18:
         missing.append("подход цены к рабочей входной области")
     if parts.get("structure", 0) < 18:
@@ -520,11 +571,15 @@ def render_scenario(s: MarketScenario) -> str:
             lines.append(f"Входная область: {_fmt_price(s.entry_low)}–{_fmt_price(s.entry_high)}")
         else:
             lines.append("Входная область: пока не сформирована")
-        lines.append(
-            f"Инвалидация: {_fmt_price(s.invalidation_price)}"
-            if s.invalidation_price is not None
-            else "Инвалидация: не определена активной встречной зоной"
-        )
+        if s.invalidation_price is not None:
+            source = (
+                " │ историческая H1-структура"
+                if s.invalidation_source == "historical_h1_structure"
+                else ""
+            )
+            lines.append(f"Инвалидация: {_fmt_price(s.invalidation_price)}{source}")
+        else:
+            lines.append("Инвалидация: не определена встречной структурой")
         if s.targets:
             lines.append("Цели: " + " → ".join(_fmt_price(x) for x in s.targets))
         if s.alternative_targets:
@@ -626,6 +681,7 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         price=price,
         zones=zones,
         events=events,
+        invalidation_zones=historical_zones,
         deriv_note=deriv_note,
         deriv_score=deriv_score,
     )
@@ -716,6 +772,7 @@ def persist_scenario(s: MarketScenario) -> bool:
         "deriv_note": s.deriv_note,
         "zone_version": ZONE_VERSION,
         "entry_breakdown": s.entry_breakdown,
+        "invalidation_source": s.invalidation_source,
         "calibration_note": s.calibration_note,
         "active_zones": [
             zone_payload(zone) for zone in (s.upper_zones + s.lower_zones)
