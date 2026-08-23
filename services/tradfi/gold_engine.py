@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -11,6 +12,7 @@ BASE = "https://www.okx.com"
 SWAP = "XAU-USDT-SWAP"
 INDEX = "XAU-USDT"
 BARS = {"M1": "1m", "M5": "5m", "M15": "15m", "H1": "1H"}
+EXECUTION_TZ = ZoneInfo("America/Chicago")
 
 
 class GoldDataError(RuntimeError):
@@ -61,6 +63,47 @@ def _atr(items: Sequence[Candle], period: int = 14) -> float:
         for a, b in zip(items[:-1], items[1:])
     ][-period:]
     return sum(values) / len(values)
+
+
+def _execution_market_open(now: datetime) -> bool:
+    """Conservative XAU CFD session gate in Chicago exchange time.
+
+    The OKX reference can keep printing during the weekend while the Bybit CFD
+    used for execution is closed.  Gold is considered tradable Sunday 17:00
+    through Friday 16:00 CT, excluding the regular 16:00-17:00 CT break.
+    ZoneInfo keeps the UTC boundary correct across daylight-saving changes.
+    """
+    local = now.astimezone(EXECUTION_TZ)
+    weekday = local.weekday()
+    minute = local.hour * 60 + local.minute
+    if weekday == 5:  # Saturday
+        return False
+    if weekday == 6:  # Sunday
+        return minute >= 17 * 60
+    if weekday == 4:  # Friday
+        return minute < 16 * 60
+    return not (16 * 60 <= minute < 17 * 60)
+
+
+def _market_activity(items: Sequence[Candle], now: datetime) -> Dict:
+    """Reject fresh-looking but frozen/micro-tick reference candles."""
+    recent = list(items[-6:])
+    stale = (now - (recent[-1].ts + timedelta(minutes=1))).total_seconds()
+    price_range = max(x.h for x in recent) - min(x.l for x in recent)
+    distinct_closes = len({round(x.c, 2) for x in recent})
+    active = stale <= 180 and price_range >= .12 and distinct_closes >= 3
+    reason = "active"
+    if stale > 180:
+        reason = "stale_m1"
+    elif price_range < .12 or distinct_closes < 3:
+        reason = "frozen_quotes"
+    return {
+        "active": active,
+        "reason": reason,
+        "range": price_range,
+        "distinct_closes": distinct_closes,
+        "stale": stale,
+    }
 
 
 def _context(items: Sequence[Candle]) -> Tuple[str, int]:
@@ -278,8 +321,19 @@ async def assess_gold_now() -> Dict:
         tactical_side = selected["side"]
     idx = _n(index.get("idxPx"))
     basis = (price/idx-1)*100 if idx else None
-    stale = (datetime.now(timezone.utc)-(candles["M1"][-1].ts+timedelta(minutes=1))).total_seconds()
-    market_block = stale > 600 or (basis is not None and abs(basis) > .20)
+    now = datetime.now(timezone.utc)
+    session_open = _execution_market_open(now)
+    activity = _market_activity(candles["M1"], now)
+    stale = activity["stale"]
+    market_ready = session_open and activity["active"]
+    market_reason = "active" if market_ready else (
+        "execution_session_closed" if not session_open else activity["reason"]
+    )
+    market_block = not market_ready or (basis is not None and abs(basis) > .20)
+    for plan in (long_plan, short_plan):
+        plan["parts"]["market"] = 10 if market_ready else 0
+        plan["score"] = min(100, sum(plan["parts"].values()))
+    selected = long_plan if selected["side"] == "LONG" else short_plan
     confirmation_threshold = 80 if selected["type"] == "COUNTERTREND" else 75
     has_confirmation = selected["parts"]["event"] >= (18 if selected["type"]=="COUNTERTREND" else 9)
     if tactical_side == "NEUTRAL" or market_block:
@@ -291,7 +345,7 @@ async def assess_gold_now() -> Dict:
     else:
         decision = "WAIT"
     trigger_text = " → ".join(selected["chain"]) if selected["chain"] else "цепочка подтверждения не сформирована"
-    return dict(now=datetime.now(timezone.utc), price=price, bid=_n(ticker.get("bidPx")),
+    return dict(now=now, price=price, bid=_n(ticker.get("bidPx")),
                 ask=_n(ticker.get("askPx")), mark=_n(mark.get("markPx")), index=idx,
                 basis=basis, funding=_n(funding.get("fundingRate")), oi=_n(oi.get("oi")),
                 contexts=contexts, higher_bias=higher_bias, direction=tactical_side,
@@ -301,7 +355,11 @@ async def assess_gold_now() -> Dict:
                 below=below, upper_zone=upper_zone, lower_zone=lower_zone,
                 active_zone=selected["zone"], stop=selected["stop"],
                 target=selected["target"], atr5=atr5,
-                impulse=impulse, stale=stale, trigger_text=trigger_text)
+                impulse=impulse, stale=stale, trigger_text=trigger_text,
+                market_open=session_open, market_active=activity["active"],
+                market_ready=market_ready, market_reason=market_reason,
+                activity_range=activity["range"],
+                activity_distinct_closes=activity["distinct_closes"])
 
 
 def _p(x) -> str:
@@ -321,12 +379,18 @@ def render_gold(a: Dict) -> str:
     labels = {"LONG":"🟢 LONG ПОДТВЕРЖДЁН", "SHORT":"🔴 SHORT ПОДТВЕРЖДЁН",
               "SETUP WATCH":"👀 СЕТАП ФОРМИРУЕТСЯ", "WAIT":"🟡 ЖДАТЬ"}
     p, c = a["parts"], a["contexts"]
+    if not a.get("market_open", True):
+        status_label = "🔒 РЫНОК BYBIT CFD ЗАКРЫТ"
+    elif not a.get("market_active", True):
+        status_label = "⏸ КОТИРОВКИ НЕАКТИВНЫ"
+    else:
+        status_label = labels[a["decision"]]
     lines = ["🥇 XAUUSD+ — ОЦЕНКА СЕЙЧАС", f"🕒 {a['now']:%d.%m.%Y %H:%M UTC}",
              "Источник: OKX XAU │ исполнение: Bybit CFD", "", "💵 ЦЕНА-ОРИЕНТИР",
              f"Trade: {_p(a['price'])} │ Bid/Ask: {_p(a['bid'])}/{_p(a['ask'])}",
              f"Mark: {_p(a['mark'])} │ Index: {_p(a['index'])}",
              f"Basis: {a['basis']:+.3f}%" if a["basis"] is not None else "Basis: —", "",
-             f"{labels[a['decision']]}", f"Старший bias: {a['higher_bias']}",
+             status_label, f"Старший bias: {a['higher_bias']}",
              f"Локальный сетап: {a['direction']} │ {a['setup_type']} │ Entry: {a['score']}/100",
              f"Long Entry: {a['long_score']}/100 │ Short Entry: {a['short_score']}/100", "",
              "🧭 КОНТЕКСТ"] + [f"• {tf}: {c[tf]}" for tf in ("H1","M15","M5","M1")]
@@ -344,6 +408,9 @@ def render_gold(a: Dict) -> str:
         lines += ["", f"⚡ Вход заблокирован: M1 импульс {a['impulse']:.1f}× ATR"]
     if a["stale"] > 600:
         lines += ["", "⛔ M1 устарела: рынок закрыт или поток остановлен"]
+    if not a.get("market_ready", True):
+        lines += ["", "Автоматические сетапы и входы приостановлены.",
+                  "После открытия нужен прогрев свежих M1/M5 данных."]
     lines += ["", f"M5 ATR: ${a['atr5']:.2f}",
               "⚠️ Уровни рассчитаны по OKX. Перед сделкой сверить Bid/Ask в Bybit."]
     return "\n".join(lines)
