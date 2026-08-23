@@ -1,7 +1,10 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from services.tradfi.gold_engine import Candle, _atr, _build_zones, _context, _event_chain, _working_zones, render_gold
+from services.tradfi.gold_engine import (
+    Candle, _atr, _build_zones, _context, _event_chain,
+    _execution_market_open, _market_activity, _working_zones, render_gold,
+)
 
 
 def candles(start=100.0, step=0.2, count=80):
@@ -16,6 +19,32 @@ def candles(start=100.0, step=0.2, count=80):
 
 
 class GoldEngineTests(unittest.TestCase):
+    def test_execution_market_is_closed_on_weekend(self):
+        self.assertFalse(_execution_market_open(
+            datetime(2026, 8, 23, 11, 30, tzinfo=timezone.utc)
+        ))
+        self.assertTrue(_execution_market_open(
+            datetime(2026, 8, 23, 23, 0, tzinfo=timezone.utc)
+        ))
+
+    def test_execution_market_observes_daily_break(self):
+        self.assertFalse(_execution_market_open(
+            datetime(2026, 8, 24, 21, 30, tzinfo=timezone.utc)
+        ))
+        self.assertTrue(_execution_market_open(
+            datetime(2026, 8, 24, 22, 5, tzinfo=timezone.utc)
+        ))
+
+    def test_frozen_quotes_are_not_active(self):
+        now = datetime(2026, 8, 24, 12, 7, tzinfo=timezone.utc)
+        frozen = [
+            Candle(now - timedelta(minutes=7-i), 100, 100.01, 100, 100, 1)
+            for i in range(6)
+        ]
+        activity = _market_activity(frozen, now)
+        self.assertFalse(activity["active"])
+        self.assertEqual(activity["reason"], "frozen_quotes")
+
     def test_uptrend_context(self):
         title, vote = _context(candles())
         self.assertEqual(vote, 1)
@@ -77,6 +106,7 @@ class GoldEngineTests(unittest.TestCase):
         self.assertIn("XAUUSD+", text)
         self.assertIn("OKX", text)
         self.assertIn("Bybit", text)
+
 
 
 if __name__ == "__main__":
