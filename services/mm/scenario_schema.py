@@ -22,4 +22,4 @@ def ensure_scenario_schema() -> None:
             conn.execute(migration.read_text(encoding="utf-8"))
             conn.commit()
             log.info("Applied idempotent migration %s", migration.name)
-    log.info("Scenario and ML foundation schemas are ready")
+    log.info("Scenario, ML foundation, and setup lifecycle schemas are ready")
