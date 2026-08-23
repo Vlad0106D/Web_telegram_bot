@@ -41,6 +41,11 @@ from services.mm.zone_store import rebuild_zones
 from services.mm.feature_store import persist_feature_snapshot
 from services.mm.setup_lifecycle import persist_setup_lifecycle
 from services.mm.setup_outcomes import persist_setup_outcomes
+from services.mm.setup_replay import (
+    SETUP_REPLAY_ENABLED,
+    SETUP_REPLAY_INTERVAL_SEC,
+    replay_setup_batch,
+)
 from services.mm.pipeline_runtime import (
     PipelineCandidate,
     PipelineRunAlreadyActive,
@@ -95,6 +100,15 @@ async def _scenario_replay_tick(app: Application) -> None:
         log.info("Scenario v2 historical replay result=%s", result)
     except Exception:
         log.exception("Scenario v2 historical replay failed")
+
+
+async def _setup_replay_tick(app: Application) -> None:
+    del app
+    try:
+        result = await asyncio.to_thread(replay_setup_batch)
+        log.info("Setup historical replay result=%s", result)
+    except Exception:
+        log.exception("Setup historical replay failed")
 
 
 def _db_url() -> str:
@@ -1023,6 +1037,21 @@ def schedule_mm_auto(app: Application) -> List[str]:
             },
         )
         created.append(replay_name)
+
+    if SETUP_REPLAY_ENABLED:
+        setup_replay_name = "mm_auto_setup_replay"
+        jq.run_repeating(
+            callback=lambda ctx: _setup_replay_tick(ctx.application),
+            interval=SETUP_REPLAY_INTERVAL_SEC,
+            first=180,
+            name=setup_replay_name,
+            job_kwargs={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 300,
+            },
+        )
+        created.append(setup_replay_name)
 
     log.info(
         "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",
