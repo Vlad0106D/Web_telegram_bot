@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -59,6 +59,7 @@ class MarketScenario:
     action_mode: str = "context"
     action_setup_fingerprint: str = ""
     action_components: dict = field(default_factory=dict)
+    action_inputs: Dict[str, Any] = field(default_factory=dict)
     mtf_context: List[dict] = field(default_factory=list)
 
 
@@ -711,6 +712,7 @@ def build_current_scenario(symbol: str = "BTC-USDT", tf: str = "H1") -> MarketSc
         scenario.action_mode = action.mode
         scenario.action_setup_fingerprint = action.setup_fingerprint
         scenario.action_components = action.components
+        scenario.action_inputs = action.inputs
     except Exception:
         scenario.action_reason = "Action Engine временно недоступен"
 
