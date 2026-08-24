@@ -36,6 +36,7 @@ class ActionDecision:
     blocked_reason: str = ""
     setup_fingerprint: str = ""
     components: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    inputs: Dict[str, Any] = field(default_factory=dict)
 
 
 def _clamp(value: float) -> int:
@@ -306,6 +307,21 @@ def score_action_context(
         blocked_reason=blocks[best],
         setup_fingerprint=fingerprint,
         components=components,
+        inputs={
+            "tf": tf,
+            "state": {
+                "prob_up": state.get("prob_up"),
+                "prob_down": state.get("prob_down"),
+                "range_state": range_state,
+            },
+            "market_event": dict(market_event or {}),
+            "liquidity_event": dict(liquidity_event or {}),
+            "higher_states": {
+                higher_tf: dict(higher_states.get(higher_tf) or {})
+                for higher_tf, _ in _mtf_stack(tf)
+            },
+            "deriv_score": deriv_score,
+        },
     )
 
 
