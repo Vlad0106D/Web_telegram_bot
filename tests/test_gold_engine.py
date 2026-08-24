@@ -2,8 +2,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from services.tradfi.gold_engine import (
-    Candle, _atr, _build_zones, _context, _event_chain,
-    _execution_market_open, _market_activity, _working_zones, render_gold,
+    Candle, GOLD_MIN_CONFIRM_RR, _atr, _build_zones, _context,
+    _decision_for_plan, _event_chain, _execution_market_open,
+    _market_activity, _working_zones, render_gold,
 )
 
 
@@ -53,15 +54,35 @@ class GoldEngineTests(unittest.TestCase):
     def test_atr_is_positive(self):
         self.assertGreater(_atr(candles()), 0)
 
-    def test_zones_use_only_h1_and_m15_and_merge_confluence(self):
+    def test_h1_confluence_does_not_widen_m15_execution_zone(self):
         h1 = candles(start=100, step=0.0, count=80)
         m15 = candles(start=100, step=0.0, count=80)
         h1[60] = Candle(h1[60].ts, 100, 105.0, 99.8, 100, 10)
         m15[60] = Candle(m15[60].ts, 100, 104.95, 99.8, 100, 10)
         zones = _build_zones({"H1": h1, "M15": m15})
-        confluence = [z for z in zones if "H1" in z["sources"] and "M15" in z["sources"]]
-        self.assertTrue(confluence)
-        self.assertGreaterEqual(confluence[-1]["strength"], 80)
+        execution = [z for z in zones if z["tf"] == "M15"]
+        self.assertTrue(execution)
+        self.assertTrue(any(z.get("context_sources") == ["H1"] for z in execution))
+        self.assertTrue(all(z["sources"] == ["M15"] for z in execution))
+        self.assertTrue(all(z["high"] - z["low"] < 1.0 for z in execution))
+
+    def test_rr_below_minimum_can_only_watch(self):
+        plan = {
+            "side": "LONG", "type": "TREND", "score": 90,
+            "parts": {"event": 25}, "rr": GOLD_MIN_CONFIRM_RR - .01,
+        }
+        decision, reason = _decision_for_plan("LONG", plan, False, 1.0)
+        self.assertEqual(decision, "SETUP WATCH")
+        self.assertIn("RR", reason)
+
+    def test_rr_at_minimum_can_confirm(self):
+        plan = {
+            "side": "LONG", "type": "TREND", "score": 90,
+            "parts": {"event": 25}, "rr": GOLD_MIN_CONFIRM_RR,
+        }
+        decision, reason = _decision_for_plan("LONG", plan, False, 1.0)
+        self.assertEqual(decision, "LONG")
+        self.assertIsNone(reason)
 
     def test_working_zone_uses_strength_and_distance(self):
         zones = [
