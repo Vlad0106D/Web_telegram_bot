@@ -103,6 +103,71 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertGreater(decision.long_score, decision.short_score)
         self.assertTrue(decision.setup_fingerprint)
 
+    def test_strong_downtrend_confirms_continuation(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "state_icon": "🔴",
+                "prob_up": 40,
+                "prob_down": 60,
+                "range": {"state": "HOLDING"},
+            },
+            market_event=event("pressure_down"),
+            liquidity_event=None,
+            higher_states={
+                "H4": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+                "D1": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+            },
+            deriv_score=45,
+        )
+        self.assertEqual(decision.mode, "strong_trend_continuation")
+        self.assertEqual(decision.lifecycle, "confirmed")
+        self.assertEqual(decision.action, "SHORT_ALLOWED")
+        self.assertEqual(decision.components["short"]["trend_regime"], 13)
+
+    def test_opposite_sweep_requires_reclaim_before_strong_trend_entry(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "state_icon": "🟢",
+                "prob_up": 55,
+                "prob_down": 45,
+                "range": {"state": "HOLDING"},
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=event("liq_sweep_high"),
+            higher_states={
+                "H4": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+                "D1": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+            },
+            deriv_score=42,
+        )
+        self.assertEqual(decision.long_score, 70)
+        self.assertEqual(decision.mode, "strong_trend_wait_reclaim")
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertIn("свип", decision.blocked_reason)
+        self.assertTrue(decision.inputs["regime"]["opposing_sweep"])
+
+    def test_single_higher_timeframe_is_not_a_strong_h1_trend(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "state_icon": "🔴",
+                "prob_up": 40,
+                "prob_down": 60,
+                "range": {"state": "HOLDING"},
+            },
+            market_event=event("pressure_down"),
+            liquidity_event=None,
+            higher_states={
+                "H4": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+                "D1": {},
+            },
+        )
+        self.assertNotIn("trend_regime", decision.components["short"])
+        self.assertNotEqual(decision.mode, "strong_trend_continuation")
+
     def test_decision_preserves_exact_scoring_inputs(self):
         market = event("pressure_up")
         liquidity = event("liq_reclaim_up")
