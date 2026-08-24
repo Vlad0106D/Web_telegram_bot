@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 from services.mm.scenario_engine import MarketScenario
 
 
-SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v1"
+SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v2"
 SETUP_CANDIDATE_SCORE = 42
 SETUP_CANDIDATE_MIN_SPREAD = 5
 SETUP_WEAK_GRACE_BARS = {"H1": 2, "H4": 1, "D1": 1, "W1": 0}
@@ -625,9 +625,14 @@ def persist_setup_lifecycle(
             cur.execute(
                 """SELECT * FROM setup_episodes
                    WHERE symbol=%s AND tf=%s AND origin=%s
-                     AND closed_ts IS NULL
+                     AND algorithm_version=%s AND closed_ts IS NULL
                    ORDER BY id DESC LIMIT 1 FOR UPDATE""",
-                (scenario.symbol, scenario.tf, feature["origin"]),
+                (
+                    scenario.symbol,
+                    scenario.tf,
+                    feature["origin"],
+                    SETUP_LIFECYCLE_VERSION,
+                ),
             )
             active = cur.fetchone()
 
