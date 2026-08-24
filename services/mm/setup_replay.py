@@ -261,6 +261,7 @@ def enrich_historical_action(
     scenario.action_mode = decision.mode
     scenario.action_setup_fingerprint = decision.setup_fingerprint
     scenario.action_components = decision.components
+    scenario.action_inputs = decision.inputs
     return scenario
 
 
