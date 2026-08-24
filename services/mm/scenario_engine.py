@@ -9,6 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from services.mm.action_engine import ACTION_ENGINE_VERSION
 from services.mm.zone_engine import ALGORITHM_VERSION as ZONE_VERSION
 from services.mm.zone_store import (
     load_current_zones,
@@ -545,7 +546,7 @@ def render_scenario(s: MarketScenario) -> str:
 
     lines += [
         "",
-        "⚙️ ACTION ENGINE (v2)",
+        f"⚙️ ACTION ENGINE ({ACTION_ENGINE_VERSION})",
         f"Decision: {s.action_decision}",
         f"Long {s.action_long_score}/100 │ Short {s.action_short_score}/100",
         f"Stage: {s.action_lifecycle.upper()} │ Mode: {s.action_mode}",
@@ -797,7 +798,7 @@ def persist_scenario(
         "invalidation_source": s.invalidation_source,
         "calibration_note": s.calibration_note,
         "action_engine": {
-            "version": "v2",
+            "version": ACTION_ENGINE_VERSION,
             "decision": s.action_decision,
             "long_score": s.action_long_score,
             "short_score": s.action_short_score,
