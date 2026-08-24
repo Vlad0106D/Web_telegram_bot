@@ -133,6 +133,7 @@ def _swing_centers(items: Sequence[Candle]) -> List[Tuple[float, int]]:
 
 
 def _build_zones(candles: Dict[str, List[Candle]]) -> List[Dict]:
+    """Build context and execution zones without widening M15 by H1 geometry."""
     atr_h1, atr_m15 = _atr(candles["H1"]), _atr(candles["M15"])
     raw: List[Dict] = []
     for tf, base, fraction, atr in (
@@ -145,29 +146,49 @@ def _build_zones(candles: Dict[str, List[Candle]]) -> List[Dict]:
         for center, index in swings:
             age = total - 1 - index
             recency = max(-15, -age // 12)
+            source_ts = candles[tf][index].ts.astimezone(timezone.utc).isoformat()
             raw.append({
                 "tf": tf, "sources": [tf], "center": center,
                 "low": center - half_width, "high": center + half_width,
                 "strength": max(20, base + recency),
+                "zone_id": f"{tf}:{source_ts}:{center:.2f}",
             })
-    raw.sort(key=lambda z: z["center"])
-    merge_distance = max(.10, .15 * atr_m15)
+
+    # Merge only zones from the same timeframe. H1 is context; it must never
+    # enlarge the M15 execution zone used for entry, stop, and fingerprint.
     clusters: List[Dict] = []
-    for zone in raw:
-        if clusters and zone["low"] <= clusters[-1]["high"] + merge_distance:
-            current = clusters[-1]
-            old_weight, new_weight = current["strength"], zone["strength"]
-            current["center"] = (
-                current["center"] * old_weight + zone["center"] * new_weight
-            ) / (old_weight + new_weight)
-            current["low"] = min(current["low"], zone["low"])
-            current["high"] = max(current["high"], zone["high"])
-            current["sources"] = sorted(set(current["sources"] + zone["sources"]))
-            current["tf"] = "+".join(current["sources"])
-            confluence = 20 if len(current["sources"]) > 1 else 0
-            current["strength"] = min(100, max(old_weight, new_weight) + confluence)
+    for tf in ("H1", "M15"):
+        merge_distance = max(.10, (.10 if tf == "M15" else .05) * atr_m15)
+        tf_raw = sorted((z for z in raw if z["tf"] == tf), key=lambda z: z["center"])
+        tf_clusters: List[Dict] = []
+        for zone in tf_raw:
+            if tf_clusters and zone["low"] <= tf_clusters[-1]["high"] + merge_distance:
+                current = tf_clusters[-1]
+                old_weight, new_weight = current["strength"], zone["strength"]
+                current["center"] = (
+                    current["center"] * old_weight + zone["center"] * new_weight
+                ) / (old_weight + new_weight)
+                current["low"] = min(current["low"], zone["low"])
+                current["high"] = max(current["high"], zone["high"])
+                current["strength"] = min(100, max(old_weight, new_weight) + 5)
+                current["zone_id"] = min(current["zone_id"], zone["zone_id"])
+            else:
+                tf_clusters.append(dict(zone))
+        clusters.extend(tf_clusters)
+
+    h1_zones = [z for z in clusters if z["tf"] == "H1"]
+    confluence_distance = max(.10, .25 * atr_m15)
+    for zone in (z for z in clusters if z["tf"] == "M15"):
+        context = [
+            h1 for h1 in h1_zones
+            if h1["low"] <= zone["high"] + confluence_distance
+            and h1["high"] >= zone["low"] - confluence_distance
+        ]
+        if context:
+            zone["strength"] = min(100, zone["strength"] + 20)
+            zone["context_sources"] = ["H1"]
         else:
-            clusters.append(dict(zone))
+            zone["context_sources"] = []
     return clusters
 
 
@@ -244,6 +265,10 @@ def _event_chain(items: Sequence[Candle], side: str, zone: Optional[Dict], atr: 
     return chain, score
 
 
+GOLD_MIN_CONFIRM_RR = 1.5
+GOLD_ENGINE_VERSION = "gold_engine_v2"
+
+
 def _side_plan(side: str, price: float, upper_zone: Optional[Dict], lower_zone: Optional[Dict],
                atr1: float, atr5: float, votes: Dict[str, int],
                candles: Dict[str, List[Candle]]) -> Dict:
@@ -286,6 +311,25 @@ def _n(value) -> Optional[float]:
         return None
 
 
+def _decision_for_plan(tactical_side: str, selected: Dict, market_block: bool,
+                       impulse: float) -> Tuple[str, Optional[str]]:
+    threshold = 80 if selected["type"] == "COUNTERTREND" else 75
+    required_event = 18 if selected["type"] == "COUNTERTREND" else 9
+    has_confirmation = selected["parts"]["event"] >= required_event
+    rr_ready = selected["rr"] >= GOLD_MIN_CONFIRM_RR
+    if tactical_side == "NEUTRAL" or market_block:
+        return "WAIT", None
+    if (selected["score"] >= threshold and has_confirmation
+            and impulse <= 2 and rr_ready):
+        return selected["side"], None
+    if selected["score"] >= 55:
+        reason = None
+        if not rr_ready:
+            reason = f"RR {selected['rr']:.2f} ниже минимума {GOLD_MIN_CONFIRM_RR:.2f}"
+        return "SETUP WATCH", reason
+    return "WAIT", None
+
+
 async def assess_gold_now() -> Dict:
     async with httpx.AsyncClient(timeout=12) as client:
         tasks = [_candles(client, tf) for tf in BARS]
@@ -308,7 +352,10 @@ async def assess_gold_now() -> Dict:
     atr1, atr5 = _atr(candles["M1"]), _atr(candles["M5"])
     atr15 = _atr(candles["M15"])
     zones = _build_zones(candles)
-    upper_zone, lower_zone = _working_zones(price, zones, atr15)
+    execution_zones = [zone for zone in zones if zone["tf"] == "M15"]
+    context_zones = [zone for zone in zones if zone["tf"] == "H1"]
+    upper_zone, lower_zone = _working_zones(price, execution_zones, atr15)
+    h1_upper_zone, h1_lower_zone = _working_zones(price, context_zones, atr15)
     above = upper_zone["center"] if upper_zone else None
     below = lower_zone["center"] if lower_zone else None
     impulse = (candles["M1"][-1].h-candles["M1"][-1].l)/atr1
@@ -334,16 +381,9 @@ async def assess_gold_now() -> Dict:
         plan["parts"]["market"] = 10 if market_ready else 0
         plan["score"] = min(100, sum(plan["parts"].values()))
     selected = long_plan if selected["side"] == "LONG" else short_plan
-    confirmation_threshold = 80 if selected["type"] == "COUNTERTREND" else 75
-    has_confirmation = selected["parts"]["event"] >= (18 if selected["type"]=="COUNTERTREND" else 9)
-    if tactical_side == "NEUTRAL" or market_block:
-        decision = "WAIT"
-    elif selected["score"] >= confirmation_threshold and has_confirmation and impulse <= 2:
-        decision = selected["side"]
-    elif selected["score"] >= 55:
-        decision = "SETUP WATCH"
-    else:
-        decision = "WAIT"
+    decision, blocked_reason = _decision_for_plan(
+        tactical_side, selected, market_block, impulse
+    )
     trigger_text = " → ".join(selected["chain"]) if selected["chain"] else "цепочка подтверждения не сформирована"
     return dict(now=now, price=price, bid=_n(ticker.get("bidPx")),
                 ask=_n(ticker.get("askPx")), mark=_n(mark.get("markPx")), index=idx,
@@ -359,7 +399,11 @@ async def assess_gold_now() -> Dict:
                 market_open=session_open, market_active=activity["active"],
                 market_ready=market_ready, market_reason=market_reason,
                 activity_range=activity["range"],
-                activity_distinct_closes=activity["distinct_closes"])
+                activity_distinct_closes=activity["distinct_closes"],
+                rr=selected["rr"], min_confirm_rr=GOLD_MIN_CONFIRM_RR,
+                confirmation_blocked_reason=blocked_reason,
+                engine_version=GOLD_ENGINE_VERSION,
+                h1_upper_zone=h1_upper_zone, h1_lower_zone=h1_lower_zone)
 
 
 def _p(x) -> str:
@@ -397,13 +441,17 @@ def render_gold(a: Dict) -> str:
     lines += ["", "⚙️ PRECISION ENTRY",
               f"Контекст {p['context']}/15 │ структура {p['structure']}/20 │ ликвидность {p['liquidity']}/15",
               f"События {p['event']}/25 │ RR {p['rr']}/15 │ рынок {p['market']}/10",
-              f"Триггер: {a['trigger_text']}", "", "🧲 ЛИКВИДНОСТЬ",
+              f"Триггер: {a['trigger_text']}",
+              f"План RR: {a.get('rr', 0):.2f} │ минимум {a.get('min_confirm_rr', GOLD_MIN_CONFIRM_RR):.2f}",
+              "", "🧲 ЛИКВИДНОСТЬ",
               f"Сверху: {_zone_text(a.get('upper_zone'))}",
               f"Снизу: {_zone_text(a.get('lower_zone'))}"]
     if a["stop"] is not None:
         risk = abs(a["price"]-a["stop"]) + .12
         lines += ["", "🎯 ПЛАН ПРИ ПОДТВЕРЖДЕНИИ" if a["decision"] in ("WAIT", "SETUP WATCH") else "🎯 АКТИВНЫЙ ПЛАН", f"Stop: {_p(a['stop'])}", f"Цель: {_p(a['target'])}",
                   f"Риск 0.01 lot: около ${risk:.2f} + проскальзывание"]
+    if a.get("confirmation_blocked_reason"):
+        lines += ["", f"⛔ Вход заблокирован: {a['confirmation_blocked_reason']}"]
     if a["impulse"] > 2:
         lines += ["", f"⚡ Вход заблокирован: M1 импульс {a['impulse']:.1f}× ATR"]
     if a["stale"] > 600:

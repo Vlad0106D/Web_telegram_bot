@@ -83,6 +83,11 @@ def _payload(a: Dict) -> Dict:
         "activity_range": a.get("activity_range"),
         "activity_distinct_closes": a.get("activity_distinct_closes"),
         "setup_fingerprint": _setup_fingerprint(a),
+        "rr": a.get("rr"), "min_confirm_rr": a.get("min_confirm_rr"),
+        "confirmation_blocked_reason": a.get("confirmation_blocked_reason"),
+        "engine_version": a.get("engine_version"),
+        "h1_upper_zone": a.get("h1_upper_zone"),
+        "h1_lower_zone": a.get("h1_lower_zone"),
     }
 
 
@@ -113,12 +118,32 @@ def persist_alert(kind: str, a: Dict) -> None:
 
 def _setup_fingerprint(assessment: Dict) -> str:
     zone = assessment.get("active_zone") or {}
+    zone_id = zone.get("zone_id")
+    if zone_id:
+        return f"{assessment.get('direction') or 'NEUTRAL'}:{zone_id}"
+    # Compatibility fallback for historical payloads.
     return ":".join((
         str(assessment.get("direction") or "NEUTRAL"),
         str(zone.get("tf") or "NO_ZONE"),
         f"{float(zone.get('low', 0)):.1f}",
         f"{float(zone.get('high', 0)):.1f}",
     ))
+
+
+def alert_already_persisted(kind: str, assessment: Dict) -> bool:
+    """Make confirmation dedup survive worker restarts and redeploys."""
+    fingerprint = _setup_fingerprint(assessment)
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            """SELECT 1
+               FROM tradfi_gold_alerts
+               WHERE alert_type = %s
+                 AND payload_json->>'setup_fingerprint' = %s
+                 AND ts >= %s
+               LIMIT 1""",
+            (kind, fingerprint, assessment["now"] - ALERT_COOLDOWN),
+        ).fetchone()
+    return row is not None
 
 
 def _same_value_count(state: Dict, key: str, value: str) -> int:
@@ -260,6 +285,7 @@ def render_alert(kind: str, a: Dict) -> str:
         f"Локально: {a['direction']} │ {a.get('setup_type', '—')} │ Entry: {a['score']}/100",
         f"Long {a.get('long_score', 0)}/100 │ Short {a.get('short_score', 0)}/100",
         f"Цепочка: {a['trigger_text']}",
+        f"RR: {a.get('rr', 0):.2f} │ минимум {a.get('min_confirm_rr', 1.5):.2f}",
     ]
     if kind == "ENTRY_CONFIRMED":
         lines += [f"Stop: {price(a['stop'])}", f"Цель: {price(a['target'])}"]
@@ -287,7 +313,15 @@ async def gold_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("TradFi gold assessment persistence failed")
         app.bot_data["tradfi_gold_last"] = assessment
-        if kind and _chat_id():
+        already_sent = False
+        if kind:
+            try:
+                already_sent = await asyncio.to_thread(
+                    alert_already_persisted, kind, assessment
+                )
+            except Exception:
+                log.exception("TradFi gold persistent alert dedup failed")
+        if kind and _chat_id() and not already_sent:
             await app.bot.send_message(chat_id=_chat_id(), text=render_alert(kind, assessment))
             try:
                 await asyncio.to_thread(persist_alert, kind, assessment)
