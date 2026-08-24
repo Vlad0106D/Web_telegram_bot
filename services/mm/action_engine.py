@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
-ACTION_ENGINE_VERSION = "v3"
+ACTION_ENGINE_VERSION = "v4"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
@@ -14,6 +14,7 @@ ACTION_DERIVATIVE_SLOPE = 0.12
 ACTION_STRONG_TREND_MIN_PROB = 55
 ACTION_STRONG_TREND_BONUS = 13
 ACTION_STRONG_TREND_OPPOSITE_PENALTY = 5
+ACTION_REVERSAL_MAX_AGE_BARS = 2
 ACTION_MTF_WEIGHTS = {
     "H1": (("H4", 9), ("D1", 11)),
     "H4": (("D1", 11),),
@@ -61,6 +62,37 @@ def _range_state(state: Dict[str, Any]) -> str:
 def _event_type(event: Optional[Dict[str, Any]]) -> Optional[str]:
     value = (event or {}).get("event_type")
     return str(value).strip() if value else None
+
+
+def _as_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _event_age_bars(
+    *, tf: str, reference_ts: Any, event: Optional[Dict[str, Any]]
+) -> Optional[float]:
+    seconds = {"H1": 3600, "H4": 14400, "D1": 86400, "W1": 604800}.get(tf)
+    reference = _as_datetime(reference_ts)
+    observed = _as_datetime((event or {}).get("ts"))
+    if seconds is None or reference is None or observed is None:
+        return None
+    return max(0.0, (reference - observed).total_seconds() / seconds)
+
+
+def _event_aligns(event_type: Optional[str], direction: str) -> bool:
+    aligned = {
+        "long": {"reclaim_up", "accept_above", "pressure_up", "sweep_low", "decision_zone_down"},
+        "short": {"reclaim_down", "accept_below", "pressure_down", "sweep_high", "decision_zone_up"},
+    }
+    return event_type in aligned[direction]
 
 
 def _context_direction(context: Dict[str, Any]) -> Optional[str]:
@@ -186,6 +218,7 @@ def action_engine_config() -> Dict[str, Any]:
         "strong_trend_min_prob": ACTION_STRONG_TREND_MIN_PROB,
         "strong_trend_bonus": ACTION_STRONG_TREND_BONUS,
         "strong_trend_opposite_penalty": ACTION_STRONG_TREND_OPPOSITE_PENALTY,
+        "reversal_max_age_bars": ACTION_REVERSAL_MAX_AGE_BARS,
         "liquidity_memory_bars": ACTION_LIQUIDITY_MEMORY_BARS,
     }
 
@@ -199,7 +232,7 @@ def score_action_context(
     higher_states: Optional[Dict[str, Dict[str, Any]]] = None,
     deriv_score: Optional[int] = None,
 ) -> ActionDecision:
-    """Pure Action Engine v2 scorer.
+    """Pure versioned Action Engine scorer.
 
     MTF is a weighted context, not a blanket veto. Only an extreme opposite
     acceptance/reclaim or an accepted opposite range can hard-block a side.
@@ -338,16 +371,54 @@ def score_action_context(
         has_setup_source=has_setup_source,
     )
 
+    reference_ts = (
+        (market_event or {}).get("ts")
+        or state.get("_state_ts")
+    )
+    liquidity_age_bars = _event_age_bars(
+        tf=tf, reference_ts=reference_ts, event=liquidity_event
+    )
+    market_aligned = _event_aligns(market_type, best)
+    liquidity_aligned = _event_aligns(liq_type, best)
     opposing_sweep = (
         strong_trend == "long" and liq_type == "sweep_high"
     ) or (
         strong_trend == "short" and liq_type == "sweep_low"
     )
-    confirmation_gate = ""
+    confirmation_gates = []
     if opposing_sweep:
-        confirmation_gate = "противоположный свип: нужен реклейм или acceptance"
-        if lifecycle == "confirmed":
-            lifecycle = "ready"
+        confirmation_gates.append(
+            "противоположный свип: нужен реклейм или acceptance"
+        )
+
+    reversal_source = strong_trend is None and liquidity_aligned and liq_type in {
+        "reclaim_up", "reclaim_down", "sweep_low", "sweep_high"
+    }
+    if reversal_source:
+        if (
+            liquidity_age_bars is not None
+            and liquidity_age_bars > ACTION_REVERSAL_MAX_AGE_BARS
+        ):
+            confirmation_gates.append("reversal: liquidity-event старше 2 баров")
+        if not market_aligned:
+            confirmation_gates.append("reversal: нет подтверждающего market-event")
+
+    countertrend_source = mtf_net[best] < 0
+    if countertrend_source and not (
+        market_aligned
+        and liquidity_aligned
+        and (
+            liquidity_age_bars is None
+            or liquidity_age_bars <= ACTION_REVERSAL_MAX_AGE_BARS
+        )
+    ):
+        confirmation_gates.append(
+            "countertrend: нужна свежая двойная локальная конфлюэнс"
+        )
+
+    confirmation_gate = "; ".join(dict.fromkeys(confirmation_gates))
+    if confirmation_gate and lifecycle == "confirmed":
+        lifecycle = "ready"
 
     if strong_trend:
         mode = (
@@ -355,7 +426,7 @@ def score_action_context(
             if opposing_sweep
             else "strong_trend_continuation"
         )
-    elif liq_type in {"reclaim_up", "reclaim_down", "sweep_low", "sweep_high"}:
+    elif reversal_source:
         mode = "reversal"
     elif market_type in {"accept_above", "accept_below"}:
         mode = "breakout_acceptance"
@@ -419,6 +490,11 @@ def score_action_context(
                 "strong_trend_direction": strong_trend,
                 "opposing_sweep": opposing_sweep,
                 "confirmation_gate": confirmation_gate,
+                "market_aligned": market_aligned,
+                "liquidity_aligned": liquidity_aligned,
+                "liquidity_age_bars": liquidity_age_bars,
+                "reversal_source": reversal_source,
+                "countertrend_source": countertrend_source,
             },
         },
     )
