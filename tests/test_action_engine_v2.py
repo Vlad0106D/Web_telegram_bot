@@ -103,6 +103,28 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertGreater(decision.long_score, decision.short_score)
         self.assertTrue(decision.setup_fingerprint)
 
+    def test_decision_preserves_exact_scoring_inputs(self):
+        market = event("pressure_up")
+        liquidity = event("liq_reclaim_up")
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "PENDING_ACCEPT_UP"},
+            },
+            market_event=market,
+            liquidity_event=liquidity,
+            higher_states={"H4": {"prob_up": 55}, "D1": {"prob_down": 60}},
+            deriv_score=57,
+        )
+        self.assertEqual(decision.inputs["market_event"], market)
+        self.assertEqual(decision.inputs["liquidity_event"], liquidity)
+        self.assertEqual(
+            decision.inputs["state"]["range_state"], "PENDING_ACCEPT_UP"
+        )
+        self.assertEqual(decision.inputs["deriv_score"], 57)
+
     def test_outcome_uses_atr_levels_not_first_small_adverse_close(self):
         bars = [
             {"ts": NOW, "high": 100.4, "low": 99.7, "close": 99.8},

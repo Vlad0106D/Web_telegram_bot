@@ -16,7 +16,7 @@ from services.mm.scenario_engine import SCENARIO_VERSION, MarketScenario
 from services.mm.zone_engine import ALGORITHM_VERSION as ZONE_VERSION
 
 
-FEATURE_SET_VERSION = "market_context_v1"
+FEATURE_SET_VERSION = "market_context_v2"
 
 
 def _db_url() -> str:
@@ -210,6 +210,31 @@ def build_feature_payload(
     if lower is None:
         context_absent.append("nearest_lower_zone")
 
+    action_inputs = dict(scenario.action_inputs or {})
+    input_state = action_inputs.get("state") or {}
+    exact_range_state = input_state.get("range_state")
+    market_event = action_inputs.get("market_event") or {}
+    liquidity_event = action_inputs.get("liquidity_event") or {}
+
+    # Legacy scenarios do not carry exact scorer inputs. V2 rows prefer the
+    # point-in-time values that actually produced the Action Engine scores.
+    if action_inputs:
+        persisted_market_event = market_event.get("event_type")
+        persisted_liquidity_event = liquidity_event.get("event_type")
+        persisted_range_state = exact_range_state
+    else:
+        persisted_market_event = (
+            None
+            if str(scenario.action_event or "").startswith("liq_")
+            else scenario.action_event
+        )
+        persisted_liquidity_event = (
+            scenario.action_event
+            if str(scenario.action_event or "").startswith("liq_")
+            else None
+        )
+        persisted_range_state = range_state
+
     features_json = _json_safe({
         "contract_hash": config_hash,
         "source": {
@@ -228,6 +253,7 @@ def build_feature_payload(
         "reasons": list(scenario.reasons),
         "entry_breakdown": dict(scenario.entry_breakdown),
         "action_components": dict(scenario.action_components),
+        "action_inputs": action_inputs,
         "mtf_context": list(scenario.mtf_context),
         "zones": {
             "active": list(scenario.upper_zones + scenario.lower_zones),
@@ -242,7 +268,7 @@ def build_feature_payload(
         "open_interest": oi,
         "oi_delta": oi_delta,
         "deriv_score": scenario.deriv_score,
-        "range_state": range_state,
+        "range_state": persisted_range_state,
         "upper": upper,
         "lower": lower,
         "upper_distance_atr": distance_atr(upper, "upper"),
@@ -254,16 +280,8 @@ def build_feature_payload(
             "context_absent": context_absent,
             "future_data_used": False,
         },
-        "market_event": (
-            None
-            if str(scenario.action_event or "").startswith("liq_")
-            else scenario.action_event
-        ),
-        "liquidity_event": (
-            scenario.action_event
-            if str(scenario.action_event or "").startswith("liq_")
-            else None
-        ),
+        "market_event": persisted_market_event,
+        "liquidity_event": persisted_liquidity_event,
     }
 
 

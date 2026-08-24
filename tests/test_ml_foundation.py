@@ -123,6 +123,18 @@ class MlFoundationTests(unittest.TestCase):
             action_components={
                 "long": {"liquidity": 28, "observed_at": NOW},
             },
+            action_inputs={
+                "tf": "H1",
+                "state": {
+                    "prob_up": 65,
+                    "prob_down": 35,
+                    "range_state": "ACCEPT_UP",
+                },
+                "market_event": {"event_type": "pressure_up", "ts": NOW},
+                "liquidity_event": {"event_type": "liq_reclaim_up", "ts": NOW},
+                "higher_states": {},
+                "deriv_score": 60,
+            },
         )
         snapshot = dict(rows[-1])
         snapshot["meta_json"] = {
@@ -142,7 +154,9 @@ class MlFoundationTests(unittest.TestCase):
             config_hash="abc",
         )
         self.assertEqual(payload["oi_delta"], 5.0)
-        self.assertEqual(payload["range_state"], "HOLDING")
+        self.assertEqual(payload["range_state"], "ACCEPT_UP")
+        self.assertEqual(payload["market_event"], "pressure_up")
+        self.assertEqual(payload["liquidity_event"], "liq_reclaim_up")
         self.assertGreater(payload["upper_distance_atr"], 0.0)
         self.assertGreater(payload["lower_distance_atr"], 0.0)
         self.assertFalse(payload["quality_json"]["future_data_used"])
@@ -155,6 +169,10 @@ class MlFoundationTests(unittest.TestCase):
         self.assertEqual(
             payload["features_json"]["action_components"]["long"]["observed_at"],
             "2026-08-21T20:00:00+00:00",
+        )
+        self.assertEqual(
+            payload["features_json"]["action_inputs"]["state"]["range_state"],
+            "ACCEPT_UP",
         )
         json.dumps(payload["features_json"])
 
