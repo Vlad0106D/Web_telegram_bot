@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import unittest
 
 from services.mm.action_engine import classify_lifecycle, score_action_context
@@ -167,6 +167,65 @@ class ActionEngineV2Tests(unittest.TestCase):
         )
         self.assertNotIn("trend_regime", decision.components["short"])
         self.assertNotEqual(decision.mode, "strong_trend_continuation")
+
+    def test_fresh_reversal_with_market_confirmation_can_confirm(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=event("liq_reclaim_up"),
+            higher_states={"H4": {}, "D1": {}},
+        )
+        self.assertEqual(decision.mode, "reversal")
+        self.assertEqual(decision.lifecycle, "confirmed")
+        self.assertEqual(decision.action, "LONG_ALLOWED")
+
+    def test_stale_reversal_cannot_confirm(self):
+        stale_liquidity = event("liq_reclaim_up")
+        stale_liquidity["ts"] = NOW - timedelta(hours=3)
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=stale_liquidity,
+            higher_states={"H4": {}, "D1": {}},
+        )
+        self.assertEqual(decision.long_score, 77)
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertIn("старше 2 баров", decision.blocked_reason)
+        self.assertEqual(decision.inputs["regime"]["liquidity_age_bars"], 3.0)
+
+    def test_fresh_double_confluence_preserves_countertrend_confirmation(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 75,
+                "prob_down": 25,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=event("liq_reclaim_up"),
+            higher_states={
+                "H4": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+                "D1": {},
+            },
+        )
+        self.assertEqual(decision.mode, "countertrend")
+        self.assertEqual(decision.lifecycle, "confirmed")
+        self.assertEqual(decision.action, "LONG_ALLOWED")
+        self.assertEqual(decision.blocked_reason, "")
 
     def test_decision_preserves_exact_scoring_inputs(self):
         market = event("pressure_up")
