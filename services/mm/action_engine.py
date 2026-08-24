@@ -4,13 +4,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
 
-ACTION_ENGINE_VERSION = "v2"
+ACTION_ENGINE_VERSION = "v3"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
 ACTION_MIN_SCORE_SPREAD = 8
 ACTION_DERIVATIVE_CAP = 6
 ACTION_DERIVATIVE_SLOPE = 0.12
+ACTION_STRONG_TREND_MIN_PROB = 55
+ACTION_STRONG_TREND_BONUS = 13
+ACTION_STRONG_TREND_OPPOSITE_PENALTY = 5
 ACTION_MTF_WEIGHTS = {
     "H1": (("H4", 9), ("D1", 11)),
     "H4": (("D1", 11),),
@@ -58,6 +61,63 @@ def _range_state(state: Dict[str, Any]) -> str:
 def _event_type(event: Optional[Dict[str, Any]]) -> Optional[str]:
     value = (event or {}).get("event_type")
     return str(value).strip() if value else None
+
+
+def _context_direction(context: Dict[str, Any]) -> Optional[str]:
+    probability_up = _safe_int(context.get("prob_up"), 50)
+    probability_down = _safe_int(context.get("prob_down"), 50)
+    icon = str(context.get("state_icon") or "")
+    range_value = str(
+        ((context.get("range") or {}).get("state"))
+        or context.get("range_state")
+        or ""
+    )
+    if range_value == "ACCEPT_UP":
+        return "long"
+    if range_value == "ACCEPT_DOWN":
+        return "short"
+    if (
+        probability_up >= ACTION_STRONG_TREND_MIN_PROB
+        and probability_up > probability_down
+        and icon != "🔴"
+    ):
+        return "long"
+    if (
+        probability_down >= ACTION_STRONG_TREND_MIN_PROB
+        and probability_down > probability_up
+        and icon != "🟢"
+    ):
+        return "short"
+    return None
+
+
+def _strong_trend_direction(
+    *,
+    tf: str,
+    state: Dict[str, Any],
+    market_type: Optional[str],
+    higher_states: Dict[str, Dict[str, Any]],
+) -> Optional[str]:
+    """Return an H1 continuation direction only when H4 and D1 agree."""
+    if tf != "H1":
+        return None
+    market_direction = {
+        "pressure_up": "long",
+        "accept_above": "long",
+        "pressure_down": "short",
+        "accept_below": "short",
+    }.get(market_type)
+    if market_direction is None or _context_direction(state) != market_direction:
+        return None
+    required_contexts = ("H4", "D1")
+    if any(not higher_states.get(higher_tf) for higher_tf in required_contexts):
+        return None
+    if all(
+        _context_direction(higher_states[higher_tf]) == market_direction
+        for higher_tf in required_contexts
+    ):
+        return market_direction
+    return None
 
 
 def _event_points(event_type: Optional[str], direction: str) -> int:
@@ -123,6 +183,9 @@ def action_engine_config() -> Dict[str, Any]:
         },
         "derivative_cap": ACTION_DERIVATIVE_CAP,
         "derivative_slope": ACTION_DERIVATIVE_SLOPE,
+        "strong_trend_min_prob": ACTION_STRONG_TREND_MIN_PROB,
+        "strong_trend_bonus": ACTION_STRONG_TREND_BONUS,
+        "strong_trend_opposite_penalty": ACTION_STRONG_TREND_OPPOSITE_PENALTY,
         "liquidity_memory_bars": ACTION_LIQUIDITY_MEMORY_BARS,
     }
 
@@ -231,6 +294,19 @@ def score_action_context(
         scores["short"] += 8
         components["short"]["confluence"] = 8
 
+    strong_trend = _strong_trend_direction(
+        tf=tf,
+        state=state,
+        market_type=market_type,
+        higher_states=higher_states,
+    )
+    if strong_trend:
+        opposite = "short" if strong_trend == "long" else "long"
+        scores[strong_trend] += ACTION_STRONG_TREND_BONUS
+        scores[opposite] -= ACTION_STRONG_TREND_OPPOSITE_PENALTY
+        components[strong_trend]["trend_regime"] = ACTION_STRONG_TREND_BONUS
+        components[opposite]["trend_regime"] = -ACTION_STRONG_TREND_OPPOSITE_PENALTY
+
     if deriv_score is not None and tf == "H1" and has_setup_source:
         adjustment = max(
             -ACTION_DERIVATIVE_CAP,
@@ -262,7 +338,24 @@ def score_action_context(
         has_setup_source=has_setup_source,
     )
 
-    if liq_type in {"reclaim_up", "reclaim_down", "sweep_low", "sweep_high"}:
+    opposing_sweep = (
+        strong_trend == "long" and liq_type == "sweep_high"
+    ) or (
+        strong_trend == "short" and liq_type == "sweep_low"
+    )
+    confirmation_gate = ""
+    if opposing_sweep:
+        confirmation_gate = "противоположный свип: нужен реклейм или acceptance"
+        if lifecycle == "confirmed":
+            lifecycle = "ready"
+
+    if strong_trend:
+        mode = (
+            "strong_trend_wait_reclaim"
+            if opposing_sweep
+            else "strong_trend_continuation"
+        )
+    elif liq_type in {"reclaim_up", "reclaim_down", "sweep_low", "sweep_high"}:
         mode = "reversal"
     elif market_type in {"accept_above", "accept_below"}:
         mode = "breakout_acceptance"
@@ -274,7 +367,7 @@ def score_action_context(
         mode = "countertrend"
 
     action: ActionType = "NONE"
-    if lifecycle == "confirmed" and not blocks[best]:
+    if lifecycle == "confirmed" and not blocks[best] and not confirmation_gate:
         action = "LONG_ALLOWED" if best == "long" else "SHORT_ALLOWED"
 
     primary_event = market_type or raw_liq_type
@@ -291,8 +384,9 @@ def score_action_context(
         f"{lifecycle_ru}; Long {int(scores['long'])}/100 | "
         f"Short {int(scores['short'])}/100"
     )
-    if blocks[best]:
-        reason += f"; блок: {blocks[best]}"
+    effective_block = blocks[best] or confirmation_gate
+    if effective_block:
+        reason += f"; блок: {effective_block}"
 
     return ActionDecision(
         tf=tf,
@@ -304,7 +398,7 @@ def score_action_context(
         short_score=int(scores["short"]),
         lifecycle=lifecycle,
         mode=mode,
-        blocked_reason=blocks[best],
+        blocked_reason=effective_block,
         setup_fingerprint=fingerprint,
         components=components,
         inputs={
@@ -321,6 +415,11 @@ def score_action_context(
                 for higher_tf, _ in _mtf_stack(tf)
             },
             "deriv_score": deriv_score,
+            "regime": {
+                "strong_trend_direction": strong_trend,
+                "opposing_sweep": opposing_sweep,
+                "confirmation_gate": confirmation_gate,
+            },
         },
     )
 
