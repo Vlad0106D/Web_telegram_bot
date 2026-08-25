@@ -66,13 +66,13 @@ class GoldEngineTests(unittest.TestCase):
         self.assertTrue(all(z["sources"] == ["M15"] for z in execution))
         self.assertTrue(all(z["high"] - z["low"] < 1.0 for z in execution))
 
-    def test_rr_below_minimum_can_only_watch(self):
+    def test_rr_below_minimum_is_wait(self):
         plan = {
             "side": "LONG", "type": "TREND", "score": 90,
             "parts": {"event": 25}, "rr": GOLD_MIN_CONFIRM_RR - .01,
         }
         decision, reason = _decision_for_plan("LONG", plan, False, 1.0)
-        self.assertEqual(decision, "SETUP WATCH")
+        self.assertEqual(decision, "WAIT")
         self.assertIn("RR", reason)
 
     def test_rr_at_minimum_can_confirm(self):
