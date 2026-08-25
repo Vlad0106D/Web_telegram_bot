@@ -17,9 +17,18 @@ INTERVAL = max(60, int(os.getenv("TRADFI_GOLD_INTERVAL_SEC", "60")))
 ENABLED = os.getenv("TRADFI_GOLD_ALERTS_ENABLED", "1").strip() == "1"
 WATCH_SCORE = 60
 CANCEL_SCORE = 50
-STABLE_TICKS = 2
+STABLE_TICKS = 3
 CANCEL_TICKS = 3
-ALERT_COOLDOWN = timedelta(minutes=45)
+IMPULSE_TRIGGER = 2.0
+IMPULSE_REARM = 1.5
+DEFAULT_ALERT_COOLDOWN = timedelta(minutes=45)
+ALERT_COOLDOWNS = {
+    "SETUP_WATCH": timedelta(hours=2),
+    "SETUP_CANCELLED": timedelta(hours=2),
+    "DIRECTION_CHANGE": timedelta(hours=2),
+    "IMPULSE": timedelta(minutes=90),
+    "ENTRY_CONFIRMED": None,
+}
 
 
 def _chat_id() -> Optional[int]:
@@ -82,7 +91,7 @@ def _payload(a: Dict) -> Dict:
         "market_ready": a.get("market_ready"), "market_reason": a.get("market_reason"),
         "activity_range": a.get("activity_range"),
         "activity_distinct_closes": a.get("activity_distinct_closes"),
-        "setup_fingerprint": _setup_fingerprint(a),
+        "setup_fingerprint": a.get("_alert_fingerprint") or _setup_fingerprint(a),
         "rr": a.get("rr"), "min_confirm_rr": a.get("min_confirm_rr"),
         "confirmation_blocked_reason": a.get("confirmation_blocked_reason"),
         "engine_version": a.get("engine_version"),
@@ -130,19 +139,24 @@ def _setup_fingerprint(assessment: Dict) -> str:
     ))
 
 
+def _alert_cooldown(kind: str) -> Optional[timedelta]:
+    return ALERT_COOLDOWNS.get(kind, DEFAULT_ALERT_COOLDOWN)
+
+
 def alert_already_persisted(kind: str, assessment: Dict) -> bool:
-    """Make confirmation dedup survive worker restarts and redeploys."""
-    fingerprint = _setup_fingerprint(assessment)
-    with psycopg.connect(_db_url()) as conn:
-        row = conn.execute(
-            """SELECT 1
-               FROM tradfi_gold_alerts
+    """Persist alert dedup across worker restarts and redeploys."""
+    fingerprint = assessment.get("_alert_fingerprint") or _setup_fingerprint(assessment)
+    cooldown = _alert_cooldown(kind)
+    query = """SELECT 1 FROM tradfi_gold_alerts
                WHERE alert_type = %s
-                 AND payload_json->>'setup_fingerprint' = %s
-                 AND ts >= %s
-               LIMIT 1""",
-            (kind, fingerprint, assessment["now"] - ALERT_COOLDOWN),
-        ).fetchone()
+                 AND payload_json->>'setup_fingerprint' = %s"""
+    params = [kind, fingerprint]
+    if cooldown is not None:
+        query += " AND ts >= %s"
+        params.append(assessment["now"] - cooldown)
+    query += " LIMIT 1"
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(query, tuple(params)).fetchone()
     return row is not None
 
 
@@ -160,39 +174,93 @@ def _recently_alerted(state: Dict, kind: str, fingerprint: str, now: datetime) -
     sent = state.setdefault("sent", {})
     key = f"{kind}:{fingerprint}"
     previous = sent.get(key)
-    if previous is not None and now - previous < ALERT_COOLDOWN:
+    cooldown = _alert_cooldown(kind)
+    if previous is not None and (cooldown is None or now - previous < cooldown):
         return True
     sent[key] = now
-    # Bound the in-memory cache during long-lived workers.
-    cutoff = now - 2 * ALERT_COOLDOWN
-    state["sent"] = {k: ts for k, ts in sent.items() if ts >= cutoff}
+    cutoff = now - timedelta(hours=4)
+    state["sent"] = {
+        key: ts for key, ts in sent.items()
+        if key.startswith("ENTRY_CONFIRMED:") or ts >= cutoff
+    }
     return False
+
+
+def _emit(state: Dict, kind: str, fingerprint: str, now: datetime) -> Optional[str]:
+    if _recently_alerted(state, kind, fingerprint, now):
+        return None
+    state["last_alert_fingerprint"] = fingerprint
+    return kind
+
+
+def _zone_distance(price: float, zone: Dict) -> float:
+    low, high = float(zone.get("low", price)), float(zone.get("high", price))
+    if low <= price <= high:
+        return 0.0
+    return min(abs(price - low), abs(price - high))
+
+
+def _update_retired_setups(state: Dict, current: Dict) -> None:
+    """Rearm a cancelled zone only after a material exit and later re-entry."""
+    retired = state.setdefault("retired", {})
+    price = float(current.get("price", 0))
+    atr = max(float(current.get("atr5") or 0), .01)
+    fingerprint = _setup_fingerprint(current)
+    for retired_fingerprint, record in list(retired.items()):
+        zone = record.get("zone") or {}
+        width = max(float(zone.get("high", price)) - float(zone.get("low", price)), .01)
+        distance = _zone_distance(price, zone)
+        if not record.get("exited") and distance >= max(atr, 1.5 * width):
+            record["exited"] = True
+        elif (record.get("exited") and retired_fingerprint == fingerprint
+              and distance <= max(.35 * atr, .5 * width)):
+            retired.pop(retired_fingerprint, None)
+
+
+def _retire_active_setup(state: Dict, fingerprint: str) -> None:
+    state.setdefault("retired", {})[fingerprint] = {
+        "zone": dict(state.get("active_zone") or {}), "exited": False,
+    }
 
 
 def detect_alert(previous: Optional[Dict], current: Dict,
                  state: Optional[Dict] = None) -> Optional[str]:
     state = state if state is not None else {}
+    state.pop("last_alert_fingerprint", None)
     if not current.get("market_ready", True):
+        sent, retired = state.get("sent", {}), state.get("retired", {})
         state.clear()
-        state["market_ready"] = False
+        state.update({"market_ready": False, "sent": sent, "retired": retired})
         return None
     if previous is None or not state.get("market_ready", False):
+        sent, retired = state.get("sent", {}), state.get("retired", {})
         state.clear()
-        state.update({"market_ready": True, "phase": "IDLE",
-                      "stable_direction": current.get("direction")})
+        state.update({
+            "market_ready": True, "phase": "IDLE",
+            "stable_direction": current.get("direction"),
+            "impulse_armed": float(current.get("impulse", 0)) <= IMPULSE_REARM,
+            "sent": sent, "retired": retired,
+        })
         return None
-    score = int(current["score"])
-    decision = current["decision"]
-    now = current["now"]
+
+    score, decision, now = int(current["score"]), current["decision"], current["now"]
     fingerprint = _setup_fingerprint(current)
+    _update_retired_setups(state, current)
+    setup_available = fingerprint not in state.get("retired", {})
+
     if current["stale"] > 600 and previous["stale"] <= 600:
-        return "DATA_STALE"
+        return _emit(state, "DATA_STALE", fingerprint, now)
     if current["basis"] is not None and abs(current["basis"]) > .20:
         old_basis = previous.get("basis")
         if old_basis is None or abs(old_basis) <= .20:
-            return "BASIS_ALERT"
-    if current["impulse"] > 2 and previous["impulse"] <= 2:
-        return "IMPULSE"
+            return _emit(state, "BASIS_ALERT", fingerprint, now)
+
+    impulse = float(current.get("impulse", 0))
+    if impulse <= IMPULSE_REARM:
+        state["impulse_armed"] = True
+    elif impulse > IMPULSE_TRIGGER and state.get("impulse_armed", False):
+        state["impulse_armed"] = False
+        return _emit(state, "IMPULSE", fingerprint, now)
 
     direction = current.get("direction")
     if direction in ("LONG", "SHORT"):
@@ -201,28 +269,37 @@ def detect_alert(previous: Optional[Dict], current: Dict,
         if (stable_direction in ("LONG", "SHORT") and direction != stable_direction
                 and direction_ticks >= STABLE_TICKS and score >= WATCH_SCORE):
             state["stable_direction"] = direction
-            if not _recently_alerted(state, "DIRECTION_CHANGE", fingerprint, now):
-                return "DIRECTION_CHANGE"
+            emitted = _emit(state, "DIRECTION_CHANGE", fingerprint, now)
+            if emitted:
+                return emitted
         elif direction_ticks >= STABLE_TICKS:
             state["stable_direction"] = direction
 
     confirm_value = fingerprint if decision in ("LONG", "SHORT") else "NONE"
     confirm_ticks = _same_value_count(state, "confirm", confirm_value)
-    if decision in ("LONG", "SHORT") and confirm_ticks >= STABLE_TICKS:
-        state.update({"phase": "CONFIRMED", "active_fingerprint": fingerprint,
-                      "cancel_count": 0})
-        if not _recently_alerted(state, "ENTRY_CONFIRMED", fingerprint, now):
-            return "ENTRY_CONFIRMED"
+    if (decision in ("LONG", "SHORT") and confirm_ticks >= STABLE_TICKS
+            and setup_available):
+        state.update({
+            "phase": "CONFIRMED", "active_fingerprint": fingerprint,
+            "active_zone": dict(current.get("active_zone") or {}), "cancel_count": 0,
+        })
+        emitted = _emit(state, "ENTRY_CONFIRMED", fingerprint, now)
+        if emitted:
+            return emitted
 
     phase = state.get("phase", "IDLE")
-    watchable = decision == "SETUP WATCH" and score >= WATCH_SCORE
-    watch_value = fingerprint if watchable else "NONE"
-    watch_ticks = _same_value_count(state, "watch", watch_value)
+    watchable = decision == "SETUP WATCH" and score >= WATCH_SCORE and setup_available
+    watch_ticks = _same_value_count(
+        state, "watch", fingerprint if watchable else "NONE"
+    )
     if watchable and watch_ticks >= STABLE_TICKS and phase == "IDLE":
-        state.update({"phase": "WATCH", "active_fingerprint": fingerprint,
-                      "cancel_count": 0})
-        if not _recently_alerted(state, "SETUP_WATCH", fingerprint, now):
-            return "SETUP_WATCH"
+        state.update({
+            "phase": "WATCH", "active_fingerprint": fingerprint,
+            "active_zone": dict(current.get("active_zone") or {}), "cancel_count": 0,
+        })
+        emitted = _emit(state, "SETUP_WATCH", fingerprint, now)
+        if emitted:
+            return emitted
 
     phase = state.get("phase", "IDLE")
     if phase in ("WATCH", "CONFIRMED"):
@@ -232,13 +309,13 @@ def detect_alert(previous: Optional[Dict], current: Dict,
         state["cancel_count"] = int(state.get("cancel_count", 0)) + 1 if lost else 0
         if state["cancel_count"] >= CANCEL_TICKS:
             cancelled_fingerprint = str(active_fingerprint or fingerprint)
-            state.update({"phase": "IDLE", "active_fingerprint": None,
-                          "cancel_count": 0})
-            if not _recently_alerted(state, "SETUP_CANCELLED",
-                                     cancelled_fingerprint, now):
-                return "SETUP_CANCELLED"
+            _retire_active_setup(state, cancelled_fingerprint)
+            state.update({
+                "phase": "IDLE", "active_fingerprint": None,
+                "active_zone": None, "cancel_count": 0,
+            })
+            return _emit(state, "SETUP_CANCELLED", cancelled_fingerprint, now)
     return None
-
 
 
 def should_persist(previous: Optional[Dict], current: Dict, alert_kind: Optional[str]) -> bool:
@@ -307,6 +384,10 @@ async def gold_auto_tick(app: Application) -> None:
         previous = app.bot_data.get("tradfi_gold_last")
         alert_state = app.bot_data.setdefault("tradfi_gold_alert_state", {})
         kind = detect_alert(previous, assessment, alert_state)
+        alert_assessment = dict(assessment)
+        alert_assessment["_alert_fingerprint"] = alert_state.get(
+            "last_alert_fingerprint", _setup_fingerprint(assessment)
+        )
         if should_persist(previous, assessment, kind):
             try:
                 await asyncio.to_thread(persist_assessment, assessment)
@@ -317,14 +398,14 @@ async def gold_auto_tick(app: Application) -> None:
         if kind:
             try:
                 already_sent = await asyncio.to_thread(
-                    alert_already_persisted, kind, assessment
+                    alert_already_persisted, kind, alert_assessment
                 )
             except Exception:
                 log.exception("TradFi gold persistent alert dedup failed")
         if kind and _chat_id() and not already_sent:
             await app.bot.send_message(chat_id=_chat_id(), text=render_alert(kind, assessment))
             try:
-                await asyncio.to_thread(persist_alert, kind, assessment)
+                await asyncio.to_thread(persist_alert, kind, alert_assessment)
             except Exception:
                 log.exception("TradFi gold alert persistence failed")
             log.info("TradFi gold alert sent: %s score=%s", kind, assessment["score"])
