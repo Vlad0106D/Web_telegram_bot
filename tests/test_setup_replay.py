@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 import unittest
 
 from services.mm.scenario_engine import MarketScenario
 from services.mm.setup_replay import (
     enrich_historical_action,
     latest_closed_context_index,
+    replay_range_states,
     select_event_as_of,
 )
 
@@ -17,6 +19,26 @@ def _ts(hour: int) -> datetime:
 
 
 class SetupReplayTests(unittest.TestCase):
+    def test_range_replay_reconstructs_acceptance_chronologically(self):
+        rows = [
+            {"ts": _ts(0), "open": 100.0, "high": 100.0, "low": 99.0, "close": 100.0},
+            {"ts": _ts(1), "open": 100.0, "high": 103.0, "low": 100.0, "close": 102.5},
+            {"ts": _ts(2), "open": 102.5, "high": 105.0, "low": 102.0, "close": 104.0},
+        ]
+        with patch.dict(
+            "os.environ",
+            {
+                "MM_RANGE_MIN_WIDTH_USD": "1",
+                "MM_RANGE_ATR_K": "0",
+                "MM_RANGE_ACCEPT_BARS_H1": "2",
+            },
+        ):
+            states = replay_range_states(rows, tf="H1")
+
+        self.assertEqual(states[_ts(0)]["state"], "HOLDING")
+        self.assertEqual(states[_ts(1)]["state"], "PENDING_ACCEPT_UP")
+        self.assertEqual(states[_ts(2)]["state"], "ACCEPT_UP")
+
     def test_latest_closed_context_never_uses_unclosed_higher_bar(self):
         timestamps = [_ts(0), _ts(4), _ts(8), _ts(12)]
         self.assertEqual(

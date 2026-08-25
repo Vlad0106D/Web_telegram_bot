@@ -26,7 +26,7 @@ from services.mm.zone_engine import Candle, replay_zone_states
 
 log = logging.getLogger(__name__)
 
-SETUP_REPLAY_VERSION = "setup_replay_v2"
+SETUP_REPLAY_VERSION = "setup_replay_v3"
 SETUP_REPLAY_ENABLED = os.getenv("SETUP_REPLAY_ENABLED", "1").strip() == "1"
 SETUP_REPLAY_BATCH_SIZE = max(1, int(os.getenv("SETUP_REPLAY_BATCH_SIZE", "50")))
 SETUP_REPLAY_INTERVAL_SEC = max(
@@ -122,6 +122,102 @@ def _targets(zones: Sequence[dict], price: float) -> Tuple[List[float], List[flo
     return down[:2], up[:2]
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float((os.getenv(name) or str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def replay_range_states(
+    rows: Sequence[Dict[str, Any]], *, tf: str
+) -> Dict[datetime, Dict[str, Any]]:
+    """Rebuild Range Engine v1 chronologically without future-data access."""
+    lookback = {
+        "H1": _env_int("MM_RANGE_LOOKBACK_H1", 120),
+        "H4": _env_int("MM_RANGE_LOOKBACK_H4", 90),
+        "D1": _env_int("MM_RANGE_LOOKBACK_D1", 60),
+        "W1": _env_int("MM_RANGE_LOOKBACK_W1", 26),
+    }.get(tf, _env_int("MM_RANGE_LOOKBACK", 60))
+    accept_bars = _env_int(f"MM_RANGE_ACCEPT_BARS_{tf}", 2)
+    post_lookback = _env_int(
+        "MM_RANGE_POST_ACCEPT_LOOKBACK", max(20, lookback // 3)
+    )
+    atr_n = _env_int("MM_RANGE_ATR_N", 14)
+    atr_k = _env_float("MM_RANGE_ATR_K", 0.25)
+    width_floor = _env_float("MM_RANGE_MIN_WIDTH_USD", 50.0)
+
+    history: Dict[datetime, Dict[str, Any]] = {}
+    anchor_high: Optional[float] = None
+    anchor_low: Optional[float] = None
+    pending_dir: Optional[str] = None
+    pending_count = 0
+
+    normalized = [dict(row) for row in rows]
+    for index, row in enumerate(normalized):
+        window = normalized[max(0, index - lookback + 1) : index + 1]
+        if anchor_high is None or anchor_low is None:
+            anchor_high = max(float(item["high"]) for item in window)
+            anchor_low = min(float(item["low"]) for item in window)
+
+        atr_window = normalized[max(0, index - atr_n) : index + 1]
+        true_ranges: List[float] = []
+        for offset in range(1, len(atr_window)):
+            current = atr_window[offset]
+            previous_close = float(atr_window[offset - 1]["close"])
+            high = float(current["high"])
+            low = float(current["low"])
+            true_ranges.append(
+                max(high - low, abs(high - previous_close), abs(low - previous_close))
+            )
+        atr = sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+        width = max(atr * atr_k, width_floor)
+        close = float(row["close"])
+        outside_up = close > anchor_high + width
+        outside_down = close < anchor_low - width
+
+        if outside_up:
+            pending_count = pending_count + 1 if pending_dir == "up" else 1
+            pending_dir = "up"
+            state = "ACCEPT_UP" if pending_count >= accept_bars else "PENDING_ACCEPT_UP"
+        elif outside_down:
+            pending_count = pending_count + 1 if pending_dir == "down" else 1
+            pending_dir = "down"
+            state = "ACCEPT_DOWN" if pending_count >= accept_bars else "PENDING_ACCEPT_DOWN"
+        else:
+            pending_dir = None
+            pending_count = 0
+            state = "HOLDING"
+
+        if state in {"ACCEPT_UP", "ACCEPT_DOWN"}:
+            fresh = normalized[max(0, index - post_lookback + 1) : index + 1]
+            anchor_high = max(float(item["high"]) for item in fresh)
+            anchor_low = min(float(item["low"]) for item in fresh)
+            pending_dir = None
+            pending_count = 0
+
+        history[row["ts"]] = {
+            "state": state,
+            "anchor_high": anchor_high,
+            "anchor_low": anchor_low,
+            "width": width,
+            "rh": {"lo": anchor_high - width, "hi": anchor_high + width},
+            "rl": {"lo": anchor_low - width, "hi": anchor_low + width},
+            "pending_dir": pending_dir,
+            "pending_count": pending_count,
+            "accept_bars": accept_bars,
+            "ts": row["ts"].isoformat(),
+        }
+    return history
+
+
 def _load_replay_context(conn: psycopg.Connection) -> Dict[str, Any]:
     with conn.cursor() as cur:
         cur.execute(
@@ -134,7 +230,7 @@ def _load_replay_context(conn: psycopg.Connection) -> Dict[str, Any]:
         cur.execute(
             """SELECT ts,tf,open,high,low,close
                FROM mm_snapshots
-               WHERE symbol='BTC-USDT' AND tf IN ('H4','D1')
+               WHERE symbol='BTC-USDT' AND tf IN ('H1','H4','D1')
                ORDER BY tf,ts"""
         )
         snapshot_rows = [dict(row) for row in (cur.fetchall() or [])]
@@ -170,6 +266,10 @@ def _load_replay_context(conn: psycopg.Connection) -> Dict[str, Any]:
             tf: [row["ts"] for row in snapshots[tf]] for tf in ("H4", "D1")
         },
         "zones": zone_history,
+        "ranges": {
+            tf: replay_range_states(snapshots[tf], tf=tf)
+            for tf in ("H1", "H4", "D1")
+        },
     }
 
 
@@ -180,6 +280,7 @@ def _state_for(
     price: float,
     zones: Sequence[dict],
     events: Sequence[dict],
+    range_payload: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     market_event = select_event_as_of(
         events, tf=tf, event_ts=ts, max_age_bars=2, layer="state"
@@ -189,19 +290,21 @@ def _state_for(
         tf, btc_close=price, dn_targets=down, up_targets=up, ev=market_event
     )
     state["_state_ts"] = ts
+    state["range"] = dict(range_payload or {"state": "HOLDING"})
     return state, market_event
 
 
 def enrich_historical_action(
     scenario: MarketScenario, context: Dict[str, Any]
 ) -> MarketScenario:
-    """Attach Action Engine v4 using only context closed by this H1 close."""
+    """Attach Action Engine v5 using only context closed by this H1 close."""
     state, market_event = _state_for(
         tf="H1",
         ts=scenario.ts,
         price=scenario.price,
         zones=scenario.upper_zones + scenario.lower_zones,
         events=context["events"]["H1"],
+        range_payload=(context.get("ranges") or {}).get("H1", {}).get(scenario.ts),
     )
     liquidity_event = select_event_as_of(
         context["events"]["H1"],
@@ -228,6 +331,7 @@ def enrich_historical_action(
             price=float(snapshot["close"]),
             zones=zones,
             events=context["events"][tf],
+            range_payload=(context.get("ranges") or {}).get(tf, {}).get(snapshot["ts"]),
         )
         higher_states[tf] = higher_state
         scenario.mtf_context.append(

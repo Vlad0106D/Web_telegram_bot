@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
-ACTION_ENGINE_VERSION = "v4"
+ACTION_ENGINE_VERSION = "v5"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
@@ -15,6 +15,8 @@ ACTION_STRONG_TREND_MIN_PROB = 55
 ACTION_STRONG_TREND_BONUS = 13
 ACTION_STRONG_TREND_OPPOSITE_PENALTY = 5
 ACTION_REVERSAL_MAX_AGE_BARS = 2
+ACTION_REVERSAL_CONFIRM_ENABLED = False
+ACTION_CONTINUATION_REQUIRES_RECLAIM = True
 ACTION_MTF_WEIGHTS = {
     "H1": (("H4", 9), ("D1", 11)),
     "H4": (("D1", 11),),
@@ -135,8 +137,10 @@ def _strong_trend_direction(
         return None
     market_direction = {
         "pressure_up": "long",
+        "reclaim_up": "long",
         "accept_above": "long",
         "pressure_down": "short",
+        "reclaim_down": "short",
         "accept_below": "short",
     }.get(market_type)
     if market_direction is None or _context_direction(state) != market_direction:
@@ -219,6 +223,8 @@ def action_engine_config() -> Dict[str, Any]:
         "strong_trend_bonus": ACTION_STRONG_TREND_BONUS,
         "strong_trend_opposite_penalty": ACTION_STRONG_TREND_OPPOSITE_PENALTY,
         "reversal_max_age_bars": ACTION_REVERSAL_MAX_AGE_BARS,
+        "reversal_confirm_enabled": ACTION_REVERSAL_CONFIRM_ENABLED,
+        "continuation_requires_reclaim": ACTION_CONTINUATION_REQUIRES_RECLAIM,
         "liquidity_memory_bars": ACTION_LIQUIDITY_MEMORY_BARS,
     }
 
@@ -394,6 +400,7 @@ def score_action_context(
     reversal_source = strong_trend is None and liquidity_aligned and liq_type in {
         "reclaim_up", "reclaim_down", "sweep_low", "sweep_high"
     }
+    countertrend_source = mtf_net[best] < 0
     if reversal_source:
         if (
             liquidity_age_bars is not None
@@ -402,8 +409,11 @@ def score_action_context(
             confirmation_gates.append("reversal: liquidity-event старше 2 баров")
         if not market_aligned:
             confirmation_gates.append("reversal: нет подтверждающего market-event")
+        if not ACTION_REVERSAL_CONFIRM_ENABLED and not countertrend_source:
+            confirmation_gates.append(
+                "reversal: подтверждения отключены до повторной калибровки"
+            )
 
-    countertrend_source = mtf_net[best] < 0
     if countertrend_source and not (
         market_aligned
         and liquidity_aligned
@@ -416,6 +426,25 @@ def score_action_context(
             "countertrend: нужна свежая двойная локальная конфлюэнс"
         )
 
+    directional_reclaims = {
+        "long": {"reclaim_up", "accept_above"},
+        "short": {"reclaim_down", "accept_below"},
+    }
+    continuation_confirmed = (
+        market_type in directional_reclaims[best]
+        or liq_type in directional_reclaims[best]
+    )
+    continuation_source = market_type in {"pressure_up", "pressure_down"}
+    if (
+        ACTION_CONTINUATION_REQUIRES_RECLAIM
+        and not countertrend_source
+        and (strong_trend or continuation_source)
+        and not continuation_confirmed
+    ):
+        confirmation_gates.append(
+            "continuation: после импульса нужен реклейм или acceptance"
+        )
+
     confirmation_gate = "; ".join(dict.fromkeys(confirmation_gates))
     if confirmation_gate and lifecycle == "confirmed":
         lifecycle = "ready"
@@ -423,7 +452,7 @@ def score_action_context(
     if strong_trend:
         mode = (
             "strong_trend_wait_reclaim"
-            if opposing_sweep
+            if opposing_sweep or not continuation_confirmed
             else "strong_trend_continuation"
         )
     elif reversal_source:

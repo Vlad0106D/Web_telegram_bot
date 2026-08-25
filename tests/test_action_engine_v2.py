@@ -103,7 +103,7 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertGreater(decision.long_score, decision.short_score)
         self.assertTrue(decision.setup_fingerprint)
 
-    def test_strong_downtrend_confirms_continuation(self):
+    def test_strong_downtrend_pressure_waits_for_reclaim(self):
         decision = score_action_context(
             tf="H1",
             state={
@@ -120,10 +120,33 @@ class ActionEngineV2Tests(unittest.TestCase):
             },
             deriv_score=45,
         )
+        self.assertEqual(decision.mode, "strong_trend_wait_reclaim")
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertIn("реклейм", decision.blocked_reason)
+        self.assertEqual(decision.components["short"]["trend_regime"], 13)
+
+    def test_strong_downtrend_reclaim_can_confirm_continuation(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "state_icon": "🔴",
+                "prob_up": 40,
+                "prob_down": 60,
+                "range": {"state": "HOLDING"},
+            },
+            market_event=event("reclaim_down"),
+            liquidity_event=None,
+            higher_states={
+                "H4": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+                "D1": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+            },
+            deriv_score=45,
+        )
         self.assertEqual(decision.mode, "strong_trend_continuation")
         self.assertEqual(decision.lifecycle, "confirmed")
         self.assertEqual(decision.action, "SHORT_ALLOWED")
-        self.assertEqual(decision.components["short"]["trend_regime"], 13)
+        self.assertEqual(decision.blocked_reason, "")
 
     def test_opposite_sweep_requires_reclaim_before_strong_trend_entry(self):
         decision = score_action_context(
@@ -168,7 +191,7 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertNotIn("trend_regime", decision.components["short"])
         self.assertNotEqual(decision.mode, "strong_trend_continuation")
 
-    def test_fresh_reversal_with_market_confirmation_can_confirm(self):
+    def test_fresh_reversal_stays_ready_until_recalibrated(self):
         decision = score_action_context(
             tf="H1",
             state={
@@ -182,8 +205,9 @@ class ActionEngineV2Tests(unittest.TestCase):
             higher_states={"H4": {}, "D1": {}},
         )
         self.assertEqual(decision.mode, "reversal")
-        self.assertEqual(decision.lifecycle, "confirmed")
-        self.assertEqual(decision.action, "LONG_ALLOWED")
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertIn("отключены", decision.blocked_reason)
 
     def test_stale_reversal_cannot_confirm(self):
         stale_liquidity = event("liq_reclaim_up")
