@@ -266,7 +266,7 @@ def _event_chain(items: Sequence[Candle], side: str, zone: Optional[Dict], atr: 
 
 
 GOLD_MIN_CONFIRM_RR = 1.5
-GOLD_ENGINE_VERSION = "gold_engine_v2"
+GOLD_ENGINE_VERSION = "gold_engine_v3"
 
 
 def _side_plan(side: str, price: float, upper_zone: Optional[Dict], lower_zone: Optional[Dict],
@@ -323,10 +323,10 @@ def _decision_for_plan(tactical_side: str, selected: Dict, market_block: bool,
             and impulse <= 2 and rr_ready):
         return selected["side"], None
     if selected["score"] >= 55:
-        reason = None
         if not rr_ready:
             reason = f"RR {selected['rr']:.2f} ниже минимума {GOLD_MIN_CONFIRM_RR:.2f}"
-        return "SETUP WATCH", reason
+            return "WAIT", reason
+        return "SETUP WATCH", None
     return "WAIT", None
 
 
