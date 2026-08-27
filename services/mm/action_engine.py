@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
-ACTION_ENGINE_VERSION = "v5"
+ACTION_ENGINE_VERSION = "v6"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
@@ -17,6 +17,7 @@ ACTION_STRONG_TREND_OPPOSITE_PENALTY = 5
 ACTION_REVERSAL_MAX_AGE_BARS = 2
 ACTION_REVERSAL_CONFIRM_ENABLED = False
 ACTION_CONTINUATION_REQUIRES_RECLAIM = True
+ACTION_CONTINUATION_MIN_ALIGNED_HIGHER_TF = 1
 ACTION_MTF_WEIGHTS = {
     "H1": (("H4", 9), ("D1", 11)),
     "H4": (("D1", 11),),
@@ -225,6 +226,9 @@ def action_engine_config() -> Dict[str, Any]:
         "reversal_max_age_bars": ACTION_REVERSAL_MAX_AGE_BARS,
         "reversal_confirm_enabled": ACTION_REVERSAL_CONFIRM_ENABLED,
         "continuation_requires_reclaim": ACTION_CONTINUATION_REQUIRES_RECLAIM,
+        "continuation_min_aligned_higher_tf": (
+            ACTION_CONTINUATION_MIN_ALIGNED_HIGHER_TF
+        ),
         "liquidity_memory_bars": ACTION_LIQUIDITY_MEMORY_BARS,
     }
 
@@ -397,9 +401,44 @@ def score_action_context(
             "противоположный свип: нужен реклейм или acceptance"
         )
 
-    reversal_source = strong_trend is None and liquidity_aligned and liq_type in {
-        "reclaim_up", "reclaim_down", "sweep_low", "sweep_high"
+    higher_directions = {
+        higher_tf: _context_direction(higher_states.get(higher_tf) or {})
+        for higher_tf, _ in _mtf_stack(tf)
+        if higher_states.get(higher_tf)
     }
+    aligned_higher_count = sum(
+        direction == best for direction in higher_directions.values()
+    )
+    opposing_higher_count = sum(
+        direction is not None and direction != best
+        for direction in higher_directions.values()
+    )
+    fresh_liquidity = (
+        liquidity_age_bars is None
+        or liquidity_age_bars <= ACTION_REVERSAL_MAX_AGE_BARS
+    )
+    local_continuation_source = (
+        tf == "H1"
+        and strong_trend is None
+        and market_aligned
+        and liquidity_aligned
+        and liq_type in {"reclaim_up", "reclaim_down"}
+        and fresh_liquidity
+        and aligned_higher_count >= ACTION_CONTINUATION_MIN_ALIGNED_HIGHER_TF
+        and opposing_higher_count == 0
+    )
+
+    reversal_source = (
+        strong_trend is None
+        and not local_continuation_source
+        and liquidity_aligned
+        and liq_type in {
+            "reclaim_up",
+            "reclaim_down",
+            "sweep_low",
+            "sweep_high",
+        }
+    )
     countertrend_source = mtf_net[best] < 0
     if reversal_source:
         if (
@@ -434,7 +473,10 @@ def score_action_context(
         market_type in directional_reclaims[best]
         or liq_type in directional_reclaims[best]
     )
-    continuation_source = market_type in {"pressure_up", "pressure_down"}
+    continuation_source = (
+        market_type in {"pressure_up", "pressure_down"}
+        or local_continuation_source
+    )
     if (
         ACTION_CONTINUATION_REQUIRES_RECLAIM
         and not countertrend_source
@@ -455,6 +497,8 @@ def score_action_context(
             if opposing_sweep or not continuation_confirmed
             else "strong_trend_continuation"
         )
+    elif local_continuation_source:
+        mode = "trend_continuation"
     elif reversal_source:
         mode = "reversal"
     elif market_type in {"accept_above", "accept_below"}:
@@ -524,6 +568,9 @@ def score_action_context(
                 "liquidity_age_bars": liquidity_age_bars,
                 "reversal_source": reversal_source,
                 "countertrend_source": countertrend_source,
+                "local_continuation_source": local_continuation_source,
+                "aligned_higher_count": aligned_higher_count,
+                "opposing_higher_count": opposing_higher_count,
             },
         },
     )

@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 from services.mm.scenario_engine import MarketScenario
 
 
-SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v3"
+SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v4"
 SETUP_CANDIDATE_SCORE = 42
 SETUP_CANDIDATE_MIN_SPREAD = 5
 SETUP_WEAK_GRACE_BARS = {"H1": 2, "H4": 1, "D1": 1, "W1": 0}
@@ -320,6 +320,8 @@ def _open_episode(
                 Jsonb(
                     {
                         "opening_reason": opening_reason,
+                        "opening_mode": signal.mode,
+                        "confirmation_mode": signal.mode if terminal else None,
                         "weak_grace_bars": SETUP_WEAK_GRACE_BARS[feature["tf"]],
                         "max_age_bars": SETUP_MAX_AGE_BARS[feature["tf"]],
                     }
@@ -478,6 +480,9 @@ def _update_active_episode(
                                                 ELSE confirmation_feature_id END,
                    confirmation_price=CASE WHEN %s THEN %s
                                            ELSE confirmation_price END,
+                   meta_json=CASE WHEN %s THEN
+                       COALESCE(meta_json,'{}'::jsonb) || %s
+                       ELSE meta_json END,
                    closed_ts=CASE WHEN %s THEN %s ELSE closed_ts END,
                    terminal_reason=COALESCE(%s,terminal_reason),updated_at=now()
                WHERE id=%s""",
@@ -494,6 +499,13 @@ def _update_active_episode(
                 int(feature["id"]),
                 confirmed,
                 float(feature["price"]),
+                confirmed,
+                Jsonb(
+                    {
+                        "confirmation_mode": signal.mode,
+                        "confirmation_fingerprint": signal.setup_fingerprint,
+                    }
+                ),
                 plan.terminal,
                 feature["event_ts"],
                 terminal_reason,
