@@ -209,6 +209,50 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertEqual(decision.action, "NONE")
         self.assertIn("отключены", decision.blocked_reason)
 
+    def test_local_reclaim_with_one_aligned_higher_tf_confirms_continuation(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=event("liq_reclaim_up"),
+            higher_states={
+                "H4": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+                "D1": {"state_icon": "🟡", "prob_up": 50, "prob_down": 50},
+            },
+        )
+        self.assertEqual(decision.mode, "trend_continuation")
+        self.assertEqual(decision.lifecycle, "confirmed")
+        self.assertEqual(decision.action, "LONG_ALLOWED")
+        self.assertTrue(decision.inputs["regime"]["local_continuation_source"])
+        self.assertEqual(decision.inputs["regime"]["aligned_higher_count"], 1)
+
+    def test_local_reclaim_with_opposing_higher_tf_stays_reversal_blocked(self):
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=event("liq_reclaim_up"),
+            higher_states={
+                "H4": {"state_icon": "🔴", "prob_up": 40, "prob_down": 60},
+                "D1": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+            },
+        )
+        self.assertEqual(decision.mode, "reversal")
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertFalse(decision.inputs["regime"]["local_continuation_source"])
+        self.assertEqual(decision.inputs["regime"]["opposing_higher_count"], 1)
+
     def test_stale_reversal_cannot_confirm(self):
         stale_liquidity = event("liq_reclaim_up")
         stale_liquidity["ts"] = NOW - timedelta(hours=3)

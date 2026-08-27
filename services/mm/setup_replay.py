@@ -26,7 +26,7 @@ from services.mm.zone_engine import Candle, replay_zone_states
 
 log = logging.getLogger(__name__)
 
-SETUP_REPLAY_VERSION = "setup_replay_v3"
+SETUP_REPLAY_VERSION = "setup_replay_v4"
 SETUP_REPLAY_ENABLED = os.getenv("SETUP_REPLAY_ENABLED", "1").strip() == "1"
 SETUP_REPLAY_BATCH_SIZE = max(1, int(os.getenv("SETUP_REPLAY_BATCH_SIZE", "50")))
 SETUP_REPLAY_INTERVAL_SEC = max(
@@ -297,7 +297,7 @@ def _state_for(
 def enrich_historical_action(
     scenario: MarketScenario, context: Dict[str, Any]
 ) -> MarketScenario:
-    """Attach Action Engine v5 using only context closed by this H1 close."""
+    """Attach Action Engine v6 using only context closed by this H1 close."""
     state, market_event = _state_for(
         tf="H1",
         ts=scenario.ts,
