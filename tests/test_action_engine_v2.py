@@ -209,7 +209,7 @@ class ActionEngineV2Tests(unittest.TestCase):
         self.assertEqual(decision.action, "NONE")
         self.assertIn("отключены", decision.blocked_reason)
 
-    def test_local_reclaim_with_one_aligned_higher_tf_confirms_continuation(self):
+    def test_fresh_local_reclaim_waits_for_one_closed_h1(self):
         decision = score_action_context(
             tf="H1",
             state={
@@ -226,10 +226,84 @@ class ActionEngineV2Tests(unittest.TestCase):
             },
         )
         self.assertEqual(decision.mode, "trend_continuation")
+        self.assertEqual(decision.lifecycle, "ready")
+        self.assertEqual(decision.action, "NONE")
+        self.assertIn("один закрытый H1", decision.blocked_reason)
+        self.assertTrue(decision.inputs["regime"]["local_continuation_source"])
+        self.assertFalse(decision.inputs["regime"]["local_continuation_held"])
+        self.assertEqual(decision.inputs["regime"]["aligned_higher_count"], 1)
+        self.assertEqual(
+            decision.setup_fingerprint,
+            "H1:long:trend_continuation:reclaim_up:2026-08-21T20:00:00+00:00",
+        )
+
+    def test_held_local_reclaim_can_confirm_continuation(self):
+        held_reclaim = event("liq_reclaim_up")
+        held_reclaim["ts"] = NOW - timedelta(hours=1)
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=event("pressure_up"),
+            liquidity_event=held_reclaim,
+            higher_states={
+                "H4": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+                "D1": {"state_icon": "🟡", "prob_up": 50, "prob_down": 50},
+            },
+        )
+        self.assertEqual(decision.mode, "trend_continuation")
         self.assertEqual(decision.lifecycle, "confirmed")
         self.assertEqual(decision.action, "LONG_ALLOWED")
-        self.assertTrue(decision.inputs["regime"]["local_continuation_source"])
-        self.assertEqual(decision.inputs["regime"]["aligned_higher_count"], 1)
+        self.assertTrue(decision.inputs["regime"]["local_continuation_held"])
+        self.assertEqual(
+            decision.setup_fingerprint,
+            "H1:long:trend_continuation:reclaim_up:2026-08-21T19:00:00+00:00",
+        )
+
+    def test_reclaim_age_uses_current_closed_bar_not_market_event_time(self):
+        prior_bar = NOW - timedelta(hours=1)
+        reclaim = event("liq_reclaim_up")
+        reclaim["ts"] = prior_bar
+        pressure = event("pressure_up")
+        pressure["ts"] = prior_bar
+        ready = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": prior_bar,
+            },
+            market_event=pressure,
+            liquidity_event=reclaim,
+            higher_states={
+                "H4": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+                "D1": {"state_icon": "🟡", "prob_up": 50, "prob_down": 50},
+            },
+        )
+        decision = score_action_context(
+            tf="H1",
+            state={
+                "prob_up": 61,
+                "prob_down": 39,
+                "range": {"state": "HOLDING"},
+                "_state_ts": NOW,
+            },
+            market_event=pressure,
+            liquidity_event=reclaim,
+            higher_states={
+                "H4": {"state_icon": "🟢", "prob_up": 55, "prob_down": 45},
+                "D1": {"state_icon": "🟡", "prob_up": 50, "prob_down": 50},
+            },
+        )
+        self.assertEqual(ready.lifecycle, "ready")
+        self.assertEqual(decision.lifecycle, "confirmed")
+        self.assertEqual(decision.inputs["regime"]["liquidity_age_bars"], 1.0)
+        self.assertEqual(ready.setup_fingerprint, decision.setup_fingerprint)
 
     def test_local_reclaim_with_opposing_higher_tf_stays_reversal_blocked(self):
         decision = score_action_context(

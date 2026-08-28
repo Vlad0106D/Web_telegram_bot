@@ -13,7 +13,7 @@ from psycopg.types.json import Jsonb
 from services.mm.scenario_engine import MarketScenario
 
 
-SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v4"
+SETUP_LIFECYCLE_VERSION = "setup_lifecycle_v5"
 SETUP_CANDIDATE_SCORE = 42
 SETUP_CANDIDATE_MIN_SPREAD = 5
 SETUP_WEAK_GRACE_BARS = {"H1": 2, "H4": 1, "D1": 1, "W1": 0}
