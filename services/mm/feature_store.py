@@ -16,7 +16,7 @@ from services.mm.scenario_engine import SCENARIO_VERSION, MarketScenario
 from services.mm.zone_engine import ALGORITHM_VERSION as ZONE_VERSION
 
 
-FEATURE_SET_VERSION = "market_context_v6"
+FEATURE_SET_VERSION = "market_context_v7"
 
 
 def _db_url() -> str:

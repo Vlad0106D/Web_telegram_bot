@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
-ACTION_ENGINE_VERSION = "v6"
+ACTION_ENGINE_VERSION = "v7"
 ACTION_WATCH_SCORE = 50
 ACTION_READY_SCORE = 64
 ACTION_CONFIRM_SCORE = 70
@@ -18,6 +18,7 @@ ACTION_REVERSAL_MAX_AGE_BARS = 2
 ACTION_REVERSAL_CONFIRM_ENABLED = False
 ACTION_CONTINUATION_REQUIRES_RECLAIM = True
 ACTION_CONTINUATION_MIN_ALIGNED_HIGHER_TF = 1
+ACTION_LOCAL_CONTINUATION_MIN_AGE_BARS = 1
 ACTION_MTF_WEIGHTS = {
     "H1": (("H4", 9), ("D1", 11)),
     "H4": (("D1", 11),),
@@ -223,6 +224,9 @@ def action_engine_config() -> Dict[str, Any]:
         "strong_trend_min_prob": ACTION_STRONG_TREND_MIN_PROB,
         "strong_trend_bonus": ACTION_STRONG_TREND_BONUS,
         "strong_trend_opposite_penalty": ACTION_STRONG_TREND_OPPOSITE_PENALTY,
+        "local_continuation_min_age_bars": (
+            ACTION_LOCAL_CONTINUATION_MIN_AGE_BARS
+        ),
         "reversal_max_age_bars": ACTION_REVERSAL_MAX_AGE_BARS,
         "reversal_confirm_enabled": ACTION_REVERSAL_CONFIRM_ENABLED,
         "continuation_requires_reclaim": ACTION_CONTINUATION_REQUIRES_RECLAIM,
@@ -382,8 +386,8 @@ def score_action_context(
     )
 
     reference_ts = (
-        (market_event or {}).get("ts")
-        or state.get("_state_ts")
+        state.get("_state_ts")
+        or (market_event or {}).get("ts")
     )
     liquidity_age_bars = _event_age_bars(
         tf=tf, reference_ts=reference_ts, event=liquidity_event
@@ -427,6 +431,11 @@ def score_action_context(
         and aligned_higher_count >= ACTION_CONTINUATION_MIN_ALIGNED_HIGHER_TF
         and opposing_higher_count == 0
     )
+    local_continuation_held = (
+        local_continuation_source
+        and liquidity_age_bars is not None
+        and liquidity_age_bars >= ACTION_LOCAL_CONTINUATION_MIN_AGE_BARS
+    )
 
     reversal_source = (
         strong_trend is None
@@ -463,6 +472,12 @@ def score_action_context(
     ):
         confirmation_gates.append(
             "countertrend: нужна свежая двойная локальная конфлюэнс"
+        )
+
+    if local_continuation_source and not local_continuation_held:
+        confirmation_gates.append(
+            "local continuation: нужен минимум один закрытый H1 "
+            "с удержанием направления"
         )
 
     directional_reclaims = {
@@ -514,8 +529,15 @@ def score_action_context(
     if lifecycle == "confirmed" and not blocks[best] and not confirmation_gate:
         action = "LONG_ALLOWED" if best == "long" else "SHORT_ALLOWED"
 
-    primary_event = market_type or raw_liq_type
-    event_ts = (market_event or liquidity_event or {}).get("ts")
+    if local_continuation_source:
+        # Anchor the whole two-stage setup to the reclaim that created it.
+        # A later observation of the same reclaim must advance the existing
+        # episode rather than open another nominally independent trade.
+        primary_event = liq_type or raw_liq_type or market_type
+        event_ts = (liquidity_event or {}).get("ts")
+    else:
+        primary_event = market_type or raw_liq_type
+        event_ts = (market_event or liquidity_event or {}).get("ts")
     event_key = event_ts.isoformat() if isinstance(event_ts, datetime) else str(event_ts or "")
     fingerprint = f"{tf}:{best}:{mode}:{primary_event or 'none'}:{event_key}"
     lifecycle_ru = {
@@ -569,6 +591,7 @@ def score_action_context(
                 "reversal_source": reversal_source,
                 "countertrend_source": countertrend_source,
                 "local_continuation_source": local_continuation_source,
+                "local_continuation_held": local_continuation_held,
                 "aligned_higher_count": aligned_higher_count,
                 "opposing_higher_count": opposing_higher_count,
             },
