@@ -11,6 +11,7 @@ from psycopg.types.json import Jsonb
 from telegram.ext import Application
 
 from services.tradfi.gold_engine import GoldDataError, assess_gold_now
+from services.tradfi.gold_outcomes import persist_gold_outcomes
 
 log = logging.getLogger(__name__)
 INTERVAL = max(60, int(os.getenv("TRADFI_GOLD_INTERVAL_SEC", "60")))
@@ -72,6 +73,76 @@ def ensure_schema() -> None:
                 payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
                 created_at timestamptz NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS tradfi_gold_m1_bars (
+                source_symbol text NOT NULL DEFAULT 'XAU-USDT-SWAP',
+                bar_ts timestamptz NOT NULL,
+                bar_closed_at timestamptz NOT NULL,
+                open double precision NOT NULL,
+                high double precision NOT NULL,
+                low double precision NOT NULL,
+                close double precision NOT NULL,
+                volume double precision,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (source_symbol, bar_ts),
+                CHECK (high >= low),
+                CHECK (bar_closed_at > bar_ts)
+            );
+            CREATE INDEX IF NOT EXISTS tradfi_gold_m1_bars_closed_idx
+            ON tradfi_gold_m1_bars(bar_closed_at);
+            CREATE TABLE IF NOT EXISTS tradfi_gold_outcomes (
+                id bigserial PRIMARY KEY,
+                alert_id bigint NOT NULL UNIQUE
+                    REFERENCES tradfi_gold_alerts(id) ON DELETE CASCADE,
+                outcome_version text NOT NULL,
+                engine_version text NOT NULL,
+                source_symbol text NOT NULL DEFAULT 'XAU-USDT-SWAP',
+                execution_symbol text NOT NULL DEFAULT 'XAUUSD+',
+                direction text NOT NULL CHECK (direction IN ('LONG','SHORT')),
+                setup_type text,
+                setup_fingerprint text,
+                entry_score integer,
+                entry_ts timestamptz NOT NULL,
+                first_eligible_bar_ts timestamptz NOT NULL,
+                horizon_end_ts timestamptz NOT NULL,
+                entry_price double precision NOT NULL,
+                stop_price double precision NOT NULL,
+                target_price double precision NOT NULL,
+                planned_rr double precision,
+                status text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN (
+                        'pending','target_hit','stop_hit','timeout',
+                        'ambiguous','unscorable'
+                    )),
+                monitoring_complete boolean NOT NULL DEFAULT false,
+                bars_observed integer NOT NULL DEFAULT 0,
+                resolution_bar_ts timestamptz,
+                resolution_ts timestamptz,
+                exit_price double precision,
+                directional_return_pct double precision,
+                mfe_pct double precision NOT NULL DEFAULT 0,
+                mae_pct double precision NOT NULL DEFAULT 0,
+                horizon_mfe_pct double precision NOT NULL DEFAULT 0,
+                horizon_mae_pct double precision NOT NULL DEFAULT 0,
+                first_target_bar integer,
+                first_stop_bar integer,
+                first_target_ts timestamptz,
+                first_stop_ts timestamptz,
+                ambiguous boolean NOT NULL DEFAULT false,
+                target_after_stop boolean NOT NULL DEFAULT false,
+                target_after_stop_ts timestamptz,
+                last_evaluated_bar_ts timestamptz,
+                quality_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                payload_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                CHECK (horizon_end_ts > entry_ts),
+                CHECK (first_eligible_bar_ts > entry_ts)
+            );
+            CREATE INDEX IF NOT EXISTS tradfi_gold_outcomes_monitoring_idx
+            ON tradfi_gold_outcomes(monitoring_complete,entry_ts)
+            WHERE monitoring_complete=false;
+            CREATE INDEX IF NOT EXISTS tradfi_gold_outcomes_timeline_idx
+            ON tradfi_gold_outcomes(entry_ts DESC,engine_version);
         """)
 
 
@@ -409,6 +480,18 @@ async def gold_auto_tick(app: Application) -> None:
             except Exception:
                 log.exception("TradFi gold alert persistence failed")
             log.info("TradFi gold alert sent: %s score=%s", kind, assessment["score"])
+        # Outcome persistence runs after live alert delivery so research writes
+        # cannot delay a time-sensitive ENTRY_CONFIRMED message.
+        try:
+            outcome_stats = await asyncio.to_thread(
+                persist_gold_outcomes,
+                assessment.get("_outcome_m1_bars", []),
+                as_of_ts=assessment["now"],
+            )
+            if any(outcome_stats.values()):
+                log.info("TradFi gold outcomes: %s", outcome_stats)
+        except Exception:
+            log.exception("TradFi gold outcome processing failed")
     except GoldDataError as exc:
         log.warning("TradFi gold data unavailable: %s", exc)
     except Exception:

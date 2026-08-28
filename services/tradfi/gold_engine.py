@@ -342,6 +342,19 @@ async def assess_gold_now() -> Dict:
         ]
         data = await asyncio.gather(*tasks)
     candles = dict(zip(BARS, data[:4]))
+    outcome_m1_bars = [
+        {
+            "source_symbol": SWAP,
+            "bar_ts": candle.ts,
+            "bar_closed_at": candle.ts + timedelta(minutes=1),
+            "open": candle.o,
+            "high": candle.h,
+            "low": candle.l,
+            "close": candle.c,
+            "volume": candle.volume,
+        }
+        for candle in candles["M1"]
+    ]
     ticker, mark, index, funding, oi = (x[0] if x else {} for x in data[4:])
     price = float(ticker["last"])
     contexts, votes = {}, {}
@@ -403,7 +416,8 @@ async def assess_gold_now() -> Dict:
                 rr=selected["rr"], min_confirm_rr=GOLD_MIN_CONFIRM_RR,
                 confirmation_blocked_reason=blocked_reason,
                 engine_version=GOLD_ENGINE_VERSION,
-                h1_upper_zone=h1_upper_zone, h1_lower_zone=h1_lower_zone)
+                h1_upper_zone=h1_upper_zone, h1_lower_zone=h1_lower_zone,
+                _outcome_m1_bars=outcome_m1_bars)
 
 
 def _p(x) -> str:
