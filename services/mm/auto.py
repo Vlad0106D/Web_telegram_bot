@@ -46,6 +46,11 @@ from services.mm.setup_replay import (
     SETUP_REPLAY_INTERVAL_SEC,
     replay_setup_batch,
 )
+from services.mm.setup_shadow import (
+    SHADOW_ENABLED,
+    SHADOW_INTERVAL_SEC,
+    run_shadow_batch,
+)
 from services.mm.pipeline_runtime import (
     PipelineCandidate,
     PipelineRunAlreadyActive,
@@ -109,6 +114,15 @@ async def _setup_replay_tick(app: Application) -> None:
         log.info("Setup historical replay result=%s", result)
     except Exception:
         log.exception("Setup historical replay failed")
+
+
+async def _setup_shadow_tick(app: Application) -> None:
+    del app
+    try:
+        result = await asyncio.to_thread(run_shadow_batch)
+        log.info("Setup shadow experiment result=%s", result)
+    except Exception:
+        log.exception("Setup shadow experiment failed")
 
 
 def _db_url() -> str:
@@ -1052,6 +1066,21 @@ def schedule_mm_auto(app: Application) -> List[str]:
             },
         )
         created.append(setup_replay_name)
+
+    if SHADOW_ENABLED:
+        setup_shadow_name = "mm_auto_setup_shadow"
+        jq.run_repeating(
+            callback=lambda ctx: _setup_shadow_tick(ctx.application),
+            interval=SHADOW_INTERVAL_SEC,
+            first=300,
+            name=setup_shadow_name,
+            job_kwargs={
+                "coalesce": True,
+                "max_instances": 1,
+                "misfire_grace_time": 300,
+            },
+        )
+        created.append(setup_shadow_name)
 
     log.info(
         "MM auto scheduled: every %ss | tfs=%s | chat_id=%s",

@@ -28,6 +28,18 @@ class SchemaMigrationTests(unittest.TestCase):
             migration,
         )
 
+    def test_shadow_experiment_uses_separate_research_tables(self):
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "migrations"
+            / "011_setup_shadow_outcomes.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CREATE TABLE IF NOT EXISTS setup_shadow_candidates", migration)
+        self.assertIn("CREATE TABLE IF NOT EXISTS setup_shadow_outcomes", migration)
+        self.assertIn("gate_code TEXT NOT NULL DEFAULT ''", migration)
+        self.assertNotIn("ALTER TABLE setup_outcomes", migration)
+
 
 if __name__ == "__main__":
     unittest.main()
