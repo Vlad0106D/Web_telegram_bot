@@ -529,6 +529,7 @@ def _evaluate_batch(
                     Jsonb(
                         {
                             "cutoff_event_ts": cutoff.isoformat(),
+                            "right_censored": evaluation.status == "pending",
                             "horizon_complete": len(bars)
                             >= int(outcome["horizon_bars"]),
                         }
