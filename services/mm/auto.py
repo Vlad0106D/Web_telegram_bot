@@ -41,12 +41,12 @@ from services.mm.zone_store import rebuild_zones
 from services.mm.feature_store import persist_feature_snapshot
 from services.mm.setup_lifecycle import persist_setup_lifecycle
 from services.mm.setup_outcomes import persist_setup_outcomes
-from services.mm.setup_replay import (
+from services.mm.validation_replay import (
     SETUP_REPLAY_ENABLED,
     SETUP_REPLAY_INTERVAL_SEC,
     replay_setup_batch,
 )
-from services.mm.setup_shadow import (
+from services.mm.validation_shadow import (
     SHADOW_ENABLED,
     SHADOW_INTERVAL_SEC,
     run_shadow_batch,

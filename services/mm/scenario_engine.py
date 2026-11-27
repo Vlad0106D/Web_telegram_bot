@@ -777,6 +777,7 @@ def persist_scenario(
     *,
     origin: str = "live",
     available_ts: Optional[datetime] = None,
+    scenario_version: str = SCENARIO_VERSION,
 ) -> bool:
     if origin not in {"live", "replay", "backfill"}:
         raise ValueError(f"Unsupported scenario origin: {origin}")
@@ -837,7 +838,7 @@ def persist_scenario(
             cur.execute(
                 sql,
                 (
-                    SCENARIO_VERSION,
+                    scenario_version,
                     s.symbol,
                     s.tf,
                     s.ts,

@@ -312,6 +312,7 @@ def persist_feature_snapshot(
     origin: str = "live",
     available_ts: Optional[datetime] = None,
     feature_key_namespace: Optional[str] = None,
+    scenario_version: str = SCENARIO_VERSION,
 ) -> int:
     """Persist an idempotent point-in-time feature row for a scenario."""
     if origin not in {"live", "replay", "backfill"}:
@@ -357,7 +358,7 @@ def persist_feature_snapshot(
                 """SELECT id FROM market_scenarios
                    WHERE algorithm_version=%s AND symbol=%s AND tf=%s
                      AND scenario_ts=%s""",
-                (SCENARIO_VERSION, scenario.symbol, scenario.tf, scenario.ts),
+                (scenario_version, scenario.symbol, scenario.tf, scenario.ts),
             )
             scenario_row = cur.fetchone()
             if not scenario_row:
